@@ -274,7 +274,7 @@ pub const Cpu = struct {
             self.setMoveWordFlags(@truncate(self.d[register]));
             return 4;
         }
-        if (opcode & 0xff00 == 0x6000 or opcode & 0xff00 == 0x6400 or opcode & 0xff00 == 0x6500 or opcode & 0xff00 == 0x6600 or opcode & 0xff00 == 0x6700 or opcode & 0xff00 == 0x6800 or opcode & 0xff00 == 0x6900 or opcode & 0xff00 == 0x6a00 or opcode & 0xff00 == 0x6b00) { // BRA/BCC/BCS/BNE/BEQ/BVC/BVS/BPL/BMI .s/.w
+        if (opcode & 0xff00 == 0x6000 or opcode & 0xff00 == 0x6200 or opcode & 0xff00 == 0x6300 or opcode & 0xff00 == 0x6400 or opcode & 0xff00 == 0x6500 or opcode & 0xff00 == 0x6600 or opcode & 0xff00 == 0x6700 or opcode & 0xff00 == 0x6800 or opcode & 0xff00 == 0x6900 or opcode & 0xff00 == 0x6a00 or opcode & 0xff00 == 0x6b00 or opcode & 0xff00 == 0x6c00 or opcode & 0xff00 == 0x6d00 or opcode & 0xff00 == 0x6e00 or opcode & 0xff00 == 0x6f00) { // BRA/BHI/BLS/BCC/BCS/BNE/BEQ/BVC/BVS/BPL/BMI/BGE/BLT/BGT/BLE .s/.w
             const low: u8 = @truncate(opcode);
             const displacement: i32 = if (low != 0)
                 @as(i32, @as(i8, @bitCast(low)))
@@ -285,6 +285,8 @@ pub const Cpu = struct {
             const condition = opcode & 0xff00;
             const should_branch = switch (condition) {
                 0x6000 => true, // BRA
+                0x6200 => self.sr & (flag_carry | flag_zero) == 0, // BHI: !C && !Z
+                0x6300 => self.sr & (flag_carry | flag_zero) != 0, // BLS: C || Z
                 0x6400 => self.sr & flag_carry == 0, // BCC
                 0x6500 => self.sr & flag_carry != 0, // BCS
                 0x6600 => self.sr & flag_zero == 0, // BNE
@@ -293,6 +295,10 @@ pub const Cpu = struct {
                 0x6900 => self.sr & flag_overflow != 0, // BVS
                 0x6a00 => self.sr & flag_negative == 0, // BPL
                 0x6b00 => self.sr & flag_negative != 0, // BMI
+                0x6c00 => (self.sr & flag_negative != 0) == (self.sr & flag_overflow != 0), // BGE: N == V
+                0x6d00 => (self.sr & flag_negative != 0) != (self.sr & flag_overflow != 0), // BLT: N != V
+                0x6e00 => self.sr & flag_zero == 0 and (self.sr & flag_negative != 0) == (self.sr & flag_overflow != 0), // BGT: !Z && N == V
+                0x6f00 => self.sr & flag_zero != 0 or (self.sr & flag_negative != 0) != (self.sr & flag_overflow != 0), // BLE: Z || N != V
                 else => unreachable,
             };
             if (should_branch) {
@@ -1234,6 +1240,103 @@ test "68000 BVC and BVS branch from the overflow flag with short and word displa
     try std.testing.expect(cpu.sr & Cpu.flag_overflow == 0);
     try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
     try std.testing.expectEqual(@as(u32, 22), cpu.pc);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+}
+
+test "68000 BGE and BLT use the signed N xor V condition with short and word displacements" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0xb0, 0x7c, // CMP.W #1,D0: D0=$8000 gives N=0,V=1, so signed less-than
+        0x00, 0x01,
+        0x6d, 0x02, // BLT.s +2, taken
+        0xff, 0xff, // skipped
+        0xb0, 0x7c, // CMP.W #$8000,D0: equal gives N=V=0
+        0x80, 0x00,
+        0x6c, 0x00, // BGE.w +2, taken
+        0x00, 0x02,
+        0xff, 0xff, // skipped
+        0x4e, 0x71, // NOP
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[0] = 0x8000;
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & Cpu.flag_negative == 0);
+    try std.testing.expect(cpu.sr & Cpu.flag_overflow != 0);
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 16), cpu.pc);
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow) == 0);
+    try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 26), cpu.pc);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+}
+
+test "68000 BGT and BLE use signed comparison including the zero case" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0xb0, 0x7c, // CMP.W #1,D0: D0=2 gives !Z, N=V=0
+        0x00, 0x01,
+        0x6e, 0x02, // BGT.s +2, taken
+        0xff, 0xff, // skipped
+        0xb0, 0x7c, // CMP.W #2,D0: equal gives Z
+        0x00, 0x02,
+        0x6f, 0x00, // BLE.w +2, taken
+        0x00, 0x02,
+        0xff, 0xff, // skipped
+        0x4e, 0x71, // NOP
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[0] = 2;
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_negative | Cpu.flag_overflow) == 0);
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 16), cpu.pc);
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & Cpu.flag_zero != 0);
+    try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 26), cpu.pc);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+}
+
+test "68000 BHI and BLS use unsigned carry and zero conditions" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0xb0, 0x7c, // CMP.W #1,D0: D0=2 gives !C && !Z
+        0x00, 0x01,
+        0x62, 0x02, // BHI.s +2, taken
+        0xff, 0xff, // skipped
+        0xb0, 0x7c, // CMP.W #2,D0: equal gives Z
+        0x00, 0x02,
+        0x63, 0x00, // BLS.w +2, taken
+        0x00, 0x02,
+        0xff, 0xff, // skipped
+        0x4e, 0x71, // NOP
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[0] = 2;
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & (Cpu.flag_carry | Cpu.flag_zero) == 0);
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 16), cpu.pc);
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & Cpu.flag_zero != 0);
+    try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 26), cpu.pc);
     try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
 }
 
