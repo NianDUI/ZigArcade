@@ -1,0 +1,8 @@
+.zig-cache/
+zig-out/
+.DS_Store
+*.nes
+*.neo
+*.zip
+roms/
+bios/
