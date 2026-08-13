@@ -172,6 +172,12 @@ BHI/BLS 完成无符号大小比较分支：它们分别判断 `!C && !Z` 与 `C
 
 `JMP (An)` 提供无栈的地址寄存器间接跳转，并保持 CCR；其余 JMP 形式仍明确未实现。
 
+`CLR.W/L Dn` 已用于受限核心的寄存器清零：word 形式只清低 16 位，long 形式清整个 Dn；两者均按对应宽度置 Z、清 N/V/C 并保留 X。
+
+`SWAP Dn` 交换 Dn 的高、低 word，再按 long 结果更新 N/Z、清 V/C 并保留 X。
+
+`EXT.W Dn` 将低 byte 符号扩展至低 word，`EXT.L Dn` 将低 word 符号扩展至 long；它们按扩展后的操作数宽度更新 N/Z、清 V/C 并保留 X。
+
 `MOVE.L Dn,(d16,An)` 与 `MOVE.L (d16,An),Dn` 复用有符号 word 位移的有效地址规则，并以 big-endian long 读写普通诊断内存。
 
 `zigarcade --demo-neogeo auto|kitty|ansi` 直接呈现不含任何 ROM/BIOS 的合成 320×224 固定层图案，并推进一帧诊断 raster clock，用于当前 Ghostty/ANSI 前端验证；它不是 Neo Geo 游戏运行入口。

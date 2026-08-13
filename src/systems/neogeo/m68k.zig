@@ -320,6 +320,39 @@ pub const Cpu = struct {
             self.setMoveWordFlags(@truncate(self.d[register]));
             return 4;
         }
+        if (opcode & 0xfff8 == 0x4240) { // CLR.W Dn
+            const register: usize = @intCast(opcode & 7);
+            self.d[register] &= 0xffff0000;
+            self.setMoveWordFlags(0);
+            return 4;
+        }
+        if (opcode & 0xfff8 == 0x4280) { // CLR.L Dn
+            const register: usize = @intCast(opcode & 7);
+            self.d[register] = 0;
+            self.setMoveLongFlags(0);
+            return 4;
+        }
+        if (opcode & 0xfff8 == 0x4840) { // SWAP Dn
+            const register: usize = @intCast(opcode & 7);
+            self.d[register] = (self.d[register] << 16) | (self.d[register] >> 16);
+            self.setMoveLongFlags(self.d[register]);
+            return 4;
+        }
+        if (opcode & 0xfff8 == 0x4880) { // EXT.W Dn: byte -> word
+            const register: usize = @intCast(opcode & 7);
+            const value: i8 = @bitCast(@as(u8, @truncate(self.d[register])));
+            const extended: u16 = @bitCast(@as(i16, value));
+            self.d[register] = (self.d[register] & 0xffff0000) | extended;
+            self.setMoveWordFlags(extended);
+            return 4;
+        }
+        if (opcode & 0xfff8 == 0x48c0) { // EXT.L Dn: word -> long
+            const register: usize = @intCast(opcode & 7);
+            const value: i16 = @bitCast(@as(u16, @truncate(self.d[register])));
+            self.d[register] = @bitCast(@as(i32, value));
+            self.setMoveLongFlags(self.d[register]);
+            return 4;
+        }
         if (opcode & 0xff00 == 0x6000 or opcode & 0xff00 == 0x6200 or opcode & 0xff00 == 0x6300 or opcode & 0xff00 == 0x6400 or opcode & 0xff00 == 0x6500 or opcode & 0xff00 == 0x6600 or opcode & 0xff00 == 0x6700 or opcode & 0xff00 == 0x6800 or opcode & 0xff00 == 0x6900 or opcode & 0xff00 == 0x6a00 or opcode & 0xff00 == 0x6b00 or opcode & 0xff00 == 0x6c00 or opcode & 0xff00 == 0x6d00 or opcode & 0xff00 == 0x6e00 or opcode & 0xff00 == 0x6f00) { // BRA/BHI/BLS/BCC/BCS/BNE/BEQ/BVC/BVS/BPL/BMI/BGE/BLT/BGT/BLE .s/.w
             const low: u8 = @truncate(opcode);
             const displacement: i32 = if (low != 0)
@@ -1005,6 +1038,73 @@ test "68000 TST.W uses the data-register low word and preserves X" {
     _ = try cpu.step(&bus);
     try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
     try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+}
+
+test "68000 CLR.W and CLR.L update only their operand widths and preserve X" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x42, 0x45, // CLR.W D5
+        0x42, 0x86, // CLR.L D6
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[5] = 0xfacebeef;
+    cpu.d[6] = 0x80abcdef;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_overflow | Cpu.flag_carry;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface0000), cpu.d[5]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_extend) == (Cpu.flag_zero | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0), cpu.d[6]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_extend) == (Cpu.flag_zero | Cpu.flag_extend));
+}
+
+test "68000 SWAP exchanges data-register words and applies long flags" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x48, 0x47, // SWAP D7
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[7] = 0x00018000;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x80000001), cpu.d[7]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative) == (Cpu.flag_extend | Cpu.flag_negative));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+}
+
+test "68000 EXT sign-extends byte and word while preserving X" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x48, 0x85, // EXT.W D5
+        0x48, 0xc6, // EXT.L D6
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[5] = 0xface0080;
+    cpu.d[6] = 0xface8001;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xfaceff80), cpu.d[5]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xffff8001), cpu.d[6]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
 }
 
 test "68000 CMP.L immediate preserves registers and X while updating subtraction flags" {
