@@ -10,9 +10,14 @@ const actionsForByte = @import("systems/nes/input.zig").actionsForByte;
 const buttonsFromActions = @import("systems/nes/input.zig").buttonsFromActions;
 const Nes = @import("systems/nes/nes.zig").Nes;
 const neogeo_fixed = @import("systems/neogeo/fixed.zig");
+const neogeo_address_map = @import("systems/neogeo/address_map.zig");
 const NeoGeoFixedMap = @import("systems/neogeo/fixed_map.zig").FixedMap;
 const NeoGeoDiagnostic = @import("systems/neogeo/neogeo.zig").NeoGeoDiagnostic;
 const neogeo_video = @import("systems/neogeo/video.zig");
+
+comptime {
+    _ = neogeo_address_map;
+}
 
 const Renderer = enum { ansi, kitty, auto };
 const nes_frame_interval_ms: i32 = 16;

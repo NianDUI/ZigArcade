@@ -12,4 +12,13 @@ ZigArcade 的源码采用 [MIT License](LICENSE)。本项目只独立实现代�
 | GnGeo | https://github.com/MatChung/gngeo | Neo Geo 系统边界研究 | 禁止复制代码，实施前核对许可证 |
 | Ghostty | https://github.com/ghostty-org/ghostty | Kitty 图形协议行为与资源管理参照 | 仅独立生成 APC 协议序列，不复制实现 |
 
+## 已锁定的 Neo Geo 地址图资料
+
+| 资料 | 固定版本 | 研究模块 | 使用边界 |
+|---|---|---|---|
+| NeoGeo Development Wiki：`68k memory map` | revision 8317，2026-08-13 访问 | 卡带 68000 地址范围、镜像、物理大小 | 页面标注 CC0；只记录硬件事实，未导入资产或代码 |
+| NeoGeo Development Wiki：`Memory mapped registers` | revision 9288，2026-08-13 访问 | I/O 基址、decode mask、LSPC/video 与 system-control 语义 | 页面明确部分 decode mask 未验证；实现前须有独立测试或第二来源核验 |
+| MAME `src/mame/snk/neogeo.cpp` | `c8f7357b5c573fd7f236c4747f0f34fafe510c54`，2026-08-13 访问 | MVS/AES 主地址图的独立交叉核验 | MAME 许可证不兼容 MIT；严禁复制代码，仅作为行为研究 |
+| FBNeo `src/burn/drv/neogeo/neo_run.cpp` | `2fcb2628fbfd529806e75f3559a9d82758c8a5cc`，2026-08-13 访问 | 与 MAME/Wiki 的地址译码交叉核验 | 含非商业与公开修改等限制；严禁复制代码或资产 |
+
 每次实际采用一项外部资料时，都必须补充锁定的 commit/tag、许可证/SPDX、研究模块与日期。许可不明或与 MIT 发布策略不兼容时，不得拷贝其代码或提交其资产。

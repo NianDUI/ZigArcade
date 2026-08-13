@@ -136,7 +136,9 @@ Neo Geo 是独立主机：68000 主 CPU、Z80 音频 CPU、YM2610、sprite/tile 
 
 首个前置模块是 `systems/neogeo/romset.zig`：它仅校验调用方提供的 P（program）、C（sprites）、S（fixed）、M（audio CPU）、V（samples）及 BIOS 条目的名称、非零大小、SHA-256 元数据和区域完整性，并可对调用方持有的字节切片验证大小/SHA-256；不打开文件、不保留字节、不捆绑、也不猜测任何游戏 ROM 或 BIOS。后续本地加载器必须在文件读取/拼接前通过此 manifest。
 
-`systems/neogeo/bus.zig` 是 P5a 前的合成数据诊断切片：定义 reset 时 BIOS 覆盖 `$000000-$0FFFFF` P-ROM、关闭 overlay 后读取 P-ROM，及 `$100000-$10FFFF` 64 KiB work RAM 的 68000 big-endian word 规则。它不含 68000 取指/执行、视频、I/O 或真实 BIOS；这些地址与时序会在正式 P5a 资料锁定后扩展。
+`systems/neogeo/address_map.zig` 依据 `docs/NEOGEO_ADDRESS_MAP.md` 中锁定的公开资料，提供显式 `.mvs`/`.aes` variant 的纯地址译码：固定/银行 P-ROM、64 KiB work RAM 及镜像、I/O、palette RAM 及镜像、system ROM，以及仅 AES 的 memory-card / 仅 MVS 的 backup RAM。它不执行寄存器副作用，也不猜测板型变种；地址表和测试是后续总线接入的唯一入口。
+
+`systems/neogeo/bus.zig` 仍是 P5a 前的**合成**数据诊断切片：定义 reset 时 BIOS 覆盖 `$000000-$0FFFFF` P-ROM、关闭 overlay 后读取 P-ROM，及 `$100000-$10FFFF` 64 KiB work RAM 的 68000 big-endian word 规则。它尚未委托 `address_map.zig`，不含真实视频、I/O 或 BIOS 映射；因此不能将其行为称作真实 Neo Geo 总线。
 
 `systems/neogeo/fixed.zig` 在 P5b 前提供 S-ROM 固定层的纯 8×8、4bpp 位平面解码：32-byte tile 的四个 8-byte plane 组合为 palette index，输出缓冲由调用方提供。尚未接入 tilemap、palette RAM、`320×224` 合成或真实 ROM；这一步仅锁定图块数据格式。
 
