@@ -275,6 +275,12 @@ pub const Cpu = struct {
             self.setCompareLongFlags(self.d[destination], self.d[source]);
             return 6;
         }
+        if (opcode & 0xf1f8 == 0xb000) { // CMP.B Dn,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            self.setCompareByteFlags(@truncate(self.d[destination]), @truncate(self.d[source]));
+            return 4;
+        }
         if (opcode & 0xf1f8 == 0x5080) { // ADDQ.L #imm3,Dn (encoded 0 means 8)
             const register: usize = @intCast(opcode & 7);
             const encoded: u32 = @intCast((opcode >> 9) & 7);
@@ -313,6 +319,16 @@ pub const Cpu = struct {
             self.setSubtractWordFlags(destination, immediate, result, true);
             return 4;
         }
+        if (opcode & 0xf1f8 == 0xd000) { // ADD.B Dn,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const destination_value: u8 = @truncate(self.d[destination]);
+            const source_value: u8 = @truncate(self.d[source]);
+            const result = destination_value +% source_value;
+            self.d[destination] = (self.d[destination] & 0xffffff00) | result;
+            self.setAddByteFlags(destination_value, source_value, result);
+            return 4;
+        }
         if (opcode & 0xf1f8 == 0xd040) { // ADD.W Dn,Dn
             const destination: usize = @intCast((opcode >> 9) & 7);
             const source: usize = @intCast(opcode & 7);
@@ -331,6 +347,16 @@ pub const Cpu = struct {
             self.d[destination] +%= source_value;
             self.setAddLongFlags(destination_value, source_value, self.d[destination]);
             return 6;
+        }
+        if (opcode & 0xf1f8 == 0x9000) { // SUB.B Dn,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const destination_value: u8 = @truncate(self.d[destination]);
+            const source_value: u8 = @truncate(self.d[source]);
+            const result = destination_value -% source_value;
+            self.d[destination] = (self.d[destination] & 0xffffff00) | result;
+            self.setSubtractByteFlags(destination_value, source_value, result, true);
+            return 4;
         }
         if (opcode & 0xf1f8 == 0x9040) { // SUB.W Dn,Dn
             const destination: usize = @intCast((opcode >> 9) & 7);
@@ -489,6 +515,13 @@ pub const Cpu = struct {
             self.setMoveLongFlags(self.d[register]);
             return 16;
         }
+        if (opcode & 0xfff8 == 0x4600) { // NOT.B Dn
+            const register: usize = @intCast(opcode & 7);
+            const result: u8 = ~@as(u8, @truncate(self.d[register]));
+            self.d[register] = (self.d[register] & 0xffffff00) | result;
+            self.setMoveByteFlags(result);
+            return 4;
+        }
         if (opcode & 0xfff8 == 0x4640) { // NOT.W Dn
             const register: usize = @intCast(opcode & 7);
             const result: u16 = ~@as(u16, @truncate(self.d[register]));
@@ -500,6 +533,14 @@ pub const Cpu = struct {
             const register: usize = @intCast(opcode & 7);
             self.d[register] = ~self.d[register];
             self.setMoveLongFlags(self.d[register]);
+            return 4;
+        }
+        if (opcode & 0xfff8 == 0x4400) { // NEG.B Dn
+            const register: usize = @intCast(opcode & 7);
+            const destination: u8 = @truncate(self.d[register]);
+            const result = 0 -% destination;
+            self.d[register] = (self.d[register] & 0xffffff00) | result;
+            self.setNegateByteFlags(destination, result);
             return 4;
         }
         if (opcode & 0xfff8 == 0x4440) { // NEG.W Dn
@@ -639,12 +680,31 @@ pub const Cpu = struct {
         self.setSubtractWordFlags(destination, source, result, false);
     }
 
+    fn setCompareByteFlags(self: *Cpu, destination: u8, source: u8) void {
+        const result = destination -% source;
+        self.setSubtractByteFlags(destination, source, result, false);
+    }
+
     fn setSubtractWordFlags(self: *Cpu, destination: u16, source: u16, result: u16, update_extend: bool) void {
         self.sr &= ~(flag_negative | flag_zero | flag_overflow | flag_carry);
         if (update_extend) self.sr &= ~flag_extend;
         if (result == 0) self.sr |= flag_zero;
         if (result & 0x8000 != 0) self.sr |= flag_negative;
         if ((destination ^ source) & (destination ^ result) & 0x8000 != 0) {
+            self.sr |= flag_overflow;
+        }
+        if (source > destination) {
+            self.sr |= flag_carry;
+            if (update_extend) self.sr |= flag_extend;
+        }
+    }
+
+    fn setSubtractByteFlags(self: *Cpu, destination: u8, source: u8, result: u8, update_extend: bool) void {
+        self.sr &= ~(flag_negative | flag_zero | flag_overflow | flag_carry);
+        if (update_extend) self.sr &= ~flag_extend;
+        if (result == 0) self.sr |= flag_zero;
+        if (result & 0x80 != 0) self.sr |= flag_negative;
+        if ((destination ^ source) & (destination ^ result) & 0x80 != 0) {
             self.sr |= flag_overflow;
         }
         if (source > destination) {
@@ -687,11 +747,29 @@ pub const Cpu = struct {
         if (result < destination) self.sr |= flag_extend | flag_carry;
     }
 
+    fn setAddByteFlags(self: *Cpu, destination: u8, source: u8, result: u8) void {
+        self.sr &= ~(flag_extend | flag_negative | flag_zero | flag_overflow | flag_carry);
+        if (result == 0) self.sr |= flag_zero;
+        if (result & 0x80 != 0) self.sr |= flag_negative;
+        if (~(destination ^ source) & (destination ^ result) & 0x80 != 0) {
+            self.sr |= flag_overflow;
+        }
+        if (result < destination) self.sr |= flag_extend | flag_carry;
+    }
+
     fn setNegateWordFlags(self: *Cpu, destination: u16, result: u16) void {
         self.sr &= ~(flag_extend | flag_negative | flag_zero | flag_overflow | flag_carry);
         if (result == 0) self.sr |= flag_zero;
         if (result & 0x8000 != 0) self.sr |= flag_negative;
         if (destination == 0x8000) self.sr |= flag_overflow;
+        if (destination != 0) self.sr |= flag_extend | flag_carry;
+    }
+
+    fn setNegateByteFlags(self: *Cpu, destination: u8, result: u8) void {
+        self.sr &= ~(flag_extend | flag_negative | flag_zero | flag_overflow | flag_carry);
+        if (result == 0) self.sr |= flag_zero;
+        if (result & 0x80 != 0) self.sr |= flag_negative;
+        if (destination == 0x80) self.sr |= flag_overflow;
         if (destination != 0) self.sr |= flag_extend | flag_carry;
     }
 
@@ -1559,6 +1637,35 @@ test "68000 NOT applies word and long inversion while preserving X" {
     try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
 }
 
+test "68000 NOT.B and NEG.B preserve high bits and use byte flags" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x46, 0x01, // NOT.B D1
+        0x44, 0x02, // NEG.B D2
+        0x44, 0x03, // NEG.B D3
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[1] = 0xface007e;
+    cpu.d[2] = 0xface0001;
+    cpu.d[3] = 0xface0080;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry;
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xface0081), cpu.d[1]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xface00ff), cpu.d[2]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_carry) == (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_carry));
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xface0080), cpu.d[3]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_overflow | Cpu.flag_carry) == (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_overflow | Cpu.flag_carry));
+}
+
 test "68000 NEG applies word and long two's-complement flags including overflow" {
     const Bus = @import("bus.zig").Bus;
     const program = [_]u8{
@@ -1678,6 +1785,27 @@ test "68000 CMP register forms compare source and destination without changing e
     try std.testing.expectEqual(@as(u16, 6), try cpu.step(&bus));
     try std.testing.expectEqual(@as(u32, 1), cpu.d[4]);
     try std.testing.expectEqual(@as(u32, 0x80000000), cpu.d[5]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_overflow | Cpu.flag_extend) == (Cpu.flag_overflow | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_zero | Cpu.flag_carry) == 0);
+}
+
+test "68000 CMP.B compares only low bytes and preserves X and registers" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0xb4, 0x01, // CMP.B D1,D2
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[1] = 0xaaaa0001;
+    cpu.d[2] = 0xbbbb0080;
+    cpu.sr |= Cpu.flag_extend;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xaaaa0001), cpu.d[1]);
+    try std.testing.expectEqual(@as(u32, 0xbbbb0080), cpu.d[2]);
     try std.testing.expect(cpu.sr & (Cpu.flag_overflow | Cpu.flag_extend) == (Cpu.flag_overflow | Cpu.flag_extend));
     try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_zero | Cpu.flag_carry) == 0);
 }
@@ -1810,6 +1938,31 @@ test "68000 ADD register forms use the source register and retain word high bits
     try std.testing.expectEqual(@as(u16, 6), try cpu.step(&bus));
     try std.testing.expectEqual(@as(u32, 0x80000000), cpu.d[5]);
     try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow) == (Cpu.flag_negative | Cpu.flag_overflow));
+}
+
+test "68000 byte ADD and SUB preserve high bits and update byte arithmetic flags" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0xd4, 0x01, // ADD.B D1,D2
+        0x94, 0x03, // SUB.B D3,D2
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[1] = 1;
+    cpu.d[2] = 0xface7f;
+    cpu.d[3] = 0x81;
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xface80), cpu.d[2]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow) == (Cpu.flag_negative | Cpu.flag_overflow));
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_carry) == 0);
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xfaceff), cpu.d[2]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_carry) == (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_carry));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow) == 0);
 }
 
 test "68000 SUB register forms use the source register and retain word high bits" {
