@@ -150,7 +150,7 @@ Neo Geo 是独立主机：68000 主 CPU、Z80 音频 CPU、YM2610、sprite/tile 
 
 `systems/neogeo/timing.zig` 提供独立的 264-scanline 诊断 raster clock：前 224 行可见，进入第 224 行时锁存一次 VBlank edge，帧结束时清除 VBlank。它尚未定义 68000/Z80 时钟比、raster IRQ 寄存器或实际视频 fetch，只为后续 P5a/P5b 提供唯一的 VBlank 事件边界。
 
-`systems/neogeo/neogeo.zig` 将诊断 bus、受限 68000 CPU、fixed tilemap、palette RAM、timing 与 `320×224` framebuffer 组装为 `NeoGeoDiagnostic`；`resetCpu` 通过当前 BIOS overlay 读取向量，`stepCpu` 执行一条已支持的诊断指令，`stepCpuInstructions(n)` 明确执行 n 条并返回周期锚点累计值，便于可复现的合成 BIOS/work-RAM 诊断。它不是无限游戏循环，也未定义 STOP、IRQ 或完整时钟。`renderFixed` 只接收调用方持有的 tile store，且仍不包含 ROM-set 文件加载、Z80 执行或真实硬件寄存器。
+`systems/neogeo/neogeo.zig` 将诊断 bus、受限 68000 CPU、fixed tilemap、palette RAM、timing 与 `320×224` framebuffer 组装为 `NeoGeoDiagnostic`；`resetCpu` 通过当前 BIOS overlay 读取向量，`stepCpu` 执行一条已支持的诊断指令，`stepCpuInstructions(n)` 明确执行 n 条并返回周期锚点累计值，`stepCpuCycleBudget(minimum, max)` 在不跳过指令的前提下累计到最小周期锚点或达到指令上限，并返回实际周期、指令数及是否达标，便于可复现的合成 BIOS/work-RAM 诊断。它们不是无限游戏循环，也未定义 STOP、IRQ 或完整时钟。`renderFixed` 只接收调用方持有的 tile store，且仍不包含 ROM-set 文件加载、Z80 执行或真实硬件寄存器。
 
 `systems/neogeo/input.zig` 把公共 `Actions(u16)` 映射到 Neo Geo A–D、Start、Coin 与方向的系统语义；端口地址及 active-low 数据线编码暂不定义，不能由 frontend 绕过该映射直接写 bus。
 

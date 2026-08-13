@@ -1,3 +1,4 @@
+const std = @import("std");
 const Frame = @import("../../core/frame.zig").Frame;
 const Actions = @import("../../core/input.zig").Actions;
 const Bus = @import("bus.zig").Bus;
@@ -49,6 +50,22 @@ pub const NeoGeoDiagnostic = struct {
         return cycles;
     }
 
+    /// Executes until the accumulated diagnostic cycle anchors reach
+    /// `minimum_cycles`, or `max_instructions` makes further execution
+    /// impossible. A final instruction may exceed the requested budget;
+    /// callers receive that fact explicitly instead of silently skipping an
+    /// instruction. This is a deterministic CPU-only helper, not a Neo Geo
+    /// master-clock or scanline scheduler.
+    pub fn stepCpuCycleBudget(self: *NeoGeoDiagnostic, minimum_cycles: u64, max_instructions: usize) CycleBudgetError!CycleBudgetResult {
+        var result: CycleBudgetResult = .{};
+        while (result.cycles < minimum_cycles and result.instructions < max_instructions) {
+            try accumulateCycleBudget(&result.cycles, try self.stepCpu());
+            result.instructions += 1;
+        }
+        result.reached_budget = result.cycles >= minimum_cycles;
+        return result;
+    }
+
     pub fn tickScanline(self: *NeoGeoDiagnostic) void {
         self.timing.tickScanline();
     }
@@ -70,6 +87,20 @@ pub const NeoGeoDiagnostic = struct {
 };
 
 pub const Error = video.Error || error{InvalidPaletteBank};
+
+pub const CycleBudgetError = @import("m68k.zig").Error || error{CycleBudgetOverflow};
+
+pub const CycleBudgetResult = struct {
+    cycles: u64 = 0,
+    instructions: usize = 0,
+    reached_budget: bool = false,
+};
+
+fn accumulateCycleBudget(total: *u64, added: u16) CycleBudgetError!void {
+    const sum = @addWithOverflow(total.*, @as(u64, added));
+    if (sum[1] != 0) return error.CycleBudgetOverflow;
+    total.* = sum[0];
+}
 
 test "Neo Geo diagnostic assembles bus, raster frame number, palette and fixed grid" {
     const program = [_]u8{ 0x12, 0x34 };
@@ -132,6 +163,37 @@ test "Neo Geo diagnostic executes a bounded BIOS program against work RAM" {
     try @import("std").testing.expectEqual(@as(u64, 28), try neogeo.stepCpuInstructions(2));
     try @import("std").testing.expectEqual(@as(?u16, 0xbeef), neogeo.bus.readWord(0x100000));
     try @import("std").testing.expectEqual(@as(u32, 0x12), neogeo.cpu.pc);
+}
+
+test "Neo Geo diagnostic cycle budget does not skip instructions or exceed its instruction cap" {
+    const bios = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x4e, 0x71, // NOP: 4
+        0x70, 0x01, // MOVEQ: 4
+        0x4e, 0x71, // NOP: 4
+    };
+    var neogeo = NeoGeoDiagnostic.init(&.{}, &bios);
+    try neogeo.resetCpu();
+    const reached = try neogeo.stepCpuCycleBudget(6, 3);
+    try @import("std").testing.expectEqual(@as(u64, 8), reached.cycles);
+    try @import("std").testing.expectEqual(@as(usize, 2), reached.instructions);
+    try @import("std").testing.expect(reached.reached_budget);
+    try @import("std").testing.expectEqual(@as(u32, 12), neogeo.cpu.pc);
+
+    var capped = NeoGeoDiagnostic.init(&.{}, &bios);
+    try capped.resetCpu();
+    const incomplete = try capped.stepCpuCycleBudget(12, 2);
+    try @import("std").testing.expectEqual(@as(u64, 8), incomplete.cycles);
+    try @import("std").testing.expectEqual(@as(usize, 2), incomplete.instructions);
+    try @import("std").testing.expect(!incomplete.reached_budget);
+    try @import("std").testing.expectEqual(@as(u32, 12), capped.cpu.pc);
+}
+
+test "Neo Geo diagnostic cycle budget reports accumulation overflow explicitly" {
+    var cycles: u64 = std.math.maxInt(u64) - 3;
+    try std.testing.expectError(error.CycleBudgetOverflow, accumulateCycleBudget(&cycles, 4));
+    try std.testing.expectEqual(std.math.maxInt(u64) - 3, cycles);
 }
 
 test "Neo Geo diagnostic exposes a sound command latch without a Z80 dependency" {
