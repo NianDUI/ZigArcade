@@ -194,6 +194,8 @@ BHI/BLS 完成无符号大小比较分支：它们分别判断 `!C && !Z` 与 `C
 
 `SUB.W/L Dn,Dn` 提供对称的数据寄存器减法，宽度写回和 X/N/Z/V/C 规则与相应 SUBQ 形式一致。
 
+`CMP.W/L Dn,Dn` 比较数据寄存器源、目标而不写回任一操作数；按对应宽度更新 N/Z/V/C 并保留 X，可直接驱动 Bcc/Scc。
+
 `MOVE.L Dn,(d16,An)` 与 `MOVE.L (d16,An),Dn` 复用有符号 word 位移的有效地址规则，并以 big-endian long 读写普通诊断内存。
 
 `zigarcade --demo-neogeo auto|kitty|ansi` 直接呈现不含任何 ROM/BIOS 的合成 320×224 固定层图案，并推进一帧诊断 raster clock，用于当前 Ghostty/ANSI 前端验证；它不是 Neo Geo 游戏运行入口。

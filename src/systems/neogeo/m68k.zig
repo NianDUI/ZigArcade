@@ -256,6 +256,18 @@ pub const Cpu = struct {
             self.setCompareWordFlags(@truncate(self.d[register]), source);
             return 8;
         }
+        if (opcode & 0xf1f8 == 0xb040) { // CMP.W Dn,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            self.setCompareWordFlags(@truncate(self.d[destination]), @truncate(self.d[source]));
+            return 4;
+        }
+        if (opcode & 0xf1f8 == 0xb080) { // CMP.L Dn,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            self.setCompareLongFlags(self.d[destination], self.d[source]);
+            return 6;
+        }
         if (opcode & 0xf1f8 == 0x5080) { // ADDQ.L #imm3,Dn (encoded 0 means 8)
             const register: usize = @intCast(opcode & 7);
             const encoded: u32 = @intCast((opcode >> 9) & 7);
@@ -1533,6 +1545,60 @@ test "68000 CMP.W immediate compares only the low word and preserves X" {
     _ = try cpu.step(&bus);
     try std.testing.expect(cpu.sr & (Cpu.flag_overflow | Cpu.flag_extend) == (Cpu.flag_overflow | Cpu.flag_extend));
     try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_zero | Cpu.flag_carry) == 0);
+}
+
+test "68000 CMP register forms compare source and destination without changing either" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0xb6, 0x41, // CMP.W D1,D3
+        0xba, 0x84, // CMP.L D4,D5
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[1] = 1;
+    cpu.d[3] = 0xface8000;
+    cpu.d[4] = 1;
+    cpu.d[5] = 0x80000000;
+    cpu.sr |= Cpu.flag_extend;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 1), cpu.d[1]);
+    try std.testing.expectEqual(@as(u32, 0xface8000), cpu.d[3]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_overflow | Cpu.flag_extend) == (Cpu.flag_overflow | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_zero | Cpu.flag_carry) == 0);
+    try std.testing.expectEqual(@as(u16, 6), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 1), cpu.d[4]);
+    try std.testing.expectEqual(@as(u32, 0x80000000), cpu.d[5]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_overflow | Cpu.flag_extend) == (Cpu.flag_overflow | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_zero | Cpu.flag_carry) == 0);
+}
+
+test "68000 CMP register condition codes drive Scc" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0xb0, 0x41, // CMP.W D1,D0
+        0x57, 0xc2, // SEQ D2
+        0x56, 0xc3, // SNE D3
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[0] = 0xface1234;
+    cpu.d[1] = 0xbeef1234;
+    cpu.d[2] = 0xaaaa0000;
+    cpu.d[3] = 0xbbbb0000;
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & Cpu.flag_zero != 0);
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xaaaa00ff), cpu.d[2]);
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xbbbb0000), cpu.d[3]);
 }
 
 test "68000 CMP.L condition codes drive BEQ control flow" {
