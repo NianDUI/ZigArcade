@@ -214,6 +214,10 @@ BHI/BLS 完成无符号大小比较分支：它们分别判断 `!C && !Z` 与 `C
 
 `MOVE.L Dn,(d16,An)` 与 `MOVE.L (d16,An),Dn` 复用有符号 word 位移的有效地址规则，并以 big-endian long 读写普通诊断内存。
 
+**68000 诊断核心现状（以本段为准）**：上文的增量记录汇总为：NOP、MOVEQ；`MOVE.B/W/L` 的 `#imm→Dn`、`Dn→Dn`，以及 word/long 的 `Dn↔(An)`、`Dn↔(An)+`、`Dn↔-(An)`、`Dn↔(d16,An)`；`MOVEA.W/L #imm,An`；`LEA (d16,An),An` 与 `LEA (d16,PC),An`；`TST`、`CLR`、`ORI`、`ANDI`、`EORI`、`NOT`、`NEG` 的 Dn byte/word/long 形式；`SWAP`、`EXT.W/L`；`ADD`、`SUB`、`CMP` 的 Dn byte/word/long 形式和 `CMP.W/L #imm,Dn`；`ADDQ.W/L`、`SUBQ.W/L`；全部条件码的 `Scc Dn`；BRA、全部 Bcc、BSR 的短/字位移；`DBF Dn,<disp>`；`JSR (An)`、`JMP (An)`、RTS。Dn 的 byte/word 访问保留未操作高位；MOVE/TST/逻辑/单操作数更新 N/Z、清 V/C、保留 X；ADD/SUB/NEG 更新 X/N/Z/V/C；CMP 保留操作数和 X；`MOVEA`、LEA、Scc、DBF、JMP 不改变 CCR。`LEA (d16,PC)` 以扩展字地址为基准，BSR 压入取完扩展字后的返回 PC。
+
+这仍不是完整 68000：异常、特权/中断、STOP、索引/绝对/其余 PC-relative 有效地址、绝大多数内存目的操作数和真实 Neo Geo I/O 均未实现。它不能执行商业 Neo Geo 游戏，也不能据此宣称 BIOS 或地址图兼容。
+
 `zigarcade --demo-neogeo auto|kitty|ansi` 直接呈现不含任何 ROM/BIOS 的合成 320×224 固定层图案，并推进一帧诊断 raster clock，用于当前 Ghostty/ANSI 前端验证；它不是 Neo Geo 游戏运行入口。
 
 ANSI 回退路径以最近邻 2×缩小任一紧凑 RGB888 偶数尺寸帧；当前 NES `256×240` 呈为 `128×60` 个终端字符单元，Neo Geo 诊断 `320×224` 呈为 `160×56` 个字符单元。它复用预分配的最大 `320×240` 源帧缩小缓冲，不在逐帧路径分配内存；Kitty 路径则保留原始分辨率。
