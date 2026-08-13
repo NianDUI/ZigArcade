@@ -353,6 +353,45 @@ pub const Cpu = struct {
             self.setMoveLongFlags(self.d[register]);
             return 4;
         }
+        if (opcode & 0xfff8 == 0x0040) { // ORI.W #imm,Dn
+            const register: usize = @intCast(opcode & 7);
+            const result: u16 = @truncate(self.d[register] | try self.fetchWord(bus));
+            self.d[register] = (self.d[register] & 0xffff0000) | result;
+            self.setMoveWordFlags(result);
+            return 8;
+        }
+        if (opcode & 0xfff8 == 0x0080) { // ORI.L #imm,Dn
+            const register: usize = @intCast(opcode & 7);
+            self.d[register] |= try self.fetchLong(bus);
+            self.setMoveLongFlags(self.d[register]);
+            return 16;
+        }
+        if (opcode & 0xfff8 == 0x0240) { // ANDI.W #imm,Dn
+            const register: usize = @intCast(opcode & 7);
+            const result: u16 = @truncate(self.d[register] & try self.fetchWord(bus));
+            self.d[register] = (self.d[register] & 0xffff0000) | result;
+            self.setMoveWordFlags(result);
+            return 8;
+        }
+        if (opcode & 0xfff8 == 0x0280) { // ANDI.L #imm,Dn
+            const register: usize = @intCast(opcode & 7);
+            self.d[register] &= try self.fetchLong(bus);
+            self.setMoveLongFlags(self.d[register]);
+            return 16;
+        }
+        if (opcode & 0xfff8 == 0x0a40) { // EORI.W #imm,Dn
+            const register: usize = @intCast(opcode & 7);
+            const result: u16 = @truncate(self.d[register] ^ try self.fetchWord(bus));
+            self.d[register] = (self.d[register] & 0xffff0000) | result;
+            self.setMoveWordFlags(result);
+            return 8;
+        }
+        if (opcode & 0xfff8 == 0x0a80) { // EORI.L #imm,Dn
+            const register: usize = @intCast(opcode & 7);
+            self.d[register] ^= try self.fetchLong(bus);
+            self.setMoveLongFlags(self.d[register]);
+            return 16;
+        }
         if (opcode & 0xff00 == 0x6000 or opcode & 0xff00 == 0x6200 or opcode & 0xff00 == 0x6300 or opcode & 0xff00 == 0x6400 or opcode & 0xff00 == 0x6500 or opcode & 0xff00 == 0x6600 or opcode & 0xff00 == 0x6700 or opcode & 0xff00 == 0x6800 or opcode & 0xff00 == 0x6900 or opcode & 0xff00 == 0x6a00 or opcode & 0xff00 == 0x6b00 or opcode & 0xff00 == 0x6c00 or opcode & 0xff00 == 0x6d00 or opcode & 0xff00 == 0x6e00 or opcode & 0xff00 == 0x6f00) { // BRA/BHI/BLS/BCC/BCS/BNE/BEQ/BVC/BVS/BPL/BMI/BGE/BLT/BGT/BLE .s/.w
             const low: u8 = @truncate(opcode);
             const displacement: i32 = if (low != 0)
@@ -1104,6 +1143,87 @@ test "68000 EXT sign-extends byte and word while preserving X" {
     try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
     try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
     try std.testing.expectEqual(@as(u32, 0xffff8001), cpu.d[6]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+}
+
+test "68000 ORI applies immediate word and long masks while preserving X" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x00, 0x42, // ORI.W #$8001,D2
+        0x80, 0x01,
+        0x00, 0x83, // ORI.L #$80000000,D3
+        0x80, 0x00,
+        0x00, 0x00,
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[2] = 0xface0000;
+    cpu.d[3] = 1;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry;
+    try std.testing.expectEqual(@as(u16, 8), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface8001), cpu.d[2]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+    try std.testing.expectEqual(@as(u16, 16), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x80000001), cpu.d[3]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+}
+
+test "68000 ANDI applies immediate word and long masks while preserving X" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x02, 0x44, // ANDI.W #$8001,D4
+        0x80, 0x01,
+        0x02, 0x85, // ANDI.L #$80000000,D5
+        0x80, 0x00,
+        0x00, 0x00,
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[4] = 0xfaceffff;
+    cpu.d[5] = 0x80abcdef;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry;
+    try std.testing.expectEqual(@as(u16, 8), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface8001), cpu.d[4]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+    try std.testing.expectEqual(@as(u16, 16), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x80000000), cpu.d[5]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+}
+
+test "68000 EORI applies immediate word and long masks while preserving X" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x0a, 0x46, // EORI.W #$8001,D6
+        0x80, 0x01,
+        0x0a, 0x87, // EORI.L #$80000001,D7
+        0x80, 0x00,
+        0x00, 0x01,
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[6] = 0xface0000;
+    cpu.d[7] = 0x00000001;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry;
+    try std.testing.expectEqual(@as(u16, 8), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface8001), cpu.d[6]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+    try std.testing.expectEqual(@as(u16, 16), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x80000000), cpu.d[7]);
     try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
 }
 
