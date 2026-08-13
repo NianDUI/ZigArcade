@@ -154,9 +154,9 @@ Neo Geo 是独立主机：68000 主 CPU、Z80 音频 CPU、YM2610、sprite/tile 
 
 `systems/neogeo/neogeo.zig` 将诊断 bus、受限 68000 CPU、fixed tilemap、palette RAM、timing 与 `320×224` framebuffer 组装为 `NeoGeoDiagnostic`；`resetCpu` 通过当前 BIOS overlay 读取向量，`stepCpu` 执行一条已支持的诊断指令，`stepCpuInstructions(n)` 明确执行 n 条并返回周期锚点累计值，`stepCpuCycleBudget(minimum, max)` 在不跳过指令的前提下累计到最小周期锚点或达到指令上限，并返回实际周期、指令数及是否达标，便于可复现的合成 BIOS/work-RAM 诊断。它们不是无限游戏循环，也未定义 STOP、IRQ 或完整时钟。`renderFixed` 只接收调用方持有的 tile store，且仍不包含 ROM-set 文件加载、Z80 执行或真实硬件寄存器。
 
-`systems/neogeo/input.zig` 把公共 `Actions(u16)` 映射到 Neo Geo A–D、Start、Coin 与方向的系统语义；端口地址及 active-low 数据线编码暂不定义，不能由 frontend 绕过该映射直接写 bus。
+`systems/neogeo/input.zig` 把公共 `Actions(u16)` 映射到 Neo Geo A–D、Start、Coin 与方向的系统语义；`cartridge_io.zig` 已独立锁定 P1/P2 的 active-low U/D/L/R/A/B/C/D 编码及 `REG_STATUS_B` 的 start/select 位，但尚未把单一宿主 select/coin 语义猜测性分派到双玩家或 MVS 状态位；正式 bus 接入前仍不能由 frontend 绕过这层。
 
-`systems/neogeo/sound_latch.zig` 定义 68000→Z80 command 与 Z80→68000 reply 的单字节 latest-value latch/pending 语义；没有假定 port 地址、Z80 中断、Z80 执行或 YM2610 寄存器。
+`systems/neogeo/sound_latch.zig` 定义 68000→Z80 command 的可消费 latch 与 Z80→68000 reply 的非破坏 latest-value latch；`cartridge_io.zig` 通过 `REG_SOUND` 连接它们。没有实现 NMI gating、Z80 执行或 YM2610 寄存器。
 
 `systems/neogeo/m68k.zig` 是 P5a 的受限 68000 诊断 CPU：它验证 reset SSP/PC vector、big-endian fetch、NOP、MOVEQ、`MOVE.L #imm,Dn`、`MOVE.L Dn,(An)`、`MOVE.L (An),Dn`、`MOVE.L Dn,(An)+`、`MOVE.L (An)+,Dn`、`MOVE.L Dn,-(An)`、`MOVE.L -(An),Dn`、`MOVEA.L #imm,An`、`MOVEA.W #imm,An`、`LEA (d16,An),An`、`MOVE.W #imm,Dn`、`MOVE.W #imm,(An)`、`MOVE.W Dn,(An)`、`MOVE.W (An),Dn`、`MOVE.W Dn,(An)+`、`MOVE.W (An)+,Dn`、`MOVE.W Dn,-(An)`、`MOVE.W -(An),Dn`、`MOVE.W Dn,(d16,An)`、`MOVE.W (d16,An),Dn`、`TST.L Dn`、`TST.W Dn`、`CMP.L #imm,Dn`、`CMP.W #imm,Dn`、`ADDQ.L/W #n,Dn`、`SUBQ.L/W #n,Dn`、BRA、BCC、BCS、BNE、BEQ、BPL、BMI（短/字位移）、`DBF Dn,<disp>`、`JSR (An)` 和 RTS 的基础控制流；JSR/RTS 回归同时锁定 big-endian 栈返回地址。当前 MOVE/TST 形式按操作数宽度更新 N/Z、清 V/C（保留 X）；`MOVEA.W` 符号扩展立即数、LEA 只做地址计算，二者均不改变 CCR；`(d16,An)` 使用有符号 word 位移，`(An)+` 在传送后自增、`-(An)` 在传送前预减，word 步长为 2、long 步长为 4 字节（均含 A7）；写入 Dn 的 word 形式保留高 16 位；CMP 按相应宽度的减法更新 N/Z/V/C 但保留 X 和操作数；ADDQ/SUBQ 的 quick 字段为 0 时表示 8，均按操作数宽度更新 X/N/Z/V/C；BCC/BCS 读取 C、BPL/BMI 读取 N、DBF 只递减 Dn 低字且不改变 CCR。未知 opcode 明确报错。cycle 返回值仅作诊断锚点，尚不代表完整 68000 指令集、异常、特权、精确总线周期或 Neo Geo 游戏可执行。
 

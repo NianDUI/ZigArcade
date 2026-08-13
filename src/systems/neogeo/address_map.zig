@@ -74,8 +74,17 @@ pub fn decode(variant: CartridgeVariant, address: u24) ?DecodedAddress {
         return .{ .target = .banked_program_rom, .offset = address - banked_program_rom_start };
     }
 
-    if (matches(address, p1_address, 0xfe0001)) return .{ .target = .player_1, .offset = address & 1 };
-    if (matches(address, dipswitch_watchdog_address, 0xfe0081)) return .{ .target = .dip_switch_and_watchdog, .offset = address & 1 };
+    // MVS reserves bit 7 for its TEST register at $300080/$300081. AES maps
+    // P1 more broadly. The Wiki explicitly marks its decode masks unverified;
+    // the MVS split below follows the independently pinned MAME map.
+    const p1_mask: u24 = switch (variant) {
+        .mvs => 0xfe0081,
+        .aes => 0xfe0001,
+    };
+    if (matches(address, p1_address, p1_mask)) return .{ .target = .player_1, .offset = address & 1 };
+    if (variant == .mvs and matches(address, dipswitch_watchdog_address, 0xfe0081)) {
+        return .{ .target = .dip_switch_and_watchdog, .offset = address & 1 };
+    }
     if (matches(address, sound_address, 0xfe0001)) return .{ .target = .sound, .offset = address & 1 };
     if (matches(address, player_2_address, 0xfe0001)) return .{ .target = .player_2, .offset = address & 1 };
     if (matches(address, system_address, 0xfe0001)) return .{ .target = .system, .offset = address & 1 };
@@ -127,11 +136,11 @@ test "Neo Geo common cartridge decoder normalizes documented RAM and palette mir
 test "Neo Geo common cartridge decoder applies documented I/O decode masks" {
     try @import("std").testing.expectEqual(
         DecodedAddress{ .target = .player_1, .offset = 0 },
-        decode(.mvs, 0x31fffe).?,
+        decode(.mvs, 0x31ff7e).?,
     );
     try @import("std").testing.expectEqual(
         DecodedAddress{ .target = .dip_switch_and_watchdog, .offset = 1 },
-        decode(.aes, 0x31ff01).?,
+        decode(.mvs, 0x31ff01).?,
     );
     try @import("std").testing.expectEqual(
         DecodedAddress{ .target = .sound, .offset = 0 },
@@ -145,6 +154,15 @@ test "Neo Geo common cartridge decoder applies documented I/O decode masks" {
         DecodedAddress{ .target = .video, .offset = 0x0e },
         decode(.mvs, 0x3dfffe).?,
     );
+}
+
+test "Neo Geo decoder separates MVS TEST space from the AES P1 mirror" {
+    try @import("std").testing.expectEqual(@as(?DecodedAddress, null), decode(.mvs, 0x300080));
+    try @import("std").testing.expectEqual(
+        DecodedAddress{ .target = .player_1, .offset = 0 },
+        decode(.aes, 0x300080).?,
+    );
+    try @import("std").testing.expectEqual(@as(?DecodedAddress, null), decode(.aes, 0x300001));
 }
 
 test "Neo Geo cartridge decoder separates AES memory card and MVS backup RAM" {

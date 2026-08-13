@@ -8,7 +8,8 @@
 |---|---|---|---|
 | NeoGeo Development Wiki：[`68k memory map`](https://wiki.neogeodev.org/index.php?title=68k_memory_map&oldid=8317) | revision 8317 | 主地址范围、物理大小与镜像 | 页面标注 CC0；仅摘录硬件事实，不拷贝实现 |
 | NeoGeo Development Wiki：[`Memory mapped registers`](https://wiki.neogeodev.org/index.php?title=Memory_mapped_registers&oldid=9288) | revision 9288 | I/O 基址、decode mask、寄存器语义 | 页面标注 CC0；其中页面自述“decode masks 未完全验证”，实施时以测试锁定 |
-| MAME：[`neogeo.cpp`](https://github.com/mamedev/mame/blob/c8f7357b5c573fd7f236c4747f0f34fafe510c54/src/mame/snk/neogeo.cpp#L1709-L1765) | commit `c8f7357b5c573fd7f236c4747f0f34fafe510c54` | 独立交叉核验 MVS/AES common map、RAM/Palette mirror 与 watchdog 地址 | MAME 许可证不兼容本项目 MIT；只作行为研究，禁止复制代码 |
+| NeoGeo Development Wiki：[`68k/Z80 communication`](https://wiki.neogeodev.org/index.php?title=68k/Z80_communication&oldid=5271) | revision 5271 | `REG_SOUND` 双向 byte latch、Z80 port `$00`/`$0C` 与 NMI 触发条件 | 页面标注 CC0；只采用 latch 读写事实，不实现 Z80/NMI |
+| MAME：[`neogeo.cpp`](https://github.com/mamedev/mame/blob/c8f7357b5c573fd7f236c4747f0f34fafe510c54/src/mame/snk/neogeo.cpp#L1533-L1584) | commit `c8f7357b5c573fd7f236c4747f0f34fafe510c54` | 独立交叉核验 MVS/AES 输入变体、RAM/Palette mirror 与 watchdog 地址 | MAME 许可证不兼容本项目 MIT；只作行为研究，禁止复制代码 |
 
 同一事实至少由 Wiki 与 MAME 之一明确支持；若二者表现出系统类型或板型差异，代码必须建模为显式 variant，不能用“默认值”掩盖。当前 `address_map.zig` 的 `decode(variant, address)` 要求调用方明确选择 `.mvs` 或 `.aes`，只编码下表中可确认的译码，不执行设备副作用。
 
@@ -27,13 +28,13 @@
 
 ## 已锁定 I/O 基址
 
-所有表项均按文档中的 decode mask 匹配镜像地址，且 68000 word 访问仍必须满足偶地址规则。byte lane、open-bus 值和未列系统变体不在本轮假定。
+所有表项均按文档中的 decode mask 匹配镜像地址。已接入的 `cartridge_io.zig` 只接受 offset 为 0 的有效 byte lane；68000 word 访问仍必须满足偶地址规则。open-bus 值和未列系统变体不在本轮假定。
 
 | 基址 | 名称 | 读 / 写概念 | 当前状态 |
 |---|---|---|---|
 | `$300000` | `REG_P1CNT` | P1 方向与 A–D，active-low | 仅译码；输入编码待总线接入 |
-| `$300001` | `REG_DIPSW` / watchdog | DIP read；写入 kick watchdog | 仅译码 |
-| `$320000` | `REG_SOUND` | Z80 reply / 68k sound command | 仅译码；可复用既有 `SoundLatch`，但 pending/IRQ 语义待 P5b |
+| `$300001` | `REG_DIPSW` / watchdog | DIP read；写入 kick watchdog | 当前只为 `.mvs` 译码；MVS 的 `$300080/$300081` TEST 空间明确不能被错译为 P1，AES 的 P1 镜像范围单独处理 |
+| `$320000` | `REG_SOUND` | Z80 reply / 68k sound command | `cartridge_io.zig` 已接入命令 latch 与非破坏 reply read；NMI、Z80 端口执行待 P5b |
 | `$340000` | `REG_P2CNT` | P2 输入，active-low | 仅译码 |
 | `$380000` | `REG_STATUS_B` | start/select 与系统状态 | 仅译码；MVS/AES 位定义需分 variant |
 | `$3A0001` 等 | system-control latch | palette bank、vector source、save/memory-card 控制等 | 仅译码；写入地址位决定 latch value |
@@ -46,7 +47,7 @@
 后续必须按以下顺序接入：
 
 1. 把 `Bus` 拆为显式 cartridge variant 与地址译码委托，保留无资产诊断路径。
-2. 以测试锁定 work RAM、palette RAM、P1/P2 active-low、sound latch 与 system-control palette/vector 开关的 byte/word lane。
+2. 以测试锁定 work RAM、palette RAM、P1/P2 active-low、start/select status 与 sound latch 的 byte/word lane；再实现 system-control palette/vector 开关。
 3. 再实现 LSPC VRAM port、timer/IRQ 与真正 68000 exception/interrupt 边界。
 
 在第 3 步完成前，不宣称可以运行 BIOS 或任何 Neo Geo 游戏。
