@@ -39,6 +39,27 @@ pub const Cpu = struct {
             self.pc = self.a[register];
             return 16;
         }
+        if (opcode & 0xfff8 == 0x4ed0) { // JMP (An)
+            const register: usize = @intCast(opcode & 7);
+            self.pc = self.a[register];
+            return 8;
+        }
+        if (opcode & 0xff00 == 0x6100) { // BSR.s/.w
+            const low: u8 = @truncate(opcode);
+            const displacement: i32 = if (low != 0)
+                @as(i32, @as(i8, @bitCast(low)))
+            else blk: {
+                const extension = try self.fetchWord(bus);
+                break :blk @as(i32, @as(i16, @bitCast(extension)));
+            };
+            try self.pushLong(bus, self.pc);
+            if (displacement < 0) {
+                self.pc -%= @intCast(-displacement);
+            } else {
+                self.pc +%= @intCast(displacement);
+            }
+            return if (low == 0) 20 else 18;
+        }
         if (opcode & 0xf1ff == 0x203c) { // MOVE.L #imm,Dn
             const register: usize = @intCast((opcode >> 9) & 7);
             self.d[register] = try self.fetchLong(bus);
@@ -91,6 +112,22 @@ pub const Cpu = struct {
             self.setMoveLongFlags(self.d[source]);
             return 14;
         }
+        if (opcode & 0xf1f8 == 0x2028) { // MOVE.L (d16,An),Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const address = self.addressWithWordDisplacement(self.a[source], try self.fetchWord(bus));
+            self.d[destination] = try readLong(bus, address);
+            self.setMoveLongFlags(self.d[destination]);
+            return 16;
+        }
+        if (opcode & 0xf1f8 == 0x2140) { // MOVE.L Dn,(d16,An)
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const address = self.addressWithWordDisplacement(self.a[destination], try self.fetchWord(bus));
+            try writeLong(bus, address, self.d[source]);
+            self.setMoveLongFlags(self.d[source]);
+            return 16;
+        }
         if (opcode & 0xf1ff == 0x207c) { // MOVEA.L #imm,An
             const register: usize = @intCast((opcode >> 9) & 7);
             self.a[register] = try self.fetchLong(bus);
@@ -106,6 +143,15 @@ pub const Cpu = struct {
             const destination: usize = @intCast((opcode >> 9) & 7);
             const source: usize = @intCast(opcode & 7);
             self.a[destination] = self.addressWithWordDisplacement(self.a[source], try self.fetchWord(bus));
+            return 8;
+        }
+        if (opcode & 0xf1ff == 0x41fa) { // LEA (d16,PC),An
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            // On 68000, PC-relative effective addresses use the address of
+            // the extension word itself, not the PC after consuming it.
+            const extension_address = self.pc;
+            const displacement = try self.fetchWord(bus);
+            self.a[destination] = self.addressWithWordDisplacement(extension_address, displacement);
             return 8;
         }
         if (opcode & 0xf1ff == 0x303c) { // MOVE.W #imm,Dn
@@ -502,6 +548,58 @@ test "68000 JSR through an address register pushes a big-endian return address f
     try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
 }
 
+test "68000 JMP through an address register changes PC without touching the stack or CCR" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x4e, 0xd3, // JMP (A3)
+        0xff, 0xff, // skipped
+        0x4e, 0x71, // target: NOP
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.a[3] = 12;
+    cpu.sr = 0x271f;
+    try std.testing.expectEqual(@as(u16, 8), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 12), cpu.pc);
+    try std.testing.expectEqual(@as(u32, 0x10fffc), cpu.a[7]);
+    try std.testing.expectEqual(@as(u16, 0x271f), cpu.sr);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+}
+
+test "68000 BSR uses relative short and word targets with RTS return addresses" {
+    const Bus = @import("bus.zig").Bus;
+    var program: [0x30]u8 = [_]u8{0} ** 0x30;
+    program[0..8].* = .{ 0x00, 0x10, 0xff, 0xfc, 0x00, 0x00, 0x00, 0x08 };
+    program[8..10].* = .{ 0x61, 0x06 }; // BSR.s $10
+    program[10..12].* = .{ 0x61, 0x00 }; // BSR.w $20
+    program[12..14].* = .{ 0x00, 0x12 };
+    program[14..16].* = .{ 0x4e, 0x71 }; // final return target: NOP
+    program[16..18].* = .{ 0x4e, 0x75 }; // short subroutine: RTS
+    program[0x20..0x22].* = .{ 0x4e, 0x75 }; // word subroutine: RTS
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    try std.testing.expectEqual(@as(u16, 18), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x10), cpu.pc);
+    try std.testing.expectEqual(@as(u32, 0x10fff8), cpu.a[7]);
+    try std.testing.expectEqual(@as(?u32, 0x0000000a), bus.readLong(0x10fff8));
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0x0a), cpu.pc);
+    try std.testing.expectEqual(@as(u16, 20), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x20), cpu.pc);
+    try std.testing.expectEqual(@as(u32, 0x10fff8), cpu.a[7]);
+    try std.testing.expectEqual(@as(?u32, 0x0000000e), bus.readLong(0x10fff8));
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0x0e), cpu.pc);
+    try std.testing.expectEqual(@as(u32, 0x10fffc), cpu.a[7]);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+}
+
 test "68000 diagnostic CPU loads a big-endian immediate long into any D register" {
     const Bus = @import("bus.zig").Bus;
     const program = [_]u8{
@@ -579,6 +677,31 @@ test "68000 MOVE.L predecrement and postincrement advance addresses by four byte
     try std.testing.expectEqual(@as(u32, 0x100024), cpu.a[5]);
 }
 
+test "68000 MOVE.L transfers through signed address displacements" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x26, 0x28, // MOVE.L -4(A0),D3
+        0xff, 0xfc,
+        0x2b, 0x43, // MOVE.L D3,4(A5)
+        0x00, 0x04,
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    try std.testing.expect(bus.writeWord(0x100000, 0x80ab));
+    try std.testing.expect(bus.writeWord(0x100002, 0xcdef));
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.a[0] = 0x100004;
+    cpu.a[5] = 0x100010;
+    try std.testing.expectEqual(@as(u16, 16), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x80abcdef), cpu.d[3]);
+    try std.testing.expect(cpu.sr & Cpu.flag_negative != 0);
+    try std.testing.expectEqual(@as(u16, 16), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(?u32, 0x80abcdef), bus.readLong(0x100014));
+}
+
 test "68000 diagnostic CPU loads a big-endian immediate long into an address register" {
     const Bus = @import("bus.zig").Bus;
     const program = [_]u8{
@@ -631,6 +754,25 @@ test "68000 LEA address displacement preserves CCR and supports a distinct desti
     try std.testing.expectEqual(@as(u16, 8), try cpu.step(&bus));
     try std.testing.expectEqual(@as(u32, 0x00100000), cpu.a[4]);
     try std.testing.expectEqual(@as(u32, 0x00100020), cpu.a[0]);
+    try std.testing.expectEqual(@as(u16, 0x271f), cpu.sr);
+}
+
+test "68000 LEA PC displacement uses the extension-word address and preserves CCR" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x4d, 0xfa, // LEA -$0004(PC),A6; extension word is at $000A
+        0xff, 0xfc,
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.sr = 0x271f;
+    try std.testing.expectEqual(@as(u16, 8), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 6), cpu.a[6]);
+    try std.testing.expectEqual(@as(u32, 12), cpu.pc);
     try std.testing.expectEqual(@as(u16, 0x271f), cpu.sr);
 }
 
