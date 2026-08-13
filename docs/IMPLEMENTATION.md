@@ -184,6 +184,10 @@ BHI/BLS 完成无符号大小比较分支：它们分别判断 `!C && !Z` 与 `C
 
 `EORI.W/L #imm,Dn` 完成 Dn-only 的立即数异或形式，数据宽度和 CCR 规则与 ORI/ANDI 一致。
 
+`NOT.W/L Dn` 对 Dn 对应宽度逐位取反；word 形式保留高 16 位，两个形式均按逻辑结果更新 N/Z、清 V/C 并保留 X。
+
+`NEG.W/L Dn` 对 Dn 对应宽度作二补数取负；非零操作数置 X/C，最小负数置 V，按结果更新 N/Z。
+
 `MOVE.L Dn,(d16,An)` 与 `MOVE.L (d16,An),Dn` 复用有符号 word 位移的有效地址规则，并以 big-endian long 读写普通诊断内存。
 
 `zigarcade --demo-neogeo auto|kitty|ansi` 直接呈现不含任何 ROM/BIOS 的合成 320×224 固定层图案，并推进一帧诊断 raster clock，用于当前 Ghostty/ANSI 前端验证；它不是 Neo Geo 游戏运行入口。

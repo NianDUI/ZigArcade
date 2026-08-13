@@ -392,6 +392,34 @@ pub const Cpu = struct {
             self.setMoveLongFlags(self.d[register]);
             return 16;
         }
+        if (opcode & 0xfff8 == 0x4640) { // NOT.W Dn
+            const register: usize = @intCast(opcode & 7);
+            const result: u16 = ~@as(u16, @truncate(self.d[register]));
+            self.d[register] = (self.d[register] & 0xffff0000) | result;
+            self.setMoveWordFlags(result);
+            return 4;
+        }
+        if (opcode & 0xfff8 == 0x4680) { // NOT.L Dn
+            const register: usize = @intCast(opcode & 7);
+            self.d[register] = ~self.d[register];
+            self.setMoveLongFlags(self.d[register]);
+            return 4;
+        }
+        if (opcode & 0xfff8 == 0x4440) { // NEG.W Dn
+            const register: usize = @intCast(opcode & 7);
+            const destination: u16 = @truncate(self.d[register]);
+            const result = 0 -% destination;
+            self.d[register] = (self.d[register] & 0xffff0000) | result;
+            self.setNegateWordFlags(destination, result);
+            return 4;
+        }
+        if (opcode & 0xfff8 == 0x4480) { // NEG.L Dn
+            const register: usize = @intCast(opcode & 7);
+            const destination = self.d[register];
+            self.d[register] = 0 -% destination;
+            self.setNegateLongFlags(destination, self.d[register]);
+            return 4;
+        }
         if (opcode & 0xff00 == 0x6000 or opcode & 0xff00 == 0x6200 or opcode & 0xff00 == 0x6300 or opcode & 0xff00 == 0x6400 or opcode & 0xff00 == 0x6500 or opcode & 0xff00 == 0x6600 or opcode & 0xff00 == 0x6700 or opcode & 0xff00 == 0x6800 or opcode & 0xff00 == 0x6900 or opcode & 0xff00 == 0x6a00 or opcode & 0xff00 == 0x6b00 or opcode & 0xff00 == 0x6c00 or opcode & 0xff00 == 0x6d00 or opcode & 0xff00 == 0x6e00 or opcode & 0xff00 == 0x6f00) { // BRA/BHI/BLS/BCC/BCS/BNE/BEQ/BVC/BVS/BPL/BMI/BGE/BLT/BGT/BLE .s/.w
             const low: u8 = @truncate(opcode);
             const displacement: i32 = if (low != 0)
@@ -526,6 +554,22 @@ pub const Cpu = struct {
             self.sr |= flag_overflow;
         }
         if (result < destination) self.sr |= flag_extend | flag_carry;
+    }
+
+    fn setNegateWordFlags(self: *Cpu, destination: u16, result: u16) void {
+        self.sr &= ~(flag_extend | flag_negative | flag_zero | flag_overflow | flag_carry);
+        if (result == 0) self.sr |= flag_zero;
+        if (result & 0x8000 != 0) self.sr |= flag_negative;
+        if (destination == 0x8000) self.sr |= flag_overflow;
+        if (destination != 0) self.sr |= flag_extend | flag_carry;
+    }
+
+    fn setNegateLongFlags(self: *Cpu, destination: u32, result: u32) void {
+        self.sr &= ~(flag_extend | flag_negative | flag_zero | flag_overflow | flag_carry);
+        if (result == 0) self.sr |= flag_zero;
+        if (result & 0x80000000 != 0) self.sr |= flag_negative;
+        if (destination == 0x80000000) self.sr |= flag_overflow;
+        if (destination != 0) self.sr |= flag_extend | flag_carry;
     }
 };
 
@@ -1225,6 +1269,59 @@ test "68000 EORI applies immediate word and long masks while preserving X" {
     try std.testing.expectEqual(@as(u16, 16), try cpu.step(&bus));
     try std.testing.expectEqual(@as(u32, 0x80000000), cpu.d[7]);
     try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+}
+
+test "68000 NOT applies word and long inversion while preserving X" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x46, 0x41, // NOT.W D1
+        0x46, 0x82, // NOT.L D2
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[1] = 0xface7ffe;
+    cpu.d[2] = 0x7fffffff;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface8001), cpu.d[1]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x80000000), cpu.d[2]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+}
+
+test "68000 NEG applies word and long two's-complement flags including overflow" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x44, 0x43, // NEG.W D3
+        0x44, 0x84, // NEG.L D4
+        0x44, 0x45, // NEG.W D5
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[3] = 0xface0001;
+    cpu.d[4] = 0x80000000;
+    cpu.d[5] = 0xdead0000;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xfaceffff), cpu.d[3]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_carry) == (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_carry));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow) == 0);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x80000000), cpu.d[4]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_overflow | Cpu.flag_carry) == (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_overflow | Cpu.flag_carry));
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xdead0000), cpu.d[5]);
+    try std.testing.expect(cpu.sr & Cpu.flag_zero != 0);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_overflow | Cpu.flag_carry) == 0);
 }
 
 test "68000 CMP.L immediate preserves registers and X while updating subtraction flags" {
