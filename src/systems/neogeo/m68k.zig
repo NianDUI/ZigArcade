@@ -294,6 +294,44 @@ pub const Cpu = struct {
             self.setSubtractWordFlags(destination, immediate, result, true);
             return 4;
         }
+        if (opcode & 0xf1f8 == 0xd040) { // ADD.W Dn,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const destination_value: u16 = @truncate(self.d[destination]);
+            const source_value: u16 = @truncate(self.d[source]);
+            const result = destination_value +% source_value;
+            self.d[destination] = (self.d[destination] & 0xffff0000) | result;
+            self.setAddWordFlags(destination_value, source_value, result);
+            return 4;
+        }
+        if (opcode & 0xf1f8 == 0xd080) { // ADD.L Dn,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const destination_value = self.d[destination];
+            const source_value = self.d[source];
+            self.d[destination] +%= source_value;
+            self.setAddLongFlags(destination_value, source_value, self.d[destination]);
+            return 6;
+        }
+        if (opcode & 0xf1f8 == 0x9040) { // SUB.W Dn,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const destination_value: u16 = @truncate(self.d[destination]);
+            const source_value: u16 = @truncate(self.d[source]);
+            const result = destination_value -% source_value;
+            self.d[destination] = (self.d[destination] & 0xffff0000) | result;
+            self.setSubtractWordFlags(destination_value, source_value, result, true);
+            return 4;
+        }
+        if (opcode & 0xf1f8 == 0x9080) { // SUB.L Dn,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const destination_value = self.d[destination];
+            const source_value = self.d[source];
+            self.d[destination] -%= source_value;
+            self.setSubtractLongFlags(destination_value, source_value, self.d[destination], true);
+            return 6;
+        }
         if (opcode & 0xfff8 == 0x51c8) { // DBF Dn,displacement
             const register: usize = @intCast(opcode & 7);
             const displacement: i32 = @as(i32, @as(i16, @bitCast(try self.fetchWord(bus))));
@@ -1575,6 +1613,80 @@ test "68000 ADDQ.W preserves the high word and applies word arithmetic flags" {
     try std.testing.expectEqual(@as(u32, 0xbeef8001), cpu.d[1]);
     try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow) == (Cpu.flag_negative | Cpu.flag_overflow));
     try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_carry) == 0);
+}
+
+test "68000 ADD register forms use the source register and retain word high bits" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0xd6, 0x41, // ADD.W D1,D3
+        0xda, 0x84, // ADD.L D4,D5
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[1] = 0x11110002;
+    cpu.d[3] = 0xface7fff;
+    cpu.d[4] = 1;
+    cpu.d[5] = 0x7fffffff;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface8001), cpu.d[3]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow) == (Cpu.flag_negative | Cpu.flag_overflow));
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_carry) == 0);
+    try std.testing.expectEqual(@as(u16, 6), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x80000000), cpu.d[5]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow) == (Cpu.flag_negative | Cpu.flag_overflow));
+}
+
+test "68000 SUB register forms use the source register and retain word high bits" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x96, 0x41, // SUB.W D1,D3
+        0x9a, 0x84, // SUB.L D4,D5
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[1] = 2;
+    cpu.d[3] = 0xface8000;
+    cpu.d[4] = 1;
+    cpu.d[5] = 0x80000000;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface7ffe), cpu.d[3]);
+    try std.testing.expect(cpu.sr & Cpu.flag_overflow != 0);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_zero | Cpu.flag_carry) == 0);
+    try std.testing.expectEqual(@as(u16, 6), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x7fffffff), cpu.d[5]);
+    try std.testing.expect(cpu.sr & Cpu.flag_overflow != 0);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_zero | Cpu.flag_carry) == 0);
+}
+
+test "68000 ADD and SUB register forms set X/C on wrap and borrow" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0xd0, 0x81, // ADD.L D1,D0
+        0x90, 0x82, // SUB.L D2,D0
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[0] = 0xffffffff;
+    cpu.d[1] = 1;
+    cpu.d[2] = 1;
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0), cpu.d[0]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_carry) == (Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_carry));
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xffffffff), cpu.d[0]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_carry) == (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_carry));
 }
 
 test "68000 SUBQ.L uses encoded eight and updates all arithmetic flags" {
