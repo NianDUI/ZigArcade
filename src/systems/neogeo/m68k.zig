@@ -353,6 +353,14 @@ pub const Cpu = struct {
             self.setMoveLongFlags(self.d[register]);
             return 4;
         }
+        if (opcode & 0xf0f8 == 0x50c0) { // Scc Dn
+            const register: usize = @intCast(opcode & 7);
+            const condition: u4 = @intCast((opcode >> 8) & 0x0f);
+            const set = self.conditionTrue(condition);
+            const value: u32 = if (set) 0xff else 0;
+            self.d[register] = (self.d[register] & 0xffffff00) | value;
+            return 4;
+        }
         if (opcode & 0xfff8 == 0x0040) { // ORI.W #imm,Dn
             const register: usize = @intCast(opcode & 7);
             const result: u16 = @truncate(self.d[register] | try self.fetchWord(bus));
@@ -482,6 +490,34 @@ pub const Cpu = struct {
             base -% @as(u32, @intCast(-@as(i32, displacement)))
         else
             base +% @as(u32, @intCast(displacement));
+    }
+
+    /// Shared 68000 condition-code decoder for Dn-only Scc. Bcc accepts all
+    /// non-zero conditions separately; condition 0 (true) and 1 (false) are
+    /// meaningful only to Scc in this restricted implementation.
+    fn conditionTrue(self: *const Cpu, condition: u4) bool {
+        const n = self.sr & flag_negative != 0;
+        const z = self.sr & flag_zero != 0;
+        const v = self.sr & flag_overflow != 0;
+        const c = self.sr & flag_carry != 0;
+        return switch (condition) {
+            0 => true, // ST
+            1 => false, // SF
+            2 => !c and !z, // SHI
+            3 => c or z, // SLS
+            4 => !c, // SCC
+            5 => c, // SCS
+            6 => !z, // SNE
+            7 => z, // SEQ
+            8 => !v, // SVC
+            9 => v, // SVS
+            10 => !n, // SPL
+            11 => n, // SMI
+            12 => n == v, // SGE
+            13 => n != v, // SLT
+            14 => !z and n == v, // SGT
+            15 => z or n != v, // SLE
+        };
     }
 
     fn setMoveLongFlags(self: *Cpu, value: u32) void {
@@ -1188,6 +1224,78 @@ test "68000 EXT sign-extends byte and word while preserving X" {
     try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
     try std.testing.expectEqual(@as(u32, 0xffff8001), cpu.d[6]);
     try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+}
+
+test "68000 Scc writes only the low byte without changing CCR" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x50, 0xc0, // ST D0
+        0x51, 0xc5, // SF D5
+        0x57, 0xc1, // SEQ D1
+        0x56, 0xc2, // SNE D2
+        0x57, 0xc3, // SEQ D3
+        0x56, 0xc4, // SNE D4
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[0] = 0xface0000;
+    cpu.d[1] = 0xface0000;
+    cpu.d[2] = 0xface0000;
+    cpu.d[3] = 0xface0000;
+    cpu.d[4] = 0xface0000;
+    cpu.d[5] = 0xface0000;
+    cpu.sr = 0x271f; // Z is set
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface00ff), cpu.d[0]);
+    try std.testing.expectEqual(@as(u16, 0x271f), cpu.sr);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface0000), cpu.d[5]);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface00ff), cpu.d[1]);
+    try std.testing.expectEqual(@as(u16, 0x271f), cpu.sr);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface0000), cpu.d[2]);
+    cpu.sr &= ~Cpu.flag_zero;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface0000), cpu.d[3]);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface00ff), cpu.d[4]);
+    try std.testing.expect(cpu.sr & Cpu.flag_zero == 0);
+}
+
+test "68000 Scc matches carry, overflow and signed comparison conditions" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x52, 0xc0, // SHI D0
+        0x53, 0xc1, // SLS D1
+        0x54, 0xc2, // SCC D2
+        0x55, 0xc3, // SCS D3
+        0x58, 0xc4, // SVC D4
+        0x59, 0xc5, // SVS D5
+        0x5c, 0xc6, // SGE D6
+        0x5d, 0xc7, // SLT D7
+        0x5a, 0xc0, // SPL D0
+        0x5b, 0xc1, // SMI D1
+        0x5e, 0xc2, // SGT D2
+        0x5f, 0xc3, // SLE D3
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.sr = 0x2700 | Cpu.flag_negative | Cpu.flag_overflow; // N=V=1, C=Z=0
+    const expected = [_]u8{ 0xff, 0x00, 0xff, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0xff, 0xff, 0x00 };
+    for (0..expected.len) |index| {
+        _ = try cpu.step(&bus);
+        try std.testing.expectEqual(expected[index], @as(u8, @truncate(cpu.d[index % 8])));
+        try std.testing.expectEqual(@as(u16, 0x270a), cpu.sr);
+    }
 }
 
 test "68000 ORI applies immediate word and long masks while preserving X" {
