@@ -42,12 +42,12 @@
 
 ## 代码落点与测试顺序
 
-`src/systems/neogeo/address_map.zig` 是纯函数地址译码层：调用方必须传入 `.mvs` 或 `.aes`，它才返回设备目标和归一化后的物理 byte offset。`bus.zig` 仍是旧的合成诊断总线，不能被误称为真实硬件总线。
+`src/systems/neogeo/address_map.zig` 是纯函数地址译码层：调用方必须传入 `.mvs` 或 `.aes`，它才返回设备目标和归一化后的物理 byte offset。`cartridge_bus.zig` 是独立的、无资产的卡带总线组合切片：目前只接入 work RAM 的 byte/word、palette RAM 的 word，以及 `cartridge_io.zig` 已锁定的 I/O byte lane；I/O word、palette byte、ROM、open bus、memory-card、backup RAM、LSPC 都明确保持未映射。`bus.zig` 仍是旧的合成诊断总线，不能被误称为真实硬件总线。
 
 后续必须按以下顺序接入：
 
-1. 把 `Bus` 拆为显式 cartridge variant 与地址译码委托，保留无资产诊断路径。
-2. 以测试锁定 work RAM、palette RAM、P1/P2 active-low、start/select status 与 sound latch 的 byte/word lane；再实现 system-control palette/vector 开关。
+1. 将固定/银行 P-ROM、system ROM、vector switch 以显式设备接入 `cartridge_bus.zig`，并先锁定 ROM wait/open-bus 规则。
+2. 扩充经资料验证的 byte/word lane：palette byte 写 mask、I/O word 低字节、system-control palette/vector 开关。
 3. 再实现 LSPC VRAM port、timer/IRQ 与真正 68000 exception/interrupt 边界。
 
 在第 3 步完成前，不宣称可以运行 BIOS 或任何 Neo Geo 游戏。
