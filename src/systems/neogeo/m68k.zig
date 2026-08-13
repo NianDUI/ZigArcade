@@ -219,6 +219,16 @@ pub const Cpu = struct {
             self.setAddLongFlags(destination, immediate, self.d[register]);
             return 8;
         }
+        if (opcode & 0xf1f8 == 0x5040) { // ADDQ.W #imm3,Dn (encoded 0 means 8)
+            const register: usize = @intCast(opcode & 7);
+            const encoded: u16 = @intCast((opcode >> 9) & 7);
+            const immediate = if (encoded == 0) @as(u16, 8) else encoded;
+            const destination: u16 = @truncate(self.d[register]);
+            const result = destination +% immediate;
+            self.d[register] = (self.d[register] & 0xffff0000) | result;
+            self.setAddWordFlags(destination, immediate, result);
+            return 4;
+        }
         if (opcode & 0xf1f8 == 0x5180) { // SUBQ.L #imm3,Dn (encoded 0 means 8)
             const register: usize = @intCast(opcode & 7);
             const encoded: u32 = @intCast((opcode >> 9) & 7);
@@ -227,6 +237,16 @@ pub const Cpu = struct {
             self.d[register] -%= immediate;
             self.setSubtractLongFlags(destination, immediate, self.d[register], true);
             return 8;
+        }
+        if (opcode & 0xf1f8 == 0x5140) { // SUBQ.W #imm3,Dn (encoded 0 means 8)
+            const register: usize = @intCast(opcode & 7);
+            const encoded: u16 = @intCast((opcode >> 9) & 7);
+            const immediate = if (encoded == 0) @as(u16, 8) else encoded;
+            const destination: u16 = @truncate(self.d[register]);
+            const result = destination -% immediate;
+            self.d[register] = (self.d[register] & 0xffff0000) | result;
+            self.setSubtractWordFlags(destination, immediate, result, true);
+            return 4;
         }
         if (opcode & 0xfff8 == 0x51c8) { // DBF Dn,displacement
             const register: usize = @intCast(opcode & 7);
@@ -327,13 +347,21 @@ pub const Cpu = struct {
 
     fn setCompareWordFlags(self: *Cpu, destination: u16, source: u16) void {
         const result = destination -% source;
+        self.setSubtractWordFlags(destination, source, result, false);
+    }
+
+    fn setSubtractWordFlags(self: *Cpu, destination: u16, source: u16, result: u16, update_extend: bool) void {
         self.sr &= ~(flag_negative | flag_zero | flag_overflow | flag_carry);
+        if (update_extend) self.sr &= ~flag_extend;
         if (result == 0) self.sr |= flag_zero;
         if (result & 0x8000 != 0) self.sr |= flag_negative;
         if ((destination ^ source) & (destination ^ result) & 0x8000 != 0) {
             self.sr |= flag_overflow;
         }
-        if (source > destination) self.sr |= flag_carry;
+        if (source > destination) {
+            self.sr |= flag_carry;
+            if (update_extend) self.sr |= flag_extend;
+        }
     }
 
     fn setSubtractLongFlags(self: *Cpu, destination: u32, source: u32, result: u32, update_extend: bool) void {
@@ -355,6 +383,16 @@ pub const Cpu = struct {
         if (result == 0) self.sr |= flag_zero;
         if (result & 0x80000000 != 0) self.sr |= flag_negative;
         if (~(destination ^ source) & (destination ^ result) & 0x80000000 != 0) {
+            self.sr |= flag_overflow;
+        }
+        if (result < destination) self.sr |= flag_extend | flag_carry;
+    }
+
+    fn setAddWordFlags(self: *Cpu, destination: u16, source: u16, result: u16) void {
+        self.sr &= ~(flag_extend | flag_negative | flag_zero | flag_overflow | flag_carry);
+        if (result == 0) self.sr |= flag_zero;
+        if (result & 0x8000 != 0) self.sr |= flag_negative;
+        if (~(destination ^ source) & (destination ^ result) & 0x8000 != 0) {
             self.sr |= flag_overflow;
         }
         if (result < destination) self.sr |= flag_extend | flag_carry;
@@ -936,6 +974,30 @@ test "68000 ADDQ.L uses encoded eight and updates all arithmetic flags" {
     try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
 }
 
+test "68000 ADDQ.W preserves the high word and applies word arithmetic flags" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x50, 0x40, // ADDQ.W #8,D0
+        0x54, 0x41, // ADDQ.W #2,D1
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[0] = 0xfacefff8;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface0000), cpu.d[0]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_carry) == (Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_carry));
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow) == 0);
+    cpu.d[1] = 0xbeef7fff;
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xbeef8001), cpu.d[1]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow) == (Cpu.flag_negative | Cpu.flag_overflow));
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_carry) == 0);
+}
+
 test "68000 SUBQ.L uses encoded eight and updates all arithmetic flags" {
     const Bus = @import("bus.zig").Bus;
     const program = [_]u8{
@@ -966,6 +1028,30 @@ test "68000 SUBQ.L uses encoded eight and updates all arithmetic flags" {
     cpu.d[2] = 0x80000000;
     _ = try cpu.step(&bus);
     try std.testing.expectEqual(@as(u32, 0x7fffffff), cpu.d[2]);
+    try std.testing.expect(cpu.sr & Cpu.flag_overflow != 0);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_zero | Cpu.flag_carry) == 0);
+}
+
+test "68000 SUBQ.W preserves the high word and applies word arithmetic flags" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x51, 0x40, // SUBQ.W #8,D0
+        0x53, 0x41, // SUBQ.W #1,D1
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[0] = 0xface0000;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xfacefff8), cpu.d[0]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_carry) == (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_carry));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow) == 0);
+    cpu.d[1] = 0xbeef8000;
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xbeef7fff), cpu.d[1]);
     try std.testing.expect(cpu.sr & Cpu.flag_overflow != 0);
     try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_zero | Cpu.flag_carry) == 0);
 }
