@@ -198,6 +198,12 @@ BHI/BLS 完成无符号大小比较分支：它们分别判断 `!C && !Z` 与 `C
 
 `MOVE.B #imm,Dn`、`TST.B Dn`、`CLR.B Dn` 构成当前 Dn-only byte 基础子集：均仅访问 Dn 低 byte、保留高 24 位，按 byte 宽度更新 N/Z、清 V/C 并保留 X。
 
+`MOVE.B Dn,Dn` 提供数据寄存器间 byte 传送：读取源低 byte、覆盖目标低 byte并保留其余 24 位；CCR 遵循 byte MOVE 规则。
+
+`MOVE.W Dn,Dn` 对应传送低 word、保留目标高 16 位，按 word 宽度更新 N/Z、清 V/C 并保留 X。
+
+`MOVE.L Dn,Dn` 复制完整 32 位结果，并按 long 宽度更新 N/Z、清 V/C、保留 X。
+
 `ORI.B`、`ANDI.B`、`EORI.B #imm,Dn` 将立即数逻辑族扩展到 Dn 低 byte：立即数使用 word 扩展字的低 byte，写回和 CCR 规则遵循 byte 宽度。
 
 `NOT.B Dn`、`NEG.B Dn` 使当前 unary 子集支持 byte：均保留 Dn 高 24 位；NEG 的非零结果置 X/C，输入 `$80` 置 V。

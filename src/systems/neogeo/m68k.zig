@@ -168,6 +168,29 @@ pub const Cpu = struct {
             self.setMoveByteFlags(value);
             return 8;
         }
+        if (opcode & 0xf1f8 == 0x1000) { // MOVE.B Dn,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const value: u8 = @truncate(self.d[source]);
+            self.d[destination] = (self.d[destination] & 0xffffff00) | value;
+            self.setMoveByteFlags(value);
+            return 4;
+        }
+        if (opcode & 0xf1f8 == 0x3000) { // MOVE.W Dn,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const value: u16 = @truncate(self.d[source]);
+            self.d[destination] = (self.d[destination] & 0xffff0000) | value;
+            self.setMoveWordFlags(value);
+            return 4;
+        }
+        if (opcode & 0xf1f8 == 0x2000) { // MOVE.L Dn,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            self.d[destination] = self.d[source];
+            self.setMoveLongFlags(self.d[destination]);
+            return 4;
+        }
         if (opcode & 0xf1ff == 0x30bc) { // MOVE.W #imm,(An)
             const register: usize = @intCast((opcode >> 9) & 7);
             const value = try self.fetchWord(bus);
@@ -970,6 +993,69 @@ test "68000 byte data-register operations preserve the high 24 bits and use byte
     try std.testing.expectEqual(@as(u32, 0xface0000), cpu.d[3]);
     try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_extend) == (Cpu.flag_zero | Cpu.flag_extend));
     try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+}
+
+test "68000 MOVE.B between data registers preserves the destination high 24 bits" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x16, 0x01, // MOVE.B D1,D3
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[1] = 0x11110080;
+    cpu.d[3] = 0xface0000;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface0080), cpu.d[3]);
+    try std.testing.expectEqual(@as(u32, 0x11110080), cpu.d[1]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+}
+
+test "68000 MOVE.W between data registers preserves the destination high word" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x36, 0x01, // MOVE.W D1,D3
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[1] = 0x11118000;
+    cpu.d[3] = 0xface0000;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface8000), cpu.d[3]);
+    try std.testing.expectEqual(@as(u32, 0x11118000), cpu.d[1]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+}
+
+test "68000 MOVE.L between data registers copies all bits and uses long flags" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x26, 0x01, // MOVE.L D1,D3
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[1] = 0x80000001;
+    cpu.d[3] = 0;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry;
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x80000001), cpu.d[3]);
+    try std.testing.expectEqual(@as(u32, 0x80000001), cpu.d[1]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
 }
 
 test "68000 MOVE.L transfers big-endian values between data registers and address-register memory" {
