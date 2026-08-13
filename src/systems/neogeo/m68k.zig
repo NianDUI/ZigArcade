@@ -274,7 +274,7 @@ pub const Cpu = struct {
             self.setMoveWordFlags(@truncate(self.d[register]));
             return 4;
         }
-        if (opcode & 0xff00 == 0x6000 or opcode & 0xff00 == 0x6600 or opcode & 0xff00 == 0x6700) { // BRA/BNE/BEQ .s/.w
+        if (opcode & 0xff00 == 0x6000 or opcode & 0xff00 == 0x6400 or opcode & 0xff00 == 0x6500 or opcode & 0xff00 == 0x6600 or opcode & 0xff00 == 0x6700 or opcode & 0xff00 == 0x6800 or opcode & 0xff00 == 0x6900 or opcode & 0xff00 == 0x6a00 or opcode & 0xff00 == 0x6b00) { // BRA/BCC/BCS/BNE/BEQ/BVC/BVS/BPL/BMI .s/.w
             const low: u8 = @truncate(opcode);
             const displacement: i32 = if (low != 0)
                 @as(i32, @as(i8, @bitCast(low)))
@@ -285,8 +285,14 @@ pub const Cpu = struct {
             const condition = opcode & 0xff00;
             const should_branch = switch (condition) {
                 0x6000 => true, // BRA
+                0x6400 => self.sr & flag_carry == 0, // BCC
+                0x6500 => self.sr & flag_carry != 0, // BCS
                 0x6600 => self.sr & flag_zero == 0, // BNE
                 0x6700 => self.sr & flag_zero != 0, // BEQ
+                0x6800 => self.sr & flag_overflow == 0, // BVC
+                0x6900 => self.sr & flag_overflow != 0, // BVS
+                0x6a00 => self.sr & flag_negative == 0, // BPL
+                0x6b00 => self.sr & flag_negative != 0, // BMI
                 else => unreachable,
             };
             if (should_branch) {
@@ -1135,6 +1141,99 @@ test "68000 BNE branches only when Z is clear" {
     _ = try cpu.step(&bus);
     _ = try cpu.step(&bus);
     try std.testing.expectEqual(@as(u32, 20), cpu.pc);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+}
+
+test "68000 BCC and BCS branch from the carry flag with short and word displacements" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0xb0, 0x7c, // CMP.W #1,D0 sets C for D0=0
+        0x00, 0x01,
+        0x65, 0x02, // BCS.s +2, taken
+        0xff, 0xff, // skipped
+        0xb0, 0x7c, // CMP.W #0,D0 clears C
+        0x00, 0x00,
+        0x64, 0x00, // BCC.w +2, taken
+        0x00, 0x02,
+        0xff, 0xff, // skipped
+        0x4e, 0x71, // NOP
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[0] = 0;
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & Cpu.flag_carry != 0);
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 16), cpu.pc);
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & Cpu.flag_carry == 0);
+    try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 26), cpu.pc);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+}
+
+test "68000 BPL and BMI branch from the negative flag with short and word displacements" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x4a, 0x40, // TST.W D0: D0=$8000 sets N
+        0x6b, 0x02, // BMI.s +2, taken
+        0xff, 0xff, // skipped
+        0x4a, 0x40, // TST.W D0: D0=0 clears N
+        0x6a, 0x00, // BPL.w +2, taken
+        0x00, 0x02,
+        0xff, 0xff, // skipped
+        0x4e, 0x71, // NOP
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[0] = 0x8000;
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & Cpu.flag_negative != 0);
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 14), cpu.pc);
+    cpu.d[0] = 0;
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & Cpu.flag_negative == 0);
+    try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 22), cpu.pc);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+}
+
+test "68000 BVC and BVS branch from the overflow flag with short and word displacements" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x52, 0x40, // ADDQ.W #1,D0: D0=$7fff causes V
+        0x69, 0x02, // BVS.s +2, taken
+        0xff, 0xff, // skipped
+        0x4a, 0x40, // TST.W D0 clears V
+        0x68, 0x00, // BVC.w +2, taken
+        0x00, 0x02,
+        0xff, 0xff, // skipped
+        0x4e, 0x71, // NOP
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[0] = 0x7fff;
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & Cpu.flag_overflow != 0);
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 14), cpu.pc);
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & Cpu.flag_overflow == 0);
+    try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 22), cpu.pc);
     try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
 }
 
