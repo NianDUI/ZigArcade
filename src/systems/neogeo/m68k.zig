@@ -161,6 +161,13 @@ pub const Cpu = struct {
             self.setMoveWordFlags(value);
             return 8;
         }
+        if (opcode & 0xf1ff == 0x103c) { // MOVE.B #imm,Dn
+            const register: usize = @intCast((opcode >> 9) & 7);
+            const value: u8 = @truncate(try self.fetchWord(bus));
+            self.d[register] = (self.d[register] & 0xffffff00) | value;
+            self.setMoveByteFlags(value);
+            return 8;
+        }
         if (opcode & 0xf1ff == 0x30bc) { // MOVE.W #imm,(An)
             const register: usize = @intCast((opcode >> 9) & 7);
             const value = try self.fetchWord(bus);
@@ -370,6 +377,17 @@ pub const Cpu = struct {
             self.setMoveWordFlags(@truncate(self.d[register]));
             return 4;
         }
+        if (opcode & 0xfff8 == 0x4a00) { // TST.B Dn
+            const register: usize = @intCast(opcode & 7);
+            self.setMoveByteFlags(@truncate(self.d[register]));
+            return 4;
+        }
+        if (opcode & 0xfff8 == 0x4200) { // CLR.B Dn
+            const register: usize = @intCast(opcode & 7);
+            self.d[register] &= 0xffffff00;
+            self.setMoveByteFlags(0);
+            return 4;
+        }
         if (opcode & 0xfff8 == 0x4240) { // CLR.W Dn
             const register: usize = @intCast(opcode & 7);
             self.d[register] &= 0xffff0000;
@@ -411,6 +429,13 @@ pub const Cpu = struct {
             self.d[register] = (self.d[register] & 0xffffff00) | value;
             return 4;
         }
+        if (opcode & 0xfff8 == 0x0000) { // ORI.B #imm,Dn
+            const register: usize = @intCast(opcode & 7);
+            const result: u8 = @truncate(self.d[register] | try self.fetchWord(bus));
+            self.d[register] = (self.d[register] & 0xffffff00) | result;
+            self.setMoveByteFlags(result);
+            return 8;
+        }
         if (opcode & 0xfff8 == 0x0040) { // ORI.W #imm,Dn
             const register: usize = @intCast(opcode & 7);
             const result: u16 = @truncate(self.d[register] | try self.fetchWord(bus));
@@ -424,6 +449,13 @@ pub const Cpu = struct {
             self.setMoveLongFlags(self.d[register]);
             return 16;
         }
+        if (opcode & 0xfff8 == 0x0200) { // ANDI.B #imm,Dn
+            const register: usize = @intCast(opcode & 7);
+            const result: u8 = @truncate(self.d[register] & try self.fetchWord(bus));
+            self.d[register] = (self.d[register] & 0xffffff00) | result;
+            self.setMoveByteFlags(result);
+            return 8;
+        }
         if (opcode & 0xfff8 == 0x0240) { // ANDI.W #imm,Dn
             const register: usize = @intCast(opcode & 7);
             const result: u16 = @truncate(self.d[register] & try self.fetchWord(bus));
@@ -436,6 +468,13 @@ pub const Cpu = struct {
             self.d[register] &= try self.fetchLong(bus);
             self.setMoveLongFlags(self.d[register]);
             return 16;
+        }
+        if (opcode & 0xfff8 == 0x0a00) { // EORI.B #imm,Dn
+            const register: usize = @intCast(opcode & 7);
+            const result: u8 = @truncate(self.d[register] ^ try self.fetchWord(bus));
+            self.d[register] = (self.d[register] & 0xffffff00) | result;
+            self.setMoveByteFlags(result);
+            return 8;
         }
         if (opcode & 0xfff8 == 0x0a40) { // EORI.W #imm,Dn
             const register: usize = @intCast(opcode & 7);
@@ -582,6 +621,12 @@ pub const Cpu = struct {
         if (value & 0x8000 != 0) self.sr |= flag_negative;
     }
 
+    fn setMoveByteFlags(self: *Cpu, value: u8) void {
+        self.sr &= ~(flag_negative | flag_zero | flag_overflow | flag_carry);
+        if (value == 0) self.sr |= flag_zero;
+        if (value & 0x80 != 0) self.sr |= flag_negative;
+    }
+
     /// CMP computes destination - source for condition codes while preserving
     /// both operands and X. C represents an unsigned borrow.
     fn setCompareLongFlags(self: *Cpu, destination: u32, source: u32) void {
@@ -712,6 +757,7 @@ test "68000 diagnostic CPU RTS reads a big-endian return address and rejects unk
     program[0..8].* = .{ 0x00, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0x08 };
     program[8..10].* = .{ 0x4e, 0x75 };
     program[0x18..0x1a].* = .{ 0x4e, 0x71 };
+    program[0x1e..0x20].* = .{ 0xff, 0xff };
     var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
     bus.disableBiosOverlay();
     try std.testing.expect(bus.writeWord(0x100010, 0));
@@ -722,7 +768,7 @@ test "68000 diagnostic CPU RTS reads a big-endian return address and rejects unk
     try std.testing.expectEqual(@as(u32, 0x18), cpu.pc);
     try std.testing.expectEqual(@as(u32, 0x100014), cpu.a[7]);
     try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
-    cpu.pc = 0x0e;
+    cpu.pc = 0x1e;
     try std.testing.expectError(error.UnsupportedOpcode, cpu.step(&bus));
 }
 
@@ -818,6 +864,34 @@ test "68000 diagnostic CPU loads a big-endian immediate long into any D register
     try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
     try std.testing.expectEqual(@as(u32, 0x12345678), cpu.d[3]);
     try std.testing.expectEqual(@as(u32, 14), cpu.pc);
+}
+
+test "68000 byte data-register operations preserve the high 24 bits and use byte flags" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x16, 0x3c, // MOVE.B #$ff80,D3 (byte immediate is the low byte)
+        0xff, 0x80,
+        0x4a, 0x03, // TST.B D3
+        0x42, 0x03, // CLR.B D3
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[3] = 0xface0000;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry;
+    try std.testing.expectEqual(@as(u16, 8), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface0080), cpu.d[3]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface0000), cpu.d[3]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_extend) == (Cpu.flag_zero | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow | Cpu.flag_carry) == 0);
 }
 
 test "68000 MOVE.L transfers big-endian values between data registers and address-register memory" {
@@ -1373,6 +1447,38 @@ test "68000 ORI applies immediate word and long masks while preserving X" {
     try std.testing.expectEqual(@as(u16, 16), try cpu.step(&bus));
     try std.testing.expectEqual(@as(u32, 0x80000001), cpu.d[3]);
     try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+}
+
+test "68000 byte immediate logic preserves high 24 bits and uses byte flags" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x00, 0x00, // ORI.B #$80,D0
+        0x00, 0x80,
+        0x02, 0x01, // ANDI.B #$81,D1
+        0x00, 0x81,
+        0x0a, 0x02, // EORI.B #$80,D2
+        0x00, 0x80,
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[0] = 0xface0001;
+    cpu.d[1] = 0xfaceffff;
+    cpu.d[2] = 0xface0001;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry;
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xface0081), cpu.d[0]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xfaceff81), cpu.d[1]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xface0081), cpu.d[2]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
 }
 
 test "68000 ANDI applies immediate word and long masks while preserving X" {

@@ -196,6 +196,10 @@ BHI/BLS 完成无符号大小比较分支：它们分别判断 `!C && !Z` 与 `C
 
 `CMP.W/L Dn,Dn` 比较数据寄存器源、目标而不写回任一操作数；按对应宽度更新 N/Z/V/C 并保留 X，可直接驱动 Bcc/Scc。
 
+`MOVE.B #imm,Dn`、`TST.B Dn`、`CLR.B Dn` 构成当前 Dn-only byte 基础子集：均仅访问 Dn 低 byte、保留高 24 位，按 byte 宽度更新 N/Z、清 V/C 并保留 X。
+
+`ORI.B`、`ANDI.B`、`EORI.B #imm,Dn` 将立即数逻辑族扩展到 Dn 低 byte：立即数使用 word 扩展字的低 byte，写回和 CCR 规则遵循 byte 宽度。
+
 `MOVE.L Dn,(d16,An)` 与 `MOVE.L (d16,An),Dn` 复用有符号 word 位移的有效地址规则，并以 big-endian long 读写普通诊断内存。
 
 `zigarcade --demo-neogeo auto|kitty|ansi` 直接呈现不含任何 ROM/BIOS 的合成 320×224 固定层图案，并推进一帧诊断 raster clock，用于当前 Ghostty/ANSI 前端验证；它不是 Neo Geo 游戏运行入口。
