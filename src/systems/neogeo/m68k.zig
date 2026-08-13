@@ -22,9 +22,9 @@ pub const Cpu = struct {
         self.sr = 0x2700;
     }
 
-    /// Executes NOP, MOVEQ, selected MOVE forms, BRA/BNE/BEQ, JSR (An) and RTS. Cycle
-    /// values are diagnostic timing anchors, not a claim of full 68000 bus-cycle
-    /// accuracy yet.
+    /// Executes NOP, MOVEQ, selected MOVE forms, branches, DBF, JSR (An) and
+    /// RTS. Cycle values are diagnostic timing anchors, not a claim of full
+    /// 68000 bus-cycle accuracy yet.
     pub fn step(self: *Cpu, bus: anytype) Error!u16 {
         const opcode = try self.fetchWord(bus);
         if (opcode == 0x4e71) return 4; // NOP
@@ -59,10 +59,54 @@ pub const Cpu = struct {
             self.setMoveLongFlags(self.d[destination]);
             return 12;
         }
+        if (opcode & 0xf1f8 == 0x2018) { // MOVE.L (An)+,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            self.d[destination] = try readLong(bus, self.a[source]);
+            self.a[source] +%= 4;
+            self.setMoveLongFlags(self.d[destination]);
+            return 12;
+        }
+        if (opcode & 0xf1f8 == 0x2020) { // MOVE.L -(An),Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            self.a[source] -%= 4;
+            self.d[destination] = try readLong(bus, self.a[source]);
+            self.setMoveLongFlags(self.d[destination]);
+            return 14;
+        }
+        if (opcode & 0xf1f8 == 0x20c0) { // MOVE.L Dn,(An)+
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            try writeLong(bus, self.a[destination], self.d[source]);
+            self.a[destination] +%= 4;
+            self.setMoveLongFlags(self.d[source]);
+            return 12;
+        }
+        if (opcode & 0xf1f8 == 0x2100) { // MOVE.L Dn,-(An)
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            self.a[destination] -%= 4;
+            try writeLong(bus, self.a[destination], self.d[source]);
+            self.setMoveLongFlags(self.d[source]);
+            return 14;
+        }
         if (opcode & 0xf1ff == 0x207c) { // MOVEA.L #imm,An
             const register: usize = @intCast((opcode >> 9) & 7);
             self.a[register] = try self.fetchLong(bus);
             return 12;
+        }
+        if (opcode & 0xf1ff == 0x307c) { // MOVEA.W #imm,An
+            const register: usize = @intCast((opcode >> 9) & 7);
+            const immediate: i16 = @bitCast(try self.fetchWord(bus));
+            self.a[register] = @bitCast(@as(i32, immediate));
+            return 8;
+        }
+        if (opcode & 0xf1f8 == 0x41e8) { // LEA (d16,An),An
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            self.a[destination] = self.addressWithWordDisplacement(self.a[source], try self.fetchWord(bus));
+            return 8;
         }
         if (opcode & 0xf1ff == 0x303c) { // MOVE.W #imm,Dn
             const register: usize = @intCast((opcode >> 9) & 7);
@@ -94,6 +138,60 @@ pub const Cpu = struct {
             self.setMoveWordFlags(value);
             return 8;
         }
+        if (opcode & 0xf1f8 == 0x3028) { // MOVE.W (d16,An),Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const address = self.addressWithWordDisplacement(self.a[source], try self.fetchWord(bus));
+            const value = try readWord(bus, address);
+            self.d[destination] = (self.d[destination] & 0xffff0000) | value;
+            self.setMoveWordFlags(value);
+            return 12;
+        }
+        if (opcode & 0xf1f8 == 0x3140) { // MOVE.W Dn,(d16,An)
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const address = self.addressWithWordDisplacement(self.a[destination], try self.fetchWord(bus));
+            const value: u16 = @truncate(self.d[source]);
+            try writeWord(bus, address, value);
+            self.setMoveWordFlags(value);
+            return 12;
+        }
+        if (opcode & 0xf1f8 == 0x3018) { // MOVE.W (An)+,Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const value = try readWord(bus, self.a[source]);
+            self.a[source] +%= 2;
+            self.d[destination] = (self.d[destination] & 0xffff0000) | value;
+            self.setMoveWordFlags(value);
+            return 8;
+        }
+        if (opcode & 0xf1f8 == 0x30c0) { // MOVE.W Dn,(An)+
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            const value: u16 = @truncate(self.d[source]);
+            try writeWord(bus, self.a[destination], value);
+            self.a[destination] +%= 2;
+            self.setMoveWordFlags(value);
+            return 8;
+        }
+        if (opcode & 0xf1f8 == 0x3020) { // MOVE.W -(An),Dn
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            self.a[source] -%= 2;
+            const value = try readWord(bus, self.a[source]);
+            self.d[destination] = (self.d[destination] & 0xffff0000) | value;
+            self.setMoveWordFlags(value);
+            return 10;
+        }
+        if (opcode & 0xf1f8 == 0x3100) { // MOVE.W Dn,-(An)
+            const destination: usize = @intCast((opcode >> 9) & 7);
+            const source: usize = @intCast(opcode & 7);
+            self.a[destination] -%= 2;
+            const value: u16 = @truncate(self.d[source]);
+            try writeWord(bus, self.a[destination], value);
+            self.setMoveWordFlags(value);
+            return 10;
+        }
         if (opcode & 0xf100 == 0x7000) { // MOVEQ #imm8,Dn
             const register: usize = @intCast((opcode >> 9) & 7);
             const immediate: i8 = @bitCast(@as(u8, @truncate(opcode)));
@@ -105,6 +203,12 @@ pub const Cpu = struct {
             const register: usize = @intCast((opcode >> 9) & 7);
             self.setCompareLongFlags(self.d[register], try self.fetchLong(bus));
             return 14;
+        }
+        if (opcode & 0xf1ff == 0xb07c) { // CMP.W #imm,Dn
+            const register: usize = @intCast((opcode >> 9) & 7);
+            const source = try self.fetchWord(bus);
+            self.setCompareWordFlags(@truncate(self.d[register]), source);
+            return 8;
         }
         if (opcode & 0xf1f8 == 0x5080) { // ADDQ.L #imm3,Dn (encoded 0 means 8)
             const register: usize = @intCast(opcode & 7);
@@ -124,9 +228,30 @@ pub const Cpu = struct {
             self.setSubtractLongFlags(destination, immediate, self.d[register], true);
             return 8;
         }
+        if (opcode & 0xfff8 == 0x51c8) { // DBF Dn,displacement
+            const register: usize = @intCast(opcode & 7);
+            const displacement: i32 = @as(i32, @as(i16, @bitCast(try self.fetchWord(bus))));
+            const counter: u16 = @truncate(self.d[register]);
+            const decremented = counter -% 1;
+            self.d[register] = (self.d[register] & 0xffff0000) | decremented;
+            if (decremented != 0xffff) {
+                if (displacement < 0) {
+                    self.pc -%= @intCast(-displacement);
+                } else {
+                    self.pc +%= @intCast(displacement);
+                }
+                return 10;
+            }
+            return 12;
+        }
         if (opcode & 0xfff8 == 0x4a80) { // TST.L Dn
             const register: usize = @intCast(opcode & 7);
             self.setMoveLongFlags(self.d[register]);
+            return 4;
+        }
+        if (opcode & 0xfff8 == 0x4a40) { // TST.W Dn
+            const register: usize = @intCast(opcode & 7);
+            self.setMoveWordFlags(@truncate(self.d[register]));
             return 4;
         }
         if (opcode & 0xff00 == 0x6000 or opcode & 0xff00 == 0x6600 or opcode & 0xff00 == 0x6700) { // BRA/BNE/BEQ .s/.w
@@ -173,6 +298,14 @@ pub const Cpu = struct {
         try writeLong(bus, self.a[7], value);
     }
 
+    fn addressWithWordDisplacement(_: *const Cpu, base: u32, encoded_displacement: u16) u32 {
+        const displacement: i16 = @bitCast(encoded_displacement);
+        return if (displacement < 0)
+            base -% @as(u32, @intCast(-@as(i32, displacement)))
+        else
+            base +% @as(u32, @intCast(displacement));
+    }
+
     fn setMoveLongFlags(self: *Cpu, value: u32) void {
         self.sr &= ~(flag_negative | flag_zero | flag_overflow | flag_carry);
         if (value == 0) self.sr |= flag_zero;
@@ -190,6 +323,17 @@ pub const Cpu = struct {
     fn setCompareLongFlags(self: *Cpu, destination: u32, source: u32) void {
         const result = destination -% source;
         self.setSubtractLongFlags(destination, source, result, false);
+    }
+
+    fn setCompareWordFlags(self: *Cpu, destination: u16, source: u16) void {
+        const result = destination -% source;
+        self.sr &= ~(flag_negative | flag_zero | flag_overflow | flag_carry);
+        if (result == 0) self.sr |= flag_zero;
+        if (result & 0x8000 != 0) self.sr |= flag_negative;
+        if ((destination ^ source) & (destination ^ result) & 0x8000 != 0) {
+            self.sr |= flag_overflow;
+        }
+        if (source > destination) self.sr |= flag_carry;
     }
 
     fn setSubtractLongFlags(self: *Cpu, destination: u32, source: u32, result: u32, update_extend: bool) void {
@@ -350,6 +494,41 @@ test "68000 MOVE.L transfers big-endian values between data registers and addres
     try std.testing.expect(cpu.sr & Cpu.flag_negative != 0);
 }
 
+test "68000 MOVE.L predecrement and postincrement advance addresses by four bytes" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x24, 0x1f, // MOVE.L (A7)+,D2
+        0x2f, 0x02, // MOVE.L D2,-(A7)
+        0x26, 0x20, // MOVE.L -(A0),D3
+        0x2a, 0xc3, // MOVE.L D3,(A5)+
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    try std.testing.expect(bus.writeWord(0x100000, 0x80ab));
+    try std.testing.expect(bus.writeWord(0x100002, 0xcdef));
+    try std.testing.expect(bus.writeWord(0x100010, 0x1234));
+    try std.testing.expect(bus.writeWord(0x100012, 0x5678));
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.a[7] = 0x100000;
+    cpu.a[0] = 0x100014;
+    cpu.a[5] = 0x100020;
+    try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x80abcdef), cpu.d[2]);
+    try std.testing.expectEqual(@as(u32, 0x100004), cpu.a[7]);
+    try std.testing.expectEqual(@as(u16, 14), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(?u32, 0x80abcdef), bus.readLong(0x100000));
+    try std.testing.expectEqual(@as(u32, 0x100000), cpu.a[7]);
+    try std.testing.expectEqual(@as(u16, 14), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x12345678), cpu.d[3]);
+    try std.testing.expectEqual(@as(u32, 0x100010), cpu.a[0]);
+    try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(?u32, 0x12345678), bus.readLong(0x100020));
+    try std.testing.expectEqual(@as(u32, 0x100024), cpu.a[5]);
+}
+
 test "68000 diagnostic CPU loads a big-endian immediate long into an address register" {
     const Bus = @import("bus.zig").Bus;
     const program = [_]u8{
@@ -365,6 +544,44 @@ test "68000 diagnostic CPU loads a big-endian immediate long into an address reg
     try cpu.reset(&bus);
     try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
     try std.testing.expectEqual(@as(u32, 0x00100000), cpu.a[2]);
+}
+
+test "68000 MOVEA.W immediate sign-extends without changing condition codes" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x34, 0x7c, // MOVEA.W #$8001,A2
+        0x80, 0x01,
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.sr = 0x271f;
+    try std.testing.expectEqual(@as(u16, 8), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xffff8001), cpu.a[2]);
+    try std.testing.expectEqual(@as(u16, 0x271f), cpu.sr);
+}
+
+test "68000 LEA address displacement preserves CCR and supports a distinct destination" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x49, 0xe8, // LEA -$20(A0),A4
+        0xff, 0xe0,
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.a[0] = 0x00100020;
+    cpu.sr = 0x271f;
+    try std.testing.expectEqual(@as(u16, 8), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0x00100000), cpu.a[4]);
+    try std.testing.expectEqual(@as(u32, 0x00100020), cpu.a[0]);
+    try std.testing.expectEqual(@as(u16, 0x271f), cpu.sr);
 }
 
 test "68000 diagnostic CPU writes an immediate word through an address register" {
@@ -431,6 +648,78 @@ test "68000 MOVE.W transfers between data registers and address-register memory"
     try std.testing.expectEqual(@as(u16, 8), try cpu.step(&bus));
     try std.testing.expectEqual(@as(u32, 0xaaaa8001), cpu.d[5]);
     try std.testing.expect(cpu.sr & Cpu.flag_negative != 0);
+}
+
+test "68000 MOVE.W transfers through signed address displacements" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x32, 0x28, // MOVE.W -2(A0),D1
+        0xff, 0xfe,
+        0x35, 0x41, // MOVE.W D1,2(A2)
+        0x00, 0x02,
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    try std.testing.expect(bus.writeWord(0x100000, 0x8001));
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.a[0] = 0x100002;
+    cpu.a[2] = 0x100000;
+    cpu.d[1] = 0xabcd0000;
+    try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xabcd8001), cpu.d[1]);
+    try std.testing.expect(cpu.sr & Cpu.flag_negative != 0);
+    try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(?u16, 0x8001), bus.readWord(0x100002));
+}
+
+test "68000 MOVE.W postincrement advances address registers after each word transfer" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x34, 0x1f, // MOVE.W (A7)+,D2
+        0x3e, 0xc2, // MOVE.W D2,(A7)+
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    try std.testing.expect(bus.writeWord(0x100000, 0x8001));
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.a[7] = 0x100000;
+    cpu.d[2] = 0xaaaa0000;
+    try std.testing.expectEqual(@as(u16, 8), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xaaaa8001), cpu.d[2]);
+    try std.testing.expectEqual(@as(u32, 0x100002), cpu.a[7]);
+    try std.testing.expectEqual(@as(u16, 8), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(?u16, 0x8001), bus.readWord(0x100002));
+    try std.testing.expectEqual(@as(u32, 0x100004), cpu.a[7]);
+}
+
+test "68000 MOVE.W predecrement updates address registers before each word transfer" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x36, 0x20, // MOVE.W -(A0),D3
+        0x3f, 0x03, // MOVE.W D3,-(A7)
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    try std.testing.expect(bus.writeWord(0x100000, 0x8001));
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.a[0] = 0x100002;
+    cpu.a[7] = 0x100006;
+    cpu.d[3] = 0xaaaa0000;
+    try std.testing.expectEqual(@as(u16, 10), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xaaaa8001), cpu.d[3]);
+    try std.testing.expectEqual(@as(u32, 0x100000), cpu.a[0]);
+    try std.testing.expectEqual(@as(u16, 10), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(?u16, 0x8001), bus.readWord(0x100004));
+    try std.testing.expectEqual(@as(u32, 0x100004), cpu.a[7]);
 }
 
 test "68000 MOVE.W immediate applies word-width N/Z flags" {
@@ -503,6 +792,29 @@ test "68000 MOVE.L immediate and TST.L share N/Z flag behavior" {
     try std.testing.expect(cpu.sr & Cpu.flag_negative != 0);
 }
 
+test "68000 TST.W uses the data-register low word and preserves X" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x4a, 0x43, // TST.W D3
+        0x4a, 0x43, // TST.W D3
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[3] = 0x80000000;
+    cpu.sr |= Cpu.flag_extend | Cpu.flag_overflow | Cpu.flag_carry;
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_extend) == (Cpu.flag_zero | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+    cpu.d[3] = 0x00008000;
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_extend) == (Cpu.flag_negative | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+}
+
 test "68000 CMP.L immediate preserves registers and X while updating subtraction flags" {
     const Bus = @import("bus.zig").Bus;
     const program = [_]u8{
@@ -536,6 +848,33 @@ test "68000 CMP.L immediate preserves registers and X while updating subtraction
     try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow | Cpu.flag_carry) == 0);
 
     cpu.d[0] = 0x80000000;
+    _ = try cpu.step(&bus);
+    try std.testing.expect(cpu.sr & (Cpu.flag_overflow | Cpu.flag_extend) == (Cpu.flag_overflow | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_zero | Cpu.flag_carry) == 0);
+}
+
+test "68000 CMP.W immediate compares only the low word and preserves X" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0xb2, 0x7c, // CMP.W #$8001,D1
+        0x80, 0x01,
+        0xb2, 0x7c, // CMP.W #1,D1
+        0x00, 0x01,
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.sr |= Cpu.flag_extend;
+    cpu.d[1] = 0xface8001;
+    try std.testing.expectEqual(@as(u16, 8), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface8001), cpu.d[1]);
+    try std.testing.expect(cpu.sr & (Cpu.flag_zero | Cpu.flag_extend) == (Cpu.flag_zero | Cpu.flag_extend));
+    try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_overflow | Cpu.flag_carry) == 0);
+
+    cpu.d[1] = 0xface8000;
     _ = try cpu.step(&bus);
     try std.testing.expect(cpu.sr & (Cpu.flag_overflow | Cpu.flag_extend) == (Cpu.flag_overflow | Cpu.flag_extend));
     try std.testing.expect(cpu.sr & (Cpu.flag_negative | Cpu.flag_zero | Cpu.flag_carry) == 0);
@@ -629,6 +968,61 @@ test "68000 SUBQ.L uses encoded eight and updates all arithmetic flags" {
     try std.testing.expectEqual(@as(u32, 0x7fffffff), cpu.d[2]);
     try std.testing.expect(cpu.sr & Cpu.flag_overflow != 0);
     try std.testing.expect(cpu.sr & (Cpu.flag_extend | Cpu.flag_negative | Cpu.flag_zero | Cpu.flag_carry) == 0);
+}
+
+test "68000 DBF decrements only the low word, branches until minus one and preserves CCR" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x51, 0xc8, // DBF D0,-4: targets its own opcode
+        0xff, 0xfc,
+        0x4e, 0x71, // NOP after the exhausted loop
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.d[0] = 0xface0002;
+    cpu.sr = 0x271f;
+    try std.testing.expectEqual(@as(u16, 10), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface0001), cpu.d[0]);
+    try std.testing.expectEqual(@as(u32, 8), cpu.pc);
+    try std.testing.expectEqual(@as(u16, 10), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xface0000), cpu.d[0]);
+    try std.testing.expectEqual(@as(u32, 8), cpu.pc);
+    try std.testing.expectEqual(@as(u16, 12), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u32, 0xfaceffff), cpu.d[0]);
+    try std.testing.expectEqual(@as(u32, 12), cpu.pc);
+    try std.testing.expectEqual(@as(u16, 0x271f), cpu.sr);
+    try std.testing.expectEqual(@as(u16, 4), try cpu.step(&bus));
+}
+
+test "68000 diagnostic word-copy loop composes MOVE postincrement and DBF" {
+    const Bus = @import("bus.zig").Bus;
+    const program = [_]u8{
+        0x00, 0x10, 0xff, 0xfc,
+        0x00, 0x00, 0x00, 0x08,
+        0x34, 0x18, // loop: MOVE.W (A0)+,D2
+        0x30, 0xc2, // MOVE.W D2,(A0)+; source and destination use one buffer for this diagnostic
+        0x51, 0xc9, // DBF D1,-8: re-enter the first MOVE
+        0xff, 0xf8,
+        0x4e, 0x71, // NOP
+    };
+    var bus = Bus{ .program_rom = &program, .bios_rom = &.{} };
+    bus.disableBiosOverlay();
+    try std.testing.expect(bus.writeWord(0x100000, 0x1111));
+    try std.testing.expect(bus.writeWord(0x100004, 0x2222));
+    var cpu: Cpu = .{};
+    try cpu.reset(&bus);
+    cpu.a[0] = 0x100000;
+    cpu.d[1] = 1; // execute the loop body twice
+    for (0..6) |_| _ = try cpu.step(&bus);
+    try std.testing.expectEqual(@as(?u16, 0x1111), bus.readWord(0x100002));
+    try std.testing.expectEqual(@as(?u16, 0x2222), bus.readWord(0x100006));
+    try std.testing.expectEqual(@as(u32, 0x100008), cpu.a[0]);
+    try std.testing.expectEqual(@as(u32, 0x0000ffff), cpu.d[1]);
+    try std.testing.expectEqual(@as(u32, 16), cpu.pc);
 }
 
 test "68000 BNE branches only when Z is clear" {
