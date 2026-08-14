@@ -28,7 +28,7 @@ comptime {
 }
 
 const Renderer = enum { ansi, kitty, auto };
-const nes_frame_interval_ms: i32 = 16;
+const nes_frame_interval_ns: u64 = 16_639_267;
 /// Traditional terminal input has no reliable key-up event. Retain a sampled
 /// game key long enough for games to register movement; terminal key-repeat
 /// refreshes this window while the player holds the key.
@@ -289,6 +289,7 @@ fn runNesWithRenderer(init: std.process.Init, rom_path: []const u8, requested_re
     var renderer = try selectRenderer(init.io, output, &session, requested_renderer);
     var held_actions = Actions{};
     var held_frames: u8 = 0;
+    var next_frame_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).addDuration(nesFrameDuration());
     while (true) {
         nes.controllers.ports[0].setHostButtons(buttonsFromActions(consumeHeldActions(&held_actions, &held_frames)));
         const frame = try nes.runFrame();
@@ -301,27 +302,64 @@ fn runNesWithRenderer(init: std.process.Init, rom_path: []const u8, requested_re
             try appendPresentedFrame(init.io, output, renderer, frame);
             try output.flush();
         }
-        switch (try session.nextEventTimeout(nes_frame_interval_ms)) {
-            .key => |event| {
-                if (event.state != .release and isEscapeKey(event.key)) break;
-                switch (event.state) {
-                    .legacy => {
-                        held_actions = actionsForKey(event.key);
-                        held_frames = raw_input_hold_frames;
-                    },
-                    .press, .repeat => applyKeyAction(&held_actions, event.key, true),
-                    .release => applyKeyAction(&held_actions, event.key, false),
-                }
-            },
+        switch (try waitForNextNesFrame(init.io, &session, &next_frame_deadline, &held_actions, &held_frames)) {
             .exit => break,
             .suspended => {
                 try kitty.appendDeleteAll(output);
                 try session.suspendAndResume(output);
                 renderer = try selectRenderer(init.io, output, &session, requested_renderer);
+                next_frame_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).addDuration(nesFrameDuration());
             },
+            .none => {},
+            .key => unreachable,
+        }
+    }
+}
+
+/// Waits only until the next emulated-frame deadline. Rendering and input
+/// processing therefore consume the same 60 Hz budget rather than being added
+/// to a fixed sleep after every frame.
+fn waitForNextNesFrame(
+    io: std.Io,
+    session: *terminal.Session,
+    deadline: *std.Io.Clock.Timestamp,
+    held_actions: *Actions,
+    held_frames: *u8,
+) !terminal.Event {
+    while (true) {
+        const now = std.Io.Clock.Timestamp.now(io, .awake);
+        if (now.compare(.gte, deadline.*)) {
+            while (deadline.*.compare(.lte, now)) deadline.* = deadline.*.addDuration(nesFrameDuration());
+            return .none;
+        }
+        const remaining_ns: u64 = @intCast(now.durationTo(deadline.*).raw.nanoseconds);
+        switch (try session.nextEventTimeout(timeoutMsForRemaining(remaining_ns))) {
+            .key => |event| {
+                if (event.state != .release and isEscapeKey(event.key)) return .exit;
+                switch (event.state) {
+                    .legacy => {
+                        held_actions.* = actionsForKey(event.key);
+                        held_frames.* = raw_input_hold_frames;
+                    },
+                    .press, .repeat => applyKeyAction(held_actions, event.key, true),
+                    .release => applyKeyAction(held_actions, event.key, false),
+                }
+            },
+            .exit => return .exit,
+            .suspended => return .suspended,
             .none => {},
         }
     }
+}
+
+fn nesFrameDuration() std.Io.Clock.Duration {
+    return .{ .raw = .fromNanoseconds(nes_frame_interval_ns), .clock = .awake };
+}
+
+fn timeoutMsForRemaining(remaining_ns: u64) i32 {
+    std.debug.assert(remaining_ns != 0);
+    const rounded_up = (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
+    return @intCast(@min(rounded_up, @as(u64, std.math.maxInt(i32))));
 }
 
 fn isEscapeKey(key: terminal.Key) bool {
@@ -529,6 +567,11 @@ test "30 FPS presentation retains every 60 Hz emulation frame" {
     try std.testing.expect(shouldPresentFrame(1));
     try std.testing.expect(!shouldPresentFrame(2));
     try std.testing.expect(shouldPresentFrame(3));
+}
+
+test "frame scheduler waits to the 60 Hz deadline without sub-millisecond spin" {
+    try std.testing.expectEqual(@as(i32, 1), timeoutMsForRemaining(1));
+    try std.testing.expectEqual(@as(i32, 17), timeoutMsForRemaining(nes_frame_interval_ns));
 }
 
 test "terminal cursor keys and lone Escape map to stable actions" {
