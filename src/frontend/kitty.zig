@@ -117,6 +117,22 @@ pub const Options = struct {
     quiet: bool = true,
 };
 
+/// Fits an image into terminal cells while retaining its pixel aspect ratio.
+/// A standard terminal cell is treated as twice as tall as it is wide, which
+/// makes a 256x240 NES frame occupy 128x60 cells at its native display size.
+/// One row is reserved by the caller for status text.
+pub fn fitOptions(frame: Frame, max_columns: u16, max_rows: u16) Options {
+    if (max_columns == 0 or max_rows == 0) return .{};
+    const columns_per_row = @as(u32, frame.width) * 2;
+    const rows_from_width = @max(@as(u32, 1), @as(u32, max_columns) * frame.height / columns_per_row);
+    const rows: u16 = @intCast(@min(@as(u32, max_rows), rows_from_width));
+    const columns: u16 = @intCast(@min(
+        @as(u32, max_columns),
+        @max(@as(u32, 1), @as(u32, rows) * columns_per_row / frame.height),
+    ));
+    return .{ .columns = columns, .rows = rows };
+}
+
 /// Encodes one raw RGB/RGBA frame as Kitty APC transmit-and-display commands.
 /// The output owns no terminal state; callers must write it atomically relative
 /// to other terminal escape sequences.
@@ -189,6 +205,16 @@ test "Kitty frame splits RGB source into 3072-byte chunks" {
     try std.testing.expect(std.mem.indexOf(u8, result, "m=1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "m=0;") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, result, "\x1b_G"));
+}
+
+test "Kitty fit options preserve NES aspect ratio within terminal cells" {
+    const frame = Frame{ .pixels = &.{}, .width = 256, .height = 240, .stride = 768, .format = .rgb888, .frame_number = 0 };
+    const wide = fitOptions(frame, 160, 59);
+    try std.testing.expectEqual(@as(u16, 125), wide.columns);
+    try std.testing.expectEqual(@as(u16, 59), wide.rows);
+    const narrow = fitOptions(frame, 80, 59);
+    try std.testing.expectEqual(@as(u16, 78), narrow.columns);
+    try std.testing.expectEqual(@as(u16, 37), narrow.rows);
 }
 
 test "Kitty rejects non-tight RGB frame" {

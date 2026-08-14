@@ -122,7 +122,7 @@ fn presentDemoFrame(init: std.process.Init, renderer: *Renderer, frame: Frame) !
 
     if (renderer.* == .auto) renderer.* = if (try probeKitty(init.io, output, &session)) .kitty else .ansi;
 
-    try appendPresentedFrame(output, renderer.*, frame);
+    try appendPresentedFrame(init.io, output, renderer.*, frame);
     try appendExitPrompt(output);
     try output.flush();
     while (true) {
@@ -131,7 +131,7 @@ fn presentDemoFrame(init: std.process.Init, renderer: *Renderer, frame: Frame) !
             .suspended => {
                 try kitty.appendDeleteAll(output);
                 try session.suspendAndResume(output);
-                try appendPresentedFrame(output, renderer.*, frame);
+                try appendPresentedFrame(init.io, output, renderer.*, frame);
                 try appendExitPrompt(output);
                 try output.flush();
             },
@@ -289,7 +289,7 @@ fn runNesWithRenderer(init: std.process.Init, rom_path: []const u8, requested_re
         // cap the initial presentation path near 30 FPS; never slow or skip
         // the emulated clock just because a frame was not presented.
         if (shouldPresentFrame(frame.frame_number)) {
-            try appendPresentedFrame(output, renderer, frame);
+            try appendPresentedFrame(init.io, output, renderer, frame);
             try appendExitPrompt(output);
             try output.flush();
         }
@@ -330,14 +330,20 @@ fn shouldPresentFrame(frame_number: u64) bool {
     return frame_number % presentation_divisor == 1;
 }
 
-fn appendPresentedFrame(output: *std.Io.Writer, renderer: Renderer, frame: Frame) !void {
+fn appendPresentedFrame(io: std.Io, output: *std.Io.Writer, renderer: Renderer, frame: Frame) !void {
     switch (renderer) {
         .ansi => {
             var pixels: [ansi.max_reduced_rgb_bytes]u8 = undefined;
             const reduced = try ansi.downsample2x(frame, &pixels);
             try ansi.appendFrame(output, reduced);
         },
-        .kitty => try kitty.appendFrame(output, frame, .{}),
+        .kitty => {
+            const options = if (try terminal.viewport(io)) |view|
+                kitty.fitOptions(frame, view.columns, if (view.rows > 1) view.rows - 1 else 1)
+            else
+                kitty.Options{};
+            try kitty.appendFrame(output, frame, options);
+        },
         .auto => unreachable,
     }
 }

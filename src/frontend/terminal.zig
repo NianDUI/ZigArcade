@@ -13,6 +13,22 @@ pub const Key = union(enum) {
 
 pub const Event = union(enum) { none, key: Key, exit, suspended };
 
+pub const Viewport = struct { columns: u16, rows: u16 };
+
+/// Returns the current terminal-cell geometry, or null when the operating
+/// system cannot provide it. The presentation path then uses its conservative
+/// fixed fallback.
+pub fn viewport(io: std.Io) !?Viewport {
+    var size: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+    const result = (try io.operate(.{ .device_io_control = .{
+        .file = std.Io.File.stdout(),
+        .code = std.posix.T.IOCGWINSZ,
+        .arg = &size,
+    } })).device_io_control;
+    if (result < 0 or size.col == 0 or size.row == 0) return null;
+    return .{ .columns = size.col, .rows = size.row };
+}
+
 pub const Session = struct {
     original_termios: ?std.posix.termios = null,
     old_int: ?std.posix.Sigaction = null,
