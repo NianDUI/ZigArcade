@@ -46,6 +46,17 @@ pub const Ppu = struct {
     v: u16 = 0,
     t: u16 = 0,
     fine_x: u3 = 0,
+    /// CPU writes configure the *next* visible state. The frame renderer
+    /// samples a separate copy at VBlank, before a game's next NMI starts
+    /// using the PPU registers as temporary VRAM-update registers.
+    pending_scroll_x: u8 = 0,
+    pending_scroll_y: u8 = 0,
+    pending_nametable: u2 = 0,
+    presentation_scroll_x: u8 = 0,
+    presentation_scroll_y: u8 = 0,
+    presentation_nametable: u2 = 0,
+    presentation_ctrl: u8 = 0,
+    presentation_mask: u8 = 0,
     write_toggle: bool = false,
     read_buffer: u8 = 0,
     open_bus: u8 = 0,
@@ -66,12 +77,17 @@ pub const Ppu = struct {
     /// start of VBlank when PPUCTRL enables it.
     pub fn tickDot(self: *Ppu) void {
         if (self.scanline == 241 and self.dot == 1) {
+            self.latchPresentationState();
             self.status |= 0x80;
             if (self.ctrl & 0x80 != 0) self.nmi_pending = true;
         } else if (self.scanline == 261 and self.dot == 1) {
             self.status &= ~@as(u8, 0x80);
             self.status &= ~@as(u8, 0x40); // sprite-0 hit
             self.status &= ~@as(u8, 0x20); // sprite overflow
+        }
+        if (self.scanline < frame_height) {
+            if (self.dot == 65) self.clockSpriteOverflow();
+            if (self.dot > 0 and self.dot <= frame_width) self.clockSpriteZeroHit(@intCast(self.dot - 1));
         }
 
         // NTSC odd frames omit the final pre-render dot while either layer
@@ -99,6 +115,95 @@ pub const Ppu = struct {
         return self.mask & 0x18 != 0;
     }
 
+    /// Evaluates the pixel currently passing the sprite-0 detector. This is
+    /// deliberately part of the dot clock rather than the host renderer:
+    /// games such as Super Mario Bros. poll $2002 during the visible region
+    /// and use the hit to install their gameplay scroll after the status bar.
+    ///
+    /// The full background fetch pipeline is still outside this first PPU
+    /// slice, but the register-visible result follows its practical rules:
+    /// both layers and left-edge rendering must be enabled, the sprite pixel
+    /// must be non-transparent, and it must overlap a non-transparent
+    /// background pixel.
+    fn clockSpriteZeroHit(self: *Ppu, screen_x: usize) void {
+        if (self.status & 0x40 != 0) return;
+        if (self.mask & 0x18 != 0x18) return;
+        if (screen_x == 255) return;
+
+        const sprite_y = @as(usize, self.oam[0]) + 1;
+        const sprite_height: usize = if (self.ctrl & 0x20 != 0) 16 else 8;
+        if (self.scanline < sprite_y or self.scanline >= sprite_y + sprite_height) return;
+
+        const sprite_x = @as(usize, self.oam[3]);
+        if (screen_x < sprite_x or screen_x >= sprite_x + 8) return;
+        if (screen_x < 8 and (self.mask & 0x06) != 0x06) return;
+
+        const attributes = self.oam[2];
+        const local_y = @as(usize, self.scanline) - sprite_y;
+        const source_y = if (attributes & 0x80 != 0) sprite_height - 1 - local_y else local_y;
+        const tile_address = self.currentSpriteTileAddress(self.oam[1], source_y);
+        const local_x = screen_x - sprite_x;
+        const source_x = if (attributes & 0x40 != 0) local_x else 7 - local_x;
+        const bit: u3 = @intCast(source_x);
+        const sprite_color = ((self.readMemory(tile_address) >> bit) & 1) |
+            (((self.readMemory(tile_address + 8) >> bit) & 1) << 1);
+        if (sprite_color == 0) return;
+        if (!self.currentBackgroundOpaque(screen_x, self.scanline)) return;
+
+        self.status |= 0x40;
+    }
+
+    /// Sprite evaluation starts shortly after each visible scanline begins.
+    /// Model the useful overflow result at its first observable point, rather
+    /// than leaking it from the asynchronous host-frame renderer.
+    fn clockSpriteOverflow(self: *Ppu) void {
+        if (self.mask & 0x18 == 0) return;
+        if (self.spritesThroughIndexOnScanline(63, self.scanline, if (self.ctrl & 0x20 != 0) 16 else 8) > 8) {
+            self.status |= 0x20;
+        }
+    }
+
+    fn currentSpriteTileAddress(self: *const Ppu, tile: u8, source_y: usize) u16 {
+        if (self.ctrl & 0x20 == 0) {
+            const pattern_base: u16 = if (self.ctrl & 0x08 != 0) 0x1000 else 0;
+            return pattern_base + @as(u16, tile) * 16 + @as(u16, @intCast(source_y));
+        }
+        const pattern_base: u16 = if (tile & 1 != 0) 0x1000 else 0;
+        const tile_number = (tile & 0xfe) + @as(u8, @intCast(source_y / 8));
+        return pattern_base + @as(u16, tile_number) * 16 + @as(u16, @intCast(source_y & 7));
+    }
+
+    fn currentBackgroundOpaque(self: *const Ppu, screen_x: usize, screen_y: usize) bool {
+        if (screen_x < 8 and self.mask & 0x02 == 0) return false;
+        const world_x = (screen_x + self.pending_scroll_x) % 512;
+        const world_y = (screen_y + self.pending_scroll_y) % 480;
+        const base_x: u16 = self.pending_nametable & 1;
+        const base_y: u16 = self.pending_nametable >> 1;
+        const nametable_x = (base_x + @as(u16, @intCast(world_x / 256))) & 1;
+        const nametable_y = (base_y + @as(u16, @intCast(world_y / 240))) & 1;
+        const nametable_base = 0x2000 + ((nametable_y << 1 | nametable_x) << 10);
+        const local_x = world_x % 256;
+        const local_y = world_y % 240;
+        const tile = self.readMemory(nametable_base + @as(u16, @intCast((local_y / 8) * 32 + local_x / 8)));
+        const row: u16 = @intCast(local_y & 7);
+        const pattern_base: u16 = if (self.ctrl & 0x10 != 0) 0x1000 else 0;
+        const tile_address = pattern_base + @as(u16, tile) * 16 + row;
+        const shift: u3 = @intCast(7 - (local_x & 7));
+        return ((self.readMemory(tile_address) >> shift) & 1) |
+            ((self.readMemory(tile_address + 8) >> shift) & 1) != 0;
+    }
+
+    /// Captures the configuration that produced the just-finished visible
+    /// frame. It deliberately runs before the VBlank NMI handler can reset
+    /// $2005/$2006 while uploading data for the following frame.
+    fn latchPresentationState(self: *Ppu) void {
+        self.presentation_scroll_x = self.pending_scroll_x;
+        self.presentation_scroll_y = self.pending_scroll_y;
+        self.presentation_nametable = self.pending_nametable;
+        self.presentation_ctrl = self.ctrl;
+        self.presentation_mask = self.mask;
+    }
+
     pub fn takeNmi(self: *Ppu) bool {
         const pending = self.nmi_pending;
         self.nmi_pending = false;
@@ -114,7 +219,8 @@ pub const Ppu = struct {
 
     /// Renders the current background state into a 256x240 RGB buffer. It is
     /// intentionally a presentation readout: all PPU timing stays in
-    /// `tickDot`. Scroll, clipping, and sprite composition are added later.
+    /// `tickDot`. It uses the VBlank-latched state of the completed frame,
+    /// never the mutable CPU VRAM-update latches.
     pub fn renderBackground(self: *const Ppu, rgb: []u8) RenderError!void {
         return self.renderBackgroundWithOpacity(rgb, null);
     }
@@ -125,7 +231,7 @@ pub const Ppu = struct {
     pub fn renderBackgroundWithOpacity(self: *const Ppu, rgb: []u8, opacity: ?[]u8) RenderError!void {
         if (rgb.len != frame_rgb_bytes) return error.InvalidFrameBuffer;
         if (opacity) |buffer| if (buffer.len != frame_width * frame_height) return error.InvalidFrameBuffer;
-        if (self.mask & 0x08 == 0) {
+        if (self.presentation_mask & 0x08 == 0) {
             const backdrop = rgbForPaletteIndex(self.palette[0]);
             for (0..frame_width * frame_height) |pixel| {
                 rgb[pixel * 3 ..][0..3].* = backdrop;
@@ -133,13 +239,13 @@ pub const Ppu = struct {
             }
             return;
         }
-        const pattern_base: u16 = if (self.ctrl & 0x10 != 0) 0x1000 else 0;
-        const scroll_x = @as(usize, self.fine_x) + @as(usize, self.t & 0x001f) * 8;
-        const scroll_y = @as(usize, (self.t >> 12) & 0x0007) + @as(usize, (self.t >> 5) & 0x001f) * 8;
-        const base_nametable = (self.t >> 10) & 0x0003;
+        const pattern_base: u16 = if (self.presentation_ctrl & 0x10 != 0) 0x1000 else 0;
+        const scroll_x = self.presentation_scroll_x;
+        const scroll_y = self.presentation_scroll_y;
+        const base_nametable = self.presentation_nametable;
         for (0..frame_height) |y| {
             for (0..frame_width) |x| {
-                if (x < 8 and self.mask & 0x02 == 0) {
+                if (x < 8 and self.presentation_mask & 0x02 == 0) {
                     const offset = (y * frame_width + x) * 3;
                     rgb[offset..][0..3].* = rgbForPaletteIndex(self.palette[0]);
                     if (opacity) |buffer| buffer[y * frame_width + x] = 0;
@@ -194,8 +300,8 @@ pub const Ppu = struct {
     pub fn renderSpritesWithBackground(self: *Ppu, rgb: []u8, background: ?[]const u8) RenderError!void {
         if (rgb.len != frame_rgb_bytes) return error.InvalidFrameBuffer;
         if (background) |buffer| if (buffer.len != frame_width * frame_height) return error.InvalidFrameBuffer;
-        if (self.mask & 0x10 == 0) return;
-        const sprite_height: usize = if (self.ctrl & 0x20 != 0) 16 else 8;
+        if (self.presentation_mask & 0x10 == 0) return;
+        const sprite_height: usize = if (self.presentation_ctrl & 0x20 != 0) 16 else 8;
         var sprite_index: usize = 64;
         while (sprite_index > 0) {
             sprite_index -= 1;
@@ -207,10 +313,7 @@ pub const Ppu = struct {
             for (0..sprite_height) |local_y| {
                 const screen_y = @as(usize, sprite_y) + 1 + local_y;
                 if (screen_y >= frame_height) continue;
-                if (self.spritesThroughIndexOnScanline(sprite_index, screen_y, sprite_height) > 8) {
-                    self.status |= 0x20;
-                    continue;
-                }
+                if (self.spritesThroughIndexOnScanline(sprite_index, screen_y, sprite_height) > 8) continue;
                 const source_y = if (attributes & 0x80 != 0) sprite_height - 1 - local_y else local_y;
                 const tile_address = self.spriteTileAddress(tile, source_y);
                 const low_plane = self.readMemory(tile_address);
@@ -218,14 +321,13 @@ pub const Ppu = struct {
                 for (0..8) |local_x| {
                     const screen_x = @as(usize, sprite_x) + local_x;
                     if (screen_x >= frame_width) continue;
-                    if (screen_x < 8 and self.mask & 0x04 == 0) continue;
+                    if (screen_x < 8 and self.presentation_mask & 0x04 == 0) continue;
                     const source_x = if (attributes & 0x40 != 0) local_x else 7 - local_x;
                     const bit: u3 = @intCast(source_x);
                     const color: u8 = ((low_plane >> bit) & 1) | (((high_plane >> bit) & 1) << 1);
                     if (color == 0) continue;
                     const rgb_offset = (screen_y * frame_width + screen_x) * 3;
                     const background_is_opaque = self.backgroundOpaque(rgb, background, screen_x, screen_y);
-                    if (sprite_index == 0 and background_is_opaque and screen_x < 255) self.status |= 0x40;
                     if (attributes & 0x20 != 0 and background_is_opaque) continue;
                     const palette_select = attributes & 0x03;
                     const palette_entry = self.palette[0x10 + palette_select * 4 + color];
@@ -236,8 +338,8 @@ pub const Ppu = struct {
     }
 
     fn spriteTileAddress(self: *const Ppu, tile: u8, source_y: usize) u16 {
-        if (self.ctrl & 0x20 == 0) {
-            const pattern_base: u16 = if (self.ctrl & 0x08 != 0) 0x1000 else 0;
+        if (self.presentation_ctrl & 0x20 == 0) {
+            const pattern_base: u16 = if (self.presentation_ctrl & 0x08 != 0) 0x1000 else 0;
             return pattern_base + @as(u16, tile) * 16 + @as(u16, @intCast(source_y));
         }
         const pattern_base: u16 = if (tile & 1 != 0) 0x1000 else 0;
@@ -295,6 +397,7 @@ pub const Ppu = struct {
                 const had_nmi_enabled = self.ctrl & 0x80 != 0;
                 self.ctrl = value;
                 self.t = (self.t & ~@as(u16, 0x0c00)) | (@as(u16, value & 0x03) << 10);
+                self.pending_nametable = @truncate(value);
                 if (!had_nmi_enabled and value & 0x80 != 0 and self.status & 0x80 != 0) {
                     self.nmi_pending = true;
                 }
@@ -331,10 +434,12 @@ pub const Ppu = struct {
         if (!self.write_toggle) {
             self.t = (self.t & ~@as(u16, 0x001f)) | @as(u16, value >> 3);
             self.fine_x = @truncate(value);
+            self.pending_scroll_x = value;
         } else {
             self.t = (self.t & ~@as(u16, 0x73e0)) |
                 (@as(u16, value & 0x07) << 12) |
                 (@as(u16, value & 0xf8) << 2);
+            self.pending_scroll_y = value;
         }
         self.write_toggle = !self.write_toggle;
     }
@@ -532,6 +637,32 @@ test "rendering odd frame skips the final pre-render dot" {
     try std.testing.expectEqual(@as(u16, 261), ppu.scanline);
 }
 
+test "sprite-0 hit is raised on the overlapping visible PPU dot" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x1e; // background, sprites, and both left-edge enables
+    for (0..8) |row| mapper.chr_ram[16 + row] = 0x80;
+    ppu.writeMemory(0x2000, 1);
+    ppu.oam[0..4].* = .{ 0, 1, 0, 0 };
+
+    ppu.scanline = 1;
+    ppu.dot = 1;
+    ppu.tickDot();
+    try std.testing.expect(ppu.status & 0x40 != 0);
+
+    ppu.status &= ~@as(u8, 0x40);
+    ppu.mask = 0x18; // clipped at the left edge
+    ppu.dot = 1;
+    ppu.tickDot();
+    try std.testing.expect(ppu.status & 0x40 == 0);
+}
+
 test "PPUMASK disables layers and leaves the universal backdrop" {
     var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
     var mapper = Mapper0{
@@ -563,6 +694,7 @@ test "background renderer decodes tile planes and attribute palette selection" {
     };
     var ppu = Ppu.init(&mapper);
     ppu.mask = 0x0a;
+    ppu.latchPresentationState();
     // Tile 0: the leftmost pixel of each row has color index 1; all other
     // pixels are transparent background color 0.
     for (0..8) |row| mapper.chr_ram[row] = 0x80;
@@ -599,6 +731,11 @@ test "background renderer scrolls across nametable edges using PPU scroll state"
     ppu.palette[2] = 0x16;
     ppu.cpuWrite(5, 248); // scroll right from final tile of nametable 0
     ppu.cpuWrite(5, 0);
+    ppu.latchPresentationState();
+    // A VBlank handler may immediately restore $2005 to zero for VRAM work;
+    // it configures the following frame and must not rewrite this one.
+    ppu.cpuWrite(5, 0);
+    ppu.cpuWrite(5, 0);
     var rgb: [frame_rgb_bytes]u8 = undefined;
     try ppu.renderBackground(&rgb);
     try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, rgb[0..3]);
@@ -615,6 +752,7 @@ test "sprite overlay handles palette flips transparency and background priority"
     };
     var ppu = Ppu.init(&mapper);
     ppu.mask = 0x14;
+    ppu.latchPresentationState();
     // Tile 1 has color 1 at its left edge and color 2 at its right edge.
     for (0..8) |row| {
         mapper.chr_ram[16 + row] = 0x80;
@@ -649,6 +787,7 @@ test "lower OAM index wins where opaque sprites overlap" {
     };
     var ppu = Ppu.init(&mapper);
     ppu.mask = 0x14;
+    ppu.latchPresentationState();
     for (0..8) |row| {
         mapper.chr_ram[16 + row] = 0xff; // tile 1 color 1
         mapper.chr_ram[32 + 8 + row] = 0xff; // tile 2 color 2
@@ -675,6 +814,7 @@ test "8x16 sprites select pattern table from tile bit and span two tiles" {
     var ppu = Ppu.init(&mapper);
     ppu.ctrl = 0x20; // 8x16 sprites
     ppu.mask = 0x14;
+    ppu.latchPresentationState();
     // Tile byte 3 chooses $1000. The top half is tile 2 (color 1), bottom
     // half tile 3 (color 2) in that table.
     for (0..8) |row| {
@@ -703,6 +843,7 @@ test "sprite renderer limits each scanline to eight and raises overflow plus spr
     };
     var ppu = Ppu.init(&mapper);
     ppu.mask = 0x14;
+    ppu.latchPresentationState();
     for (0..8) |row| mapper.chr_ram[16 + row] = 0x80;
     ppu.palette[0x11] = 0x21;
     for (0..9) |index| ppu.oam[index * 4 ..][0..4].* = .{ 39, 1, 0, 60 };
@@ -711,8 +852,10 @@ test "sprite renderer limits each scanline to eight and raises overflow plus spr
     var background: [frame_width * frame_height]u8 = [_]u8{0} ** (frame_width * frame_height);
     background[40 * frame_width + 60] = 1;
     try ppu.renderSpritesWithBackground(&rgb, &background);
+    ppu.scanline = 40;
+    ppu.dot = 65;
+    ppu.tickDot();
     try std.testing.expect(ppu.status & 0x20 != 0);
-    try std.testing.expect(ppu.status & 0x40 != 0);
     const visible = (40 * frame_width + 60) * 3;
     try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, rgb[visible..][0..3]);
 }
