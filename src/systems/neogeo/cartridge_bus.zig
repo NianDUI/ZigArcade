@@ -3,6 +3,7 @@ const address_map = @import("address_map.zig");
 const CartridgeIo = @import("cartridge_io.zig").CartridgeIo;
 const DipSwitchWatchdog = @import("dipswitch_watchdog.zig").DipSwitchWatchdog;
 const PaletteRam = @import("palette_ram.zig").PaletteRam;
+const SystemControl = @import("system_control.zig").SystemControl;
 
 /// Partial, asset-free cartridge-system 68000 bus. It composes only address
 /// targets with evidence-backed byte/word device contracts: mirrored work RAM,
@@ -15,6 +16,7 @@ pub const CartridgeBus = struct {
     palette_ram: PaletteRam = .{},
     io: CartridgeIo,
     dipswitch_watchdog: DipSwitchWatchdog = .{},
+    system_control: SystemControl = .{},
 
     pub fn init(variant: address_map.CartridgeVariant) CartridgeBus {
         return .{ .variant = variant, .io = CartridgeIo.init(variant) };
@@ -38,6 +40,7 @@ pub const CartridgeBus = struct {
             .work_ram => self.work_ram[@intCast(decoded.offset)] = value,
             .sound => return self.io.write(decoded, value),
             .dip_switch_and_watchdog => return self.dipswitch_watchdog.write(decoded),
+            .system_control => return self.system_control.write(decoded),
             else => return false,
         }
         return true;
@@ -129,6 +132,17 @@ test "Neo Geo cartridge bus connects MVS DIP input and watchdog kicks" {
     var aes = CartridgeBus.init(.aes);
     try std.testing.expectEqual(@as(?u8, null), aes.readByte(0x300001));
     try std.testing.expect(!aes.writeByte(0x300001, 0));
+}
+
+test "Neo Geo cartridge bus routes system-control writes without changing ROM or palette mapping" {
+    var bus = CartridgeBus.init(.aes);
+    try std.testing.expect(bus.writeByte(0x3b0013, 0x42));
+    try std.testing.expectEqual(@import("system_control.zig").VectorSource.cartridge, bus.system_control.vector_source);
+    try std.testing.expect(bus.writeByte(0x3a001f, 0));
+    try std.testing.expectEqual(@import("system_control.zig").PaletteBank.bank_1, bus.system_control.palette_bank);
+    try std.testing.expect(!bus.writeByte(0x3a0012, 0));
+    try std.testing.expectEqual(@as(?u8, null), bus.readByte(0x3a0013));
+    try std.testing.expectEqual(@as(?u16, null), bus.readWord(0x3a0012));
 }
 
 test "Neo Geo cartridge bus rejects unmapped and non-24-bit addresses" {
