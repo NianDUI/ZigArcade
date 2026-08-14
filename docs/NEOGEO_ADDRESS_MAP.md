@@ -37,17 +37,17 @@
 | `$320000` | `REG_SOUND` | Z80 reply / 68k sound command | `cartridge_io.zig` 已接入命令 latch 与非破坏 reply read；NMI、Z80 端口执行待 P5b |
 | `$340000` | `REG_P2CNT` | P2 输入，active-low | 仅译码 |
 | `$380000` | `REG_STATUS_B` | start/select 与系统状态 | 仅译码；MVS/AES 位定义需分 variant |
-| `$3A0001` 等 | system-control latch | palette bank、vector source、save/memory-card 控制等 | 仅译码；写入地址位决定 latch value |
+| `$3A0001` 等 | system-control latch | palette bank、vector source、save/memory-card 控制等 | `system_control.zig` 已记录 `$3A0003/$3A0013` 的 BIOS/卡带 vector source 与 `$3A000F/$3A001F` 的 palette bank 0/1；写数据被忽略，只有 odd byte lane 有效；尚未连接 ROM 或 palette RAM |
 | `$3C0000-$3C000E` | LSPC video | VRAM address/data/modulo、mode、timer、IRQ ack | 仅译码；VRAM/IRQ 未实现 |
 
 ## 代码落点与测试顺序
 
-`src/systems/neogeo/address_map.zig` 是纯函数地址译码层：调用方必须传入 `.mvs` 或 `.aes`，它才返回设备目标和归一化后的物理 byte offset。`cartridge_bus.zig` 是独立的、无资产的卡带总线组合切片：目前只接入 work RAM 的 byte/word、palette RAM 的 word，以及 `cartridge_io.zig` 已锁定的 I/O byte lane；I/O word、palette byte、ROM、open bus、memory-card、backup RAM、LSPC 都明确保持未映射。`bus.zig` 仍是旧的合成诊断总线，不能被误称为真实硬件总线。
+`src/systems/neogeo/address_map.zig` 是纯函数地址译码层：调用方必须传入 `.mvs` 或 `.aes`，它才返回设备目标和归一化后的物理 byte offset。`system_control.zig` 消费其中的 system-control 目标，建模 74HC259 风格的地址触发锁存：写数据无意义，只有 odd byte lane 有效，地址 bit 4 选择 set/reset；当前仅接受有明确证据的 vector source 和 palette bank 两组状态。`cartridge_bus.zig` 是独立的、无资产的卡带总线组合切片：目前只接入 work RAM 的 byte/word、palette RAM 的 word，以及 `cartridge_io.zig` 已锁定的 I/O byte lane；I/O word、palette byte、ROM、open bus、memory-card、backup RAM、system-control、LSPC 都明确保持未映射。`bus.zig` 仍是旧的合成诊断总线，不能被误称为真实硬件总线。
 
 后续必须按以下顺序接入：
 
-1. 将固定/银行 P-ROM、system ROM、vector switch 以显式设备接入 `cartridge_bus.zig`，并先锁定 ROM wait/open-bus 规则。
-2. 扩充经资料验证的 byte/word lane：palette byte 写 mask、I/O word 低字节、system-control palette/vector 开关。
+1. 将固定/银行 P-ROM、system ROM、已建模的 vector switch 以显式设备接入 `cartridge_bus.zig`，并先锁定 ROM wait/open-bus 规则。
+2. 扩充经资料验证的 byte/word lane：palette byte 写 mask、I/O word 低字节，并在两组 palette 存储均有明确模型后接入已建模的 palette bank 开关。
 3. 再实现 LSPC VRAM port、timer/IRQ 与真正 68000 exception/interrupt 边界。
 
 在第 3 步完成前，不宣称可以运行 BIOS 或任何 Neo Geo 游戏。

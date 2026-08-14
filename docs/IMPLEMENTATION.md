@@ -140,6 +140,8 @@ Neo Geo 是独立主机：68000 主 CPU、Z80 音频 CPU、YM2610、sprite/tile 
 
 `systems/neogeo/bus.zig` 仍是 P5a 前的**合成**数据诊断切片：定义 reset 时 BIOS 覆盖 `$000000-$0FFFFF` P-ROM、关闭 overlay 后读取 P-ROM，及 `$100000-$10FFFF` 64 KiB work RAM 的 68000 big-endian word 规则。它尚未委托 `address_map.zig`，不含真实视频、I/O 或 BIOS 映射；因此不能将其行为称作真实 Neo Geo 总线。
 
+`systems/neogeo/system_control.zig` 建模资料可验证的 74HC259 风格 system-control 地址锁存：写数据无效，仅 odd byte lane 的地址 bit 4 决定锁存值；目前只记录 `$3A0003/$3A0013` 的 BIOS/卡带 vector source 和 `$3A000F/$3A001F` 的 palette bank 0/1。它尚未连接 ROM 或 `PaletteRam`，也不猜测 card/save/fix/shadow 等未建模锁存器。
+
 `systems/neogeo/cartridge_bus.zig` 是独立、无资产的卡带总线组合切片：已把显式 MVS/AES 地址译码接到 work RAM 的 byte/word、palette RAM 的 word 与已验证 I/O byte lane；I/O word、palette byte、ROM、open bus、memory-card、backup RAM、system-control 和 LSPC 一律明确未映射。它不替换合成 `bus.zig`，直到 ROM/vector 和 68000 总线细节也有证据与回归测试。
 
 `systems/neogeo/fixed.zig` 在 P5b 前提供 S-ROM 固定层的纯 8×8、4bpp 位平面解码：32-byte tile 的四个 8-byte plane 组合为 palette index，输出缓冲由调用方提供。尚未接入 tilemap、palette RAM、`320×224` 合成或真实 ROM；这一步仅锁定图块数据格式。
