@@ -5,8 +5,9 @@ const address_map = @import("address_map.zig");
 /// boards use a 74HC259-style latch: the write data is ignored, the selected
 /// address bit chooses a latch value, and only odd 68000 byte lanes trigger
 /// it. This device records only the two controls whose effects are known well
-/// enough to model independently; ROM and palette devices consume neither
-/// state yet.
+/// enough to model independently. The cartridge bus consumes vector source
+/// for its first 128 fixed-P-ROM bytes; palette devices do not consume the
+/// palette-bank state yet.
 pub const SystemControl = struct {
     vector_source: VectorSource = .bios,
     palette_bank: PaletteBank = .bank_0,
