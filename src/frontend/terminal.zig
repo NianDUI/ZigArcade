@@ -11,7 +11,16 @@ pub const Key = union(enum) {
     right,
 };
 
-pub const Event = union(enum) { none, key: Key, exit, suspended };
+/// Legacy terminals expose only a press-like byte stream. Kitty Keyboard
+/// Protocol additionally provides real press/repeat/release transitions.
+pub const KeyState = enum { legacy, press, repeat, release };
+
+pub const KeyEvent = struct {
+    key: Key,
+    state: KeyState,
+};
+
+pub const Event = union(enum) { none, key: KeyEvent, exit, suspended };
 
 pub const Viewport = struct { columns: u16, rows: u16 };
 
@@ -72,9 +81,10 @@ pub const Session = struct {
     }
 
     /// Reads one raw key. It recognizes the portable ANSI cursor sequences
-    /// (`ESC [ A/B/C/D`) while retaining a lone Escape byte for the frontend.
-    /// The NES loop supplies the shorter timeout for frame pacing; the demo
-    /// keeps the original 50 ms lifecycle cadence through `nextEvent`.
+    /// (`ESC [ A/B/C/D`) and Kitty Keyboard Protocol transitions while
+    /// retaining a lone Escape byte for legacy frontends. The NES loop
+    /// supplies the shorter timeout for frame pacing; the demo keeps the
+    /// original 50 ms lifecycle cadence through `nextEvent`.
     pub fn nextEventTimeout(self: *Session, timeout_ms: i32) !Event {
         if (takePendingSignal()) |signal| return eventForSignal(signal);
 
@@ -87,11 +97,21 @@ pub const Session = struct {
         if (takePendingSignal()) |signal| return eventForSignal(signal);
 
         const byte = try self.readByte() orelse return .exit;
-        if (byte != 0x1b) return .{ .key = .{ .byte = byte } };
-        const csi = try self.readByteWithTimeout(5) orelse return .{ .key = .{ .byte = byte } };
-        if (csi != '[') return .{ .key = .{ .byte = byte } };
-        const final = try self.readByteWithTimeout(5) orelse return .{ .key = .{ .byte = byte } };
-        return .{ .key = keyForCursorSequence(final) orelse .{ .byte = byte } };
+        if (byte != 0x1b) return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
+        const csi = try self.readByteWithTimeout(5) orelse return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
+        if (csi != '[') return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
+
+        var params: [32]u8 = undefined;
+        var len: usize = 0;
+        while (len < params.len) {
+            const next = try self.readByteWithTimeout(5) orelse return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
+            if (next >= 0x40 and next <= 0x7e) {
+                return .{ .key = keyEventForCsi(params[0..len], next) orelse .{ .key = .{ .byte = byte }, .state = .legacy } };
+            }
+            params[len] = next;
+            len += 1;
+        }
+        return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
     }
 
     fn readByte(self: *Session) !?u8 {
@@ -136,13 +156,16 @@ pub const Session = struct {
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw);
         errdefer std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, saved) catch {};
 
-        try output.writeAll("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+        // 0b1011: disambiguate escape, report press/repeat/release, and
+        // encode text keys too. Unsupported terminals ignore this request and
+        // keep their normal legacy byte stream.
+        try output.writeAll("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[>11u");
         self.active = true;
     }
 
     fn deactivate(self: *Session, output: *std.Io.Writer) void {
         if (!self.active) return;
-        output.writeAll("\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
+        output.writeAll("\x1b[<u\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
         if (self.original_termios) |saved| std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, saved) catch {};
         self.active = false;
     }
@@ -196,6 +219,37 @@ fn keyForCursorSequence(final: u8) ?Key {
     };
 }
 
+fn keyEventForCsi(params: []const u8, final: u8) ?KeyEvent {
+    const key = switch (final) {
+        'A', 'B', 'C', 'D' => keyForCursorSequence(final).?,
+        'u' => keyForCodepoint(params) orelse return null,
+        else => return null,
+    };
+    return .{ .key = key, .state = keyStateForCsi(params) };
+}
+
+fn keyForCodepoint(params: []const u8) ?Key {
+    var end: usize = 0;
+    while (end < params.len and params[end] != ';' and params[end] != ':') : (end += 1) {}
+    if (end == 0) return null;
+    const codepoint = std.fmt.parseInt(u32, params[0..end], 10) catch return null;
+    if (codepoint > 0xff) return null;
+    return .{ .byte = @intCast(codepoint) };
+}
+
+fn keyStateForCsi(params: []const u8) KeyState {
+    // A CSI key sequence without the `:event` suffix is traditional terminal
+    // input, so it must keep the bounded fallback rather than stick forever.
+    const colon = std.mem.lastIndexOfScalar(u8, params, ':') orelse return .legacy;
+    const state = std.fmt.parseInt(u8, params[colon + 1 ..], 10) catch return .press;
+    return switch (state) {
+        1 => .press,
+        2 => .repeat,
+        3 => .release,
+        else => .press,
+    };
+}
+
 fn signalAction() std.posix.Sigaction {
     return .{
         .handler = .{ .handler = onSignal },
@@ -234,6 +288,19 @@ test "terminal recognizes standard ANSI cursor sequence suffixes" {
     try std.testing.expectEqual(Key.right, keyForCursorSequence('C').?);
     try std.testing.expectEqual(Key.left, keyForCursorSequence('D').?);
     try std.testing.expectEqual(@as(?Key, null), keyForCursorSequence('~'));
+}
+
+test "Kitty keyboard events preserve press repeat and release" {
+    const pressed = keyEventForCsi("1;1:1", 'C').?;
+    try std.testing.expectEqual(Key.right, pressed.key);
+    try std.testing.expectEqual(KeyState.press, pressed.state);
+    const repeated = keyEventForCsi("1;1:2", 'C').?;
+    try std.testing.expectEqual(KeyState.repeat, repeated.state);
+    const released = keyEventForCsi("119;1:3", 'u').?;
+    try std.testing.expectEqual(KeyState.release, released.state);
+    try std.testing.expectEqual(Key{ .byte = 'w' }, released.key);
+    try std.testing.expectEqual(KeyState.legacy, keyEventForCsi("", 'C').?.state);
+    try std.testing.expect(keyEventForCsi("57358;1:1", 'u') == null);
 }
 
 test "terminal queues probe-time user input in order" {

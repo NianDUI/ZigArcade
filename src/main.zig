@@ -29,6 +29,10 @@ comptime {
 
 const Renderer = enum { ansi, kitty, auto };
 const nes_frame_interval_ms: i32 = 16;
+/// Traditional terminal input has no reliable key-up event. Retain a sampled
+/// game key long enough for games to register movement; terminal key-repeat
+/// refreshes this window while the player holds the key.
+const raw_input_hold_frames: u8 = 8;
 const presentation_divisor: u64 = 2;
 const max_framehash_frames: u32 = 10_000;
 
@@ -283,10 +287,10 @@ fn runNesWithRenderer(init: std.process.Init, rom_path: []const u8, requested_re
     defer leavePresentation(&session, output);
 
     var renderer = try selectRenderer(init.io, output, &session, requested_renderer);
-    var next_actions = Actions{};
+    var held_actions = Actions{};
+    var held_frames: u8 = 0;
     while (true) {
-        nes.controllers.ports[0].setHostButtons(buttonsFromActions(next_actions));
-        next_actions = .{};
+        nes.controllers.ports[0].setHostButtons(buttonsFromActions(consumeHeldActions(&held_actions, &held_frames)));
         const frame = try nes.runFrame();
         // Emulation advances one NTSC frame each loop (about 60 Hz). The
         // terminal is intentionally updated every second emulated frame to
@@ -298,9 +302,16 @@ fn runNesWithRenderer(init: std.process.Init, rom_path: []const u8, requested_re
             try output.flush();
         }
         switch (try session.nextEventTimeout(nes_frame_interval_ms)) {
-            .key => |key| {
-                if (isEscapeKey(key)) break;
-                next_actions = actionsForKey(key);
+            .key => |event| {
+                if (event.state != .release and isEscapeKey(event.key)) break;
+                switch (event.state) {
+                    .legacy => {
+                        held_actions = actionsForKey(event.key);
+                        held_frames = raw_input_hold_frames;
+                    },
+                    .press, .repeat => applyKeyAction(&held_actions, event.key, true),
+                    .release => applyKeyAction(&held_actions, event.key, false),
+                }
             },
             .exit => break,
             .suspended => {
@@ -328,6 +339,23 @@ fn actionsForKey(key: terminal.Key) Actions {
         .left => .{ .left = true },
         .right => .{ .right = true },
     };
+}
+
+/// Returns the sampled terminal action for this emulated frame, then expires
+/// it after its short hold window. Keeping this state here ensures every host
+/// input path still reaches the NES controller only at a frame boundary.
+fn consumeHeldActions(held_actions: *Actions, held_frames: *u8) Actions {
+    const actions = held_actions.*;
+    if (held_frames.* == 0) return actions;
+    held_frames.* -= 1;
+    if (held_frames.* == 0) held_actions.* = .{};
+    return actions;
+}
+
+fn applyKeyAction(actions: *Actions, key: terminal.Key, pressed: bool) void {
+    const current: u16 = @bitCast(actions.*);
+    const changed: u16 = @bitCast(actionsForKey(key));
+    actions.* = @bitCast(if (pressed) current | changed else current & ~changed);
 }
 
 fn shouldPresentFrame(frame_number: u64) bool {
@@ -511,6 +539,26 @@ test "terminal cursor keys and lone Escape map to stable actions" {
     try std.testing.expect(actionsForKey(.{ .byte = 'z' }).primary_1);
     try std.testing.expect(isEscapeKey(.{ .byte = 0x1b }));
     try std.testing.expect(!isEscapeKey(.left));
+}
+
+test "raw terminal samples retain buttons for a short movement window" {
+    var actions = Actions{ .right = true };
+    var remaining = @as(u8, 2);
+    try std.testing.expect(consumeHeldActions(&actions, &remaining).right);
+    try std.testing.expectEqual(@as(u8, 1), remaining);
+    try std.testing.expect(consumeHeldActions(&actions, &remaining).right);
+    try std.testing.expectEqual(@as(u8, 0), remaining);
+    try std.testing.expect(!consumeHeldActions(&actions, &remaining).right);
+    try std.testing.expectEqual(@as(u8, 8), raw_input_hold_frames);
+}
+
+test "Kitty key releases preserve other held controls" {
+    var actions = Actions{};
+    applyKeyAction(&actions, .right, true);
+    applyKeyAction(&actions, .{ .byte = 'z' }, true);
+    applyKeyAction(&actions, .right, false);
+    try std.testing.expect(!actions.right);
+    try std.testing.expect(actions.primary_1);
 }
 
 fn fillColorBarsForSize(rgb: []u8, width: usize, height: usize) void {
