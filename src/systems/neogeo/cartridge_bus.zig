@@ -11,8 +11,9 @@ const VectorSource = @import("system_control.zig").VectorSource;
 /// word-wide palette RAM, byte-wide I/O, caller-supplied system ROM, and the
 /// fixed P-ROM window with its separately controlled 128-byte vector area.
 /// The standard banked P-ROM window is also modeled for caller-supplied,
-/// unprotected images. Open-bus values, memory cards, backup RAM and LSPC are
-/// not silently emulated here.
+/// unprotected images. MVS backup RAM is volatile and remains write-protected
+/// until its system-control latch is enabled. Open-bus values, memory cards,
+/// and LSPC are not silently emulated here.
 pub const CartridgeBus = struct {
     variant: address_map.CartridgeVariant,
     /// Caller-owned fixed P-ROM byte image. It is visible at $000080 onward;
@@ -27,6 +28,7 @@ pub const CartridgeBus = struct {
     /// guessed open-bus value.
     system_rom: []const u8 = &.{},
     work_ram: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024),
+    backup_ram: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024),
     palette_ram: PaletteRam = .{},
     io: CartridgeIo,
     dipswitch_watchdog: DipSwitchWatchdog = .{},
@@ -42,6 +44,7 @@ pub const CartridgeBus = struct {
             .fixed_program_rom => self.readFixedProgramByte(decoded.offset),
             .banked_program_rom => self.readBankedProgramByte(decoded.offset),
             .work_ram => self.work_ram[@intCast(decoded.offset)],
+            .backup_ram => self.backup_ram[@intCast(decoded.offset)],
             .system_rom => readRomByte(self.system_rom, decoded.offset),
             .player_1, .sound, .player_2, .system => self.io.read(decoded),
             .dip_switch_and_watchdog => self.dipswitch_watchdog.read(decoded),
@@ -55,9 +58,13 @@ pub const CartridgeBus = struct {
         const decoded = self.decode(address) orelse return false;
         switch (decoded.target) {
             .work_ram => self.work_ram[@intCast(decoded.offset)] = value,
+            .backup_ram => {
+                if (!self.system_control.backup_ram_write_enabled) return false;
+                self.backup_ram[@intCast(decoded.offset)] = value;
+            },
             .sound => return self.io.write(decoded, value),
             .dip_switch_and_watchdog => return self.dipswitch_watchdog.write(decoded),
-            .system_control => return self.system_control.write(decoded),
+            .system_control => return self.system_control.write(self.variant, decoded),
             else => return false,
         }
         return true;
@@ -83,6 +90,12 @@ pub const CartridgeBus = struct {
                 const low = self.work_ram[@intCast(decoded.offset + 1)];
                 break :blk (@as(u16, high) << 8) | low;
             },
+            .backup_ram => blk: {
+                if (decoded.offset > 0xfffe) break :blk null;
+                const high = self.backup_ram[@intCast(decoded.offset)];
+                const low = self.backup_ram[@intCast(decoded.offset + 1)];
+                break :blk (@as(u16, high) << 8) | low;
+            },
             .palette => blk: {
                 if (decoded.offset & 1 != 0) break :blk null;
                 break :blk self.palette_ram.readWord(@intCast(decoded.offset / 2));
@@ -106,6 +119,11 @@ pub const CartridgeBus = struct {
                 if (decoded.offset > 0xfffe) return false;
                 self.work_ram[@intCast(decoded.offset)] = @truncate(value >> 8);
                 self.work_ram[@intCast(decoded.offset + 1)] = @truncate(value);
+            },
+            .backup_ram => {
+                if (decoded.offset > 0xfffe or !self.system_control.backup_ram_write_enabled) return false;
+                self.backup_ram[@intCast(decoded.offset)] = @truncate(value >> 8);
+                self.backup_ram[@intCast(decoded.offset + 1)] = @truncate(value);
             },
             .palette => {
                 if (decoded.offset & 1 != 0) return false;
@@ -225,6 +243,26 @@ test "Neo Geo cartridge bus maps standard P-ROM banks and rejects unavailable ch
     try std.testing.expectEqual(@as(?u16, null), bus.readWord(0x200000));
     try std.testing.expect(!bus.writeWord(0x2fffee, 0));
     try std.testing.expect(!bus.writeByte(0x2ffff0, 0));
+}
+
+test "Neo Geo cartridge bus mirrors MVS backup RAM and requires its write-enable latch" {
+    var bus = CartridgeBus.init(.mvs);
+    try std.testing.expectEqual(@as(?u16, 0), bus.readWord(0xd01234));
+    try std.testing.expect(!bus.writeWord(0xd01234, 0xbeef));
+    try std.testing.expect(bus.writeByte(0x3a001d, 0));
+    try std.testing.expect(bus.system_control.backup_ram_write_enabled);
+    try std.testing.expect(bus.writeWord(0xdf1234, 0xbeef));
+    try std.testing.expectEqual(@as(?u8, 0xbe), bus.readByte(0xd01234));
+    try std.testing.expectEqual(@as(?u16, 0xbeef), bus.readWord(0xd01234));
+    try std.testing.expect(bus.writeByte(0x3a000d, 0));
+    try std.testing.expect(!bus.writeByte(0xd01234, 0));
+
+    var aes = CartridgeBus.init(.aes);
+    try std.testing.expectEqual(@as(?u8, null), aes.readByte(0xd00000));
+    try std.testing.expect(!aes.writeByte(0xd00000, 0));
+    try std.testing.expect(!aes.writeByte(0x3a001d, 0));
+    try std.testing.expect(!aes.writeByte(0x3a000d, 0));
+    try std.testing.expect(!aes.system_control.backup_ram_write_enabled);
 }
 
 test "Neo Geo cartridge bus uses decoded I/O byte lanes without I/O word guesses" {
