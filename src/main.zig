@@ -143,7 +143,7 @@ fn presentDemoFrame(init: std.process.Init, renderer: *Renderer, frame: Frame) !
 fn appendExitPrompt(io: std.Io, output: *std.Io.Writer) !void {
     const row = if (try terminal.viewport(io)) |view| view.rows else 61;
     if (row > 1) {
-        try output.print("\x1b[0m\x1b[{d};1H\x1b[2KEsc 退出 · WASD 移动 · Z/X A/B · Enter Start", .{row});
+        try output.print("\x1b[0m\x1b[{d};1H\x1b[2KEsc 退出 · 方向键/WASD 移动 · Z/X A/B · Enter Start", .{row});
     }
     try output.writeAll("\x1b[H");
 }
@@ -505,6 +505,8 @@ test "30 FPS presentation retains every 60 Hz emulation frame" {
 
 test "terminal cursor keys and lone Escape map to stable actions" {
     try std.testing.expect(actionsForKey(.up).up);
+    try std.testing.expect(actionsForKey(.down).down);
+    try std.testing.expect(actionsForKey(.left).left);
     try std.testing.expect(actionsForKey(.right).right);
     try std.testing.expect(actionsForKey(.{ .byte = 'z' }).primary_1);
     try std.testing.expect(isEscapeKey(.{ .byte = 0x1b }));
