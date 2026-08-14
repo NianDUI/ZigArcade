@@ -6,8 +6,8 @@ const address_map = @import("address_map.zig");
 /// address bit chooses a latch value, and only odd 68000 byte lanes trigger
 /// it. This device records only the three controls whose effects are known well
 /// enough to model independently. The cartridge bus consumes vector source
-/// for its first 128 fixed-P-ROM bytes; palette devices do not consume the
-/// palette-bank state yet. MVS backup RAM consumes its write-enable state.
+/// for its first 128 fixed-P-ROM bytes; palette RAM consumes the palette-bank
+/// state. MVS backup RAM consumes its write-enable state.
 pub const SystemControl = struct {
     vector_source: VectorSource = .bios,
     palette_bank: PaletteBank = .bank_0,

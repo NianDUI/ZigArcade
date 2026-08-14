@@ -4,6 +4,7 @@ const CartridgeIo = @import("cartridge_io.zig").CartridgeIo;
 const DipSwitchWatchdog = @import("dipswitch_watchdog.zig").DipSwitchWatchdog;
 const PaletteRam = @import("palette_ram.zig").PaletteRam;
 const SystemControl = @import("system_control.zig").SystemControl;
+const PaletteBank = @import("system_control.zig").PaletteBank;
 const VectorSource = @import("system_control.zig").VectorSource;
 
 /// Partial, asset-free cartridge-system 68000 bus. It composes only address
@@ -29,7 +30,10 @@ pub const CartridgeBus = struct {
     system_rom: []const u8 = &.{},
     work_ram: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024),
     backup_ram: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024),
-    palette_ram: PaletteRam = .{},
+    /// The two 4096-word palette RAM banks selected by system-control latch
+    /// bit 7. CPU palette reads and writes address only the currently selected
+    /// bank; byte lanes remain deliberately unsupported.
+    palette_ram: [2]PaletteRam = .{ .{}, .{} },
     io: CartridgeIo,
     dipswitch_watchdog: DipSwitchWatchdog = .{},
     system_control: SystemControl = .{},
@@ -98,7 +102,7 @@ pub const CartridgeBus = struct {
             },
             .palette => blk: {
                 if (decoded.offset & 1 != 0) break :blk null;
-                break :blk self.palette_ram.readWord(@intCast(decoded.offset / 2));
+                break :blk self.activePaletteRamConst().readWord(@intCast(decoded.offset / 2));
             },
             .system_rom => blk: {
                 const high = readRomByte(self.system_rom, decoded.offset) orelse break :blk null;
@@ -127,7 +131,7 @@ pub const CartridgeBus = struct {
             },
             .palette => {
                 if (decoded.offset & 1 != 0) return false;
-                return self.palette_ram.writeWord(@intCast(decoded.offset / 2), value);
+                return self.activePaletteRam().writeWord(@intCast(decoded.offset / 2), value);
             },
             .banked_program_rom => return self.writeProgramBank(decoded, value),
             else => return false,
@@ -146,6 +150,14 @@ pub const CartridgeBus = struct {
         else
             self.program_rom;
         return readRomByte(rom, offset);
+    }
+
+    fn activePaletteRam(self: *CartridgeBus) *PaletteRam {
+        return &self.palette_ram[@intFromEnum(self.system_control.palette_bank)];
+    }
+
+    fn activePaletteRamConst(self: *const CartridgeBus) *const PaletteRam {
+        return &self.palette_ram[@intFromEnum(self.system_control.palette_bank)];
     }
 
     fn readBankedProgramByte(self: *const CartridgeBus, offset: u32) ?u8 {
@@ -186,6 +198,20 @@ test "Neo Geo cartridge bus maps palette words but rejects unproven byte lanes" 
     try std.testing.expectEqual(@as(?u16, 0x7c00), bus.readWord(0x400010));
     try std.testing.expectEqual(@as(?u8, null), bus.readByte(0x400010));
     try std.testing.expect(!bus.writeByte(0x400010, 0xff));
+}
+
+test "Neo Geo cartridge bus switches the CPU-visible palette RAM bank" {
+    var bus = CartridgeBus.init(.aes);
+    try std.testing.expect(bus.writeWord(0x400010, 0x1111));
+    try std.testing.expect(bus.writeByte(0x3a001f, 0));
+    try std.testing.expectEqual(PaletteBank.bank_1, bus.system_control.palette_bank);
+    try std.testing.expectEqual(@as(?u16, 0), bus.readWord(0x400010));
+    try std.testing.expect(bus.writeWord(0x400010, 0x2222));
+    try std.testing.expect(bus.writeByte(0x3a000f, 0));
+    try std.testing.expectEqual(PaletteBank.bank_0, bus.system_control.palette_bank);
+    try std.testing.expectEqual(@as(?u16, 0x1111), bus.readWord(0x7fe010));
+    try std.testing.expect(bus.writeByte(0x3b001f, 0));
+    try std.testing.expectEqual(@as(?u16, 0x2222), bus.readWord(0x400010));
 }
 
 test "Neo Geo cartridge bus mirrors caller-supplied system ROM as read-only big-endian bytes" {
@@ -290,7 +316,7 @@ test "Neo Geo cartridge bus connects MVS DIP input and watchdog kicks" {
     try std.testing.expect(!aes.writeByte(0x300001, 0));
 }
 
-test "Neo Geo cartridge bus routes system-control writes without a palette side effect" {
+test "Neo Geo cartridge bus routes system-control writes through palette bank state" {
     var bus = CartridgeBus.init(.aes);
     try std.testing.expect(bus.writeByte(0x3b0013, 0x42));
     try std.testing.expectEqual(@import("system_control.zig").VectorSource.cartridge, bus.system_control.vector_source);

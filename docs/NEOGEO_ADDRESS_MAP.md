@@ -21,7 +21,7 @@
 | `$100000-$10FFFF` | 64 KiB work RAM；`$110000-$1FFFFF` 为镜像 | 地址与镜像已建模 |
 | `$200000-$2FFFFF` | 第二个 P-ROM / banked window | `cartridge_bus.zig` 为无保护、调用方提供的 P-ROM 建模 1 MiB bank window；初始/低三位 bank `0` 读取 P-ROM 的第 2 MiB，`$2FFFF0-$2FFFFF` 的偶地址 word 写选择低三位 bank；未提供的 chunk、byte write、保护/非标准 bank 方案保持未映射 |
 | `$300000-$3FFFFF` | I/O | 仅已列寄存器的译码已建模 |
-| `$400000-$401FFF` | 8 KiB palette RAM；至 `$7FFFFF` 镜像 | `cartridge_bus.zig` 已接入 `PaletteRam` 的 word 读写与镜像；byte lane/write mask 和 palette-bank 切换仍未建模 |
+| `$400000-$401FFF` | 8 KiB palette RAM；至 `$7FFFFF` 镜像 | `cartridge_bus.zig` 已接入两组各 4096-word `PaletteRam` 的 word 读写与镜像；system-control `$3A000F/$3A001F` 选择当前 CPU-visible bank 0/1；byte lane/write mask 与 shadow 合成仍未建模 |
 | `$800000-$BFFFFF` | AES memory-card window | 仅 `.aes` 译码；不读取或创建持久卡数据 |
 | `$C00000-$C1FFFF` | 128 KiB system ROM；至 `$CFFFFF` 镜像 | `cartridge_bus.zig` 可读取调用方提供的只读 byte slice（不足 128 KiB 的部分保持未映射），镜像与 big-endian word 已回归；仅在 BIOS vector source 时同时供 `$000000-$00007F` 使用，其余 system-ROM 映射独立，未定义开放总线 |
 | `$D00000-$D0FFFF` | MVS backup RAM；至 `$DFFFFF` 镜像 | `cartridge_bus.zig` 提供易失 64 KiB byte/word RAM 与镜像；默认写保护，只有 system-control `$3A001D` 解锁（`$3A000D` 锁回）后可写；不创建持久存档 |
@@ -37,17 +37,17 @@
 | `$320000` | `REG_SOUND` | Z80 reply / 68k sound command | `cartridge_io.zig` 已接入命令 latch 与非破坏 reply read；NMI、Z80 端口执行待 P5b |
 | `$340000` | `REG_P2CNT` | P2 输入，active-low | 仅译码 |
 | `$380000` | `REG_STATUS_B` | start/select 与系统状态 | 仅译码；MVS/AES 位定义需分 variant |
-| `$3A0001` 等 | system-control latch | palette bank、vector source、save/memory-card 控制等 | `system_control.zig` 已记录 `$3A0003/$3A0013` 的 BIOS/卡带 vector source、`$3A000D/$3A001D` 的 MVS backup-RAM 锁/解锁，及 `$3A000F/$3A001F` 的 palette bank 0/1；写数据被忽略，只有 odd byte lane 有效；vector source 已连接 `$000000-$00007F`，palette bank 尚未连接 palette RAM |
+| `$3A0001` 等 | system-control latch | palette bank、vector source、save/memory-card 控制等 | `system_control.zig` 已记录 `$3A0003/$3A0013` 的 BIOS/卡带 vector source、`$3A000D/$3A001D` 的 MVS backup-RAM 锁/解锁，及 `$3A000F/$3A001F` 的 palette bank 0/1；写数据被忽略，只有 odd byte lane 有效；vector source 已连接 `$000000-$00007F`，palette bank 已选择 CPU-visible palette RAM |
 | `$3C0000-$3C000E` | LSPC video | VRAM address/data/modulo、mode、timer、IRQ ack | 仅译码；VRAM/IRQ 未实现 |
 
 ## 代码落点与测试顺序
 
-`src/systems/neogeo/address_map.zig` 是纯函数地址译码层：调用方必须传入 `.mvs` 或 `.aes`，它才返回设备目标和归一化后的物理 byte offset。`system_control.zig` 消费其中的 system-control 目标，建模 74HC259 风格的地址触发锁存：写数据无意义，只有 odd byte lane 有效，地址 bit 4 选择 set/reset；当前已接入 vector source、MVS backup-RAM write enable 与 palette bank 三组有明确证据的状态。`dipswitch_watchdog.zig` 是 MVS `REG_DIPSW` 的 raw-byte 注入与 watchdog-kick 观测边界；它不伪造默认 DIP 配置或 watchdog 复位时序。`cartridge_bus.zig` 是独立的、无资产的卡带总线组合切片：目前接入调用方提供的 fixed P-ROM byte/word（前 `$80` byte 由 vector latch 决定 system ROM/P-ROM）、标准 1 MiB banked P-ROM byte/word（仅已锁定的 bank-select word 写）、system ROM byte/word、work RAM 的 byte/word、易失 MVS backup RAM 的 byte/word（经写使能锁存门控）、palette RAM 的 word、已验证 I/O byte lane、MVS DIP/watchdog byte lane 与 system-control 写入；system-control palette latch 尚不连接 palette RAM，读/word lane、open bus、memory-card、LSPC 与保护/非标准 ROM bank 方案都明确保持未映射。`bus.zig` 仍是旧的合成诊断总线，不能被误称为真实硬件总线。
+`src/systems/neogeo/address_map.zig` 是纯函数地址译码层：调用方必须传入 `.mvs` 或 `.aes`，它才返回设备目标和归一化后的物理 byte offset。`system_control.zig` 消费其中的 system-control 目标，建模 74HC259 风格的地址触发锁存：写数据无意义，只有 odd byte lane 有效，地址 bit 4 选择 set/reset；当前已接入 vector source、MVS backup-RAM write enable 与 palette bank 三组有明确证据的状态。`dipswitch_watchdog.zig` 是 MVS `REG_DIPSW` 的 raw-byte 注入与 watchdog-kick 观测边界；它不伪造默认 DIP 配置或 watchdog 复位时序。`cartridge_bus.zig` 是独立的、无资产的卡带总线组合切片：目前接入调用方提供的 fixed P-ROM byte/word（前 `$80` byte 由 vector latch 决定 system ROM/P-ROM）、标准 1 MiB banked P-ROM byte/word（仅已锁定的 bank-select word 写）、system ROM byte/word、work RAM 的 byte/word、易失 MVS backup RAM 的 byte/word（经写使能锁存门控）、双 bank palette RAM 的 word（由 palette latch 选择 CPU-visible bank）、已验证 I/O byte lane、MVS DIP/watchdog byte lane 与 system-control 写入；palette byte lane/shadow、I/O word lane、open bus、memory-card、LSPC 与保护/非标准 ROM bank 方案都明确保持未映射。`bus.zig` 仍是旧的合成诊断总线，不能被误称为真实硬件总线。
 
 后续必须按以下顺序接入：
 
 1. 为保护/非标准 P-ROM bank 方案扩展显式设备，并先锁定 ROM wait/open-bus 规则；fixed P-ROM、system ROM、标准 1 MiB bank window 和已建模的 `$80`-byte vector switch 已接入。
-2. 扩充经资料验证的 byte/word lane：palette byte 写 mask、I/O word 低字节，并在两组 palette 存储均有明确模型后接入已建模的 palette bank 开关。
+2. 扩充经资料验证的 byte/word lane：palette byte 写 mask、I/O word 低字节与 shadow 合成。
 3. 再实现 LSPC VRAM port、timer/IRQ 与真正 68000 exception/interrupt 边界。
 
 在第 3 步完成前，不宣称可以运行 BIOS 或任何 Neo Geo 游戏。

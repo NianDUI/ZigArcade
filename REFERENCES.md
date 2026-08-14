@@ -19,7 +19,7 @@ ZigArcade 的源码采用 [MIT License](LICENSE)。本项目只独立实现代�
 | NeoGeo Development Wiki：`68k memory map` | revision 8317，2026-08-13 访问 | 卡带 68000 地址范围、镜像、物理大小 | 页面标注 CC0；只记录硬件事实，未导入资产或代码 |
 | NeoGeo Development Wiki：`Memory mapped registers` | revision 9288，2026-08-13 访问 | I/O 基址、decode mask、LSPC/video 与 system-control 语义 | 页面明确部分 decode mask 未验证；实现前须有独立测试或第二来源核验 |
 | NeoGeo Development Wiki：`68k/Z80 communication` | revision 5271，2026-08-14 访问 | `REG_SOUND` 的命令/回复 latch 与 Z80 NMI 条件 | 页面标注 CC0；仅实现 latch 行为，不复制示例代码或引入 Z80 实现 |
-| MAME `src/mame/snk/neogeo.cpp` | `c8f7357b5c573fd7f236c4747f0f34fafe510c54`，2026-08-13、2026-08-14 访问 | MVS/AES 主地址图、`$000000-$00007F` BIOS/P-ROM vector 切换范围、标准 `$2FFFF0-$2FFFFF` P-ROM bank-select 及 MVS backup-RAM write-enable latch 的独立交叉核验 | 文件头 SPDX `BSD-3-Clause`（可与 MIT 共存）；本项目仍只作行为研究，严禁复制代码 |
+| MAME `src/mame/snk/neogeo.cpp` / `neogeo_v.cpp` | `c8f7357b5c573fd7f236c4747f0f34fafe510c54`，2026-08-13、2026-08-14 访问 | MVS/AES 主地址图、`$000000-$00007F` BIOS/P-ROM vector 切换范围、标准 `$2FFFF0-$2FFFFF` P-ROM bank-select、MVS backup-RAM write-enable latch 及双 palette-RAM bank 的 CPU-visible 选择 | 文件头 SPDX `BSD-3-Clause`（可与 MIT 共存）；本项目仍只作行为研究，严禁复制代码 |
 | FBNeo `src/burn/drv/neogeo/neo_run.cpp` | `2fcb2628fbfd529806e75f3559a9d82758c8a5cc`，2026-08-13 访问 | 与 MAME/Wiki 的地址译码交叉核验 | 含非商业与公开修改等限制；严禁复制代码或资产 |
 
 每次实际采用一项外部资料时，都必须补充锁定的 commit/tag、许可证/SPDX、研究模块与日期。许可不明或与 MIT 发布策略不兼容时，不得拷贝其代码或提交其资产。
