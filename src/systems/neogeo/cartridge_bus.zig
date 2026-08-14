@@ -1,6 +1,7 @@
 const std = @import("std");
 const address_map = @import("address_map.zig");
 const CartridgeIo = @import("cartridge_io.zig").CartridgeIo;
+const DipSwitchWatchdog = @import("dipswitch_watchdog.zig").DipSwitchWatchdog;
 const PaletteRam = @import("palette_ram.zig").PaletteRam;
 
 /// Partial, asset-free cartridge-system 68000 bus. It composes only address
@@ -13,6 +14,7 @@ pub const CartridgeBus = struct {
     work_ram: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024),
     palette_ram: PaletteRam = .{},
     io: CartridgeIo,
+    dipswitch_watchdog: DipSwitchWatchdog = .{},
 
     pub fn init(variant: address_map.CartridgeVariant) CartridgeBus {
         return .{ .variant = variant, .io = CartridgeIo.init(variant) };
@@ -23,6 +25,7 @@ pub const CartridgeBus = struct {
         return switch (decoded.target) {
             .work_ram => self.work_ram[@intCast(decoded.offset)],
             .player_1, .sound, .player_2, .system => self.io.read(decoded),
+            .dip_switch_and_watchdog => self.dipswitch_watchdog.read(decoded),
             // Palette accesses are word-wide in this deliberately narrow
             // slice. Byte-write masks need their own hardware evidence.
             else => null,
@@ -34,6 +37,7 @@ pub const CartridgeBus = struct {
         switch (decoded.target) {
             .work_ram => self.work_ram[@intCast(decoded.offset)] = value,
             .sound => return self.io.write(decoded, value),
+            .dip_switch_and_watchdog => return self.dipswitch_watchdog.write(decoded),
             else => return false,
         }
         return true;
@@ -113,6 +117,18 @@ test "Neo Geo cartridge bus uses decoded I/O byte lanes without I/O word guesses
     try std.testing.expectEqual(@as(?u8, null), bus.readByte(0x320001));
     try std.testing.expectEqual(@as(?u16, null), bus.readWord(0x320000));
     try std.testing.expect(!bus.writeWord(0x320000, 0));
+}
+
+test "Neo Geo cartridge bus connects MVS DIP input and watchdog kicks" {
+    var bus = CartridgeBus.init(.mvs);
+    bus.dipswitch_watchdog.setDips(0x5a);
+    try std.testing.expectEqual(@as(?u8, 0x5a), bus.readByte(0x31ff01));
+    try std.testing.expect(bus.writeByte(0x31ff01, 0x42));
+    try std.testing.expectEqual(@as(u64, 1), bus.dipswitch_watchdog.watchdog_kicks);
+
+    var aes = CartridgeBus.init(.aes);
+    try std.testing.expectEqual(@as(?u8, null), aes.readByte(0x300001));
+    try std.testing.expect(!aes.writeByte(0x300001, 0));
 }
 
 test "Neo Geo cartridge bus rejects unmapped and non-24-bit addresses" {

@@ -33,7 +33,7 @@
 | 基址 | 名称 | 读 / 写概念 | 当前状态 |
 |---|---|---|---|
 | `$300000` | `REG_P1CNT` | P1 方向与 A–D，active-low | 仅译码；输入编码待总线接入 |
-| `$300001` | `REG_DIPSW` / watchdog | DIP read；写入 kick watchdog | 当前只为 `.mvs` 译码；MVS 的 `$300080/$300081` TEST 空间明确不能被错译为 P1，AES 的 P1 镜像范围单独处理 |
+| `$300001` | `REG_DIPSW` / watchdog | DIP read；写入 kick watchdog | 仅 `.mvs`；`dipswitch_watchdog.zig` 接收调用方注入的 raw DIP byte（未设置即保持未映射）并记录每次 watchdog kick，不臆测 DIP 语义或 watchdog timeout；MVS 的 `$300080/$300081` TEST 空间明确不能被错译为 P1，AES 的 P1 镜像范围单独处理 |
 | `$320000` | `REG_SOUND` | Z80 reply / 68k sound command | `cartridge_io.zig` 已接入命令 latch 与非破坏 reply read；NMI、Z80 端口执行待 P5b |
 | `$340000` | `REG_P2CNT` | P2 输入，active-low | 仅译码 |
 | `$380000` | `REG_STATUS_B` | start/select 与系统状态 | 仅译码；MVS/AES 位定义需分 variant |
@@ -42,7 +42,7 @@
 
 ## 代码落点与测试顺序
 
-`src/systems/neogeo/address_map.zig` 是纯函数地址译码层：调用方必须传入 `.mvs` 或 `.aes`，它才返回设备目标和归一化后的物理 byte offset。`system_control.zig` 消费其中的 system-control 目标，建模 74HC259 风格的地址触发锁存：写数据无意义，只有 odd byte lane 有效，地址 bit 4 选择 set/reset；当前仅接受有明确证据的 vector source 和 palette bank 两组状态。`cartridge_bus.zig` 是独立的、无资产的卡带总线组合切片：目前只接入 work RAM 的 byte/word、palette RAM 的 word，以及 `cartridge_io.zig` 已锁定的 I/O byte lane；I/O word、palette byte、ROM、open bus、memory-card、backup RAM、system-control、LSPC 都明确保持未映射。`bus.zig` 仍是旧的合成诊断总线，不能被误称为真实硬件总线。
+`src/systems/neogeo/address_map.zig` 是纯函数地址译码层：调用方必须传入 `.mvs` 或 `.aes`，它才返回设备目标和归一化后的物理 byte offset。`system_control.zig` 消费其中的 system-control 目标，建模 74HC259 风格的地址触发锁存：写数据无意义，只有 odd byte lane 有效，地址 bit 4 选择 set/reset；当前仅接受有明确证据的 vector source 和 palette bank 两组状态。`dipswitch_watchdog.zig` 是 MVS `REG_DIPSW` 的 raw-byte 注入与 watchdog-kick 观测边界；它不伪造默认 DIP 配置或 watchdog 复位时序。`cartridge_bus.zig` 是独立的、无资产的卡带总线组合切片：目前接入 work RAM 的 byte/word、palette RAM 的 word、已验证 I/O byte lane 与 MVS DIP/watchdog byte lane；I/O word、palette byte、ROM、open bus、memory-card、backup RAM、system-control、LSPC 都明确保持未映射。`bus.zig` 仍是旧的合成诊断总线，不能被误称为真实硬件总线。
 
 后续必须按以下顺序接入：
 

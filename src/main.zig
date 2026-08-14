@@ -13,6 +13,7 @@ const neogeo_fixed = @import("systems/neogeo/fixed.zig");
 const neogeo_address_map = @import("systems/neogeo/address_map.zig");
 const neogeo_cartridge_bus = @import("systems/neogeo/cartridge_bus.zig");
 const neogeo_cartridge_io = @import("systems/neogeo/cartridge_io.zig");
+const neogeo_dipswitch_watchdog = @import("systems/neogeo/dipswitch_watchdog.zig");
 const neogeo_system_control = @import("systems/neogeo/system_control.zig");
 const NeoGeoFixedMap = @import("systems/neogeo/fixed_map.zig").FixedMap;
 const NeoGeoDiagnostic = @import("systems/neogeo/neogeo.zig").NeoGeoDiagnostic;
@@ -22,6 +23,7 @@ comptime {
     _ = neogeo_address_map;
     _ = neogeo_cartridge_bus;
     _ = neogeo_cartridge_io;
+    _ = neogeo_dipswitch_watchdog;
     _ = neogeo_system_control;
 }
 
