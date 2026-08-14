@@ -144,7 +144,7 @@ Neo Geo 是独立主机：68000 主 CPU、Z80 音频 CPU、YM2610、sprite/tile 
 
 `systems/neogeo/dipswitch_watchdog.zig` 建模 MVS `REG_DIPSW` 的原始 DIP byte 与 watchdog kick 边界：调用方须显式给出 DIP byte，未给出时读保持未映射；每次有效 odd-lane 写仅记录一次 kick，不凭空定义 timeout 或复位效果。AES 不会译码这一设备。
 
-`systems/neogeo/cartridge_bus.zig` 是独立、无资产的卡带总线组合切片：已把显式 MVS/AES 地址译码接到调用方提供的 fixed P-ROM byte/word、system-ROM byte/word（128 KiB 物理窗口镜像、只读）、work RAM 的 byte/word、palette RAM 的 word、已验证 I/O byte lane、MVS DIP/watchdog byte lane 与 system-control 的有效 byte 写。system-control 的 vector 写已准确切换 `$000000-$00007F` 的 system ROM/P-ROM 来源，`$000080-$0FFFFF` 仍为 fixed P-ROM；palette 写尚不影响 palette RAM。I/O word、palette byte、system-control 读/word、银行 P-ROM、open bus、memory-card、backup RAM 和 LSPC 一律明确未映射。它不替换合成 `bus.zig`，直到银行 P-ROM 和 68000 总线细节也有证据与回归测试。
+`systems/neogeo/cartridge_bus.zig` 是独立、无资产的卡带总线组合切片：已把显式 MVS/AES 地址译码接到调用方提供的 fixed P-ROM byte/word、标准 banked P-ROM byte/word（每 bank 1 MiB、基于 P-ROM 第二个 MiB，`$2FFFF0-$2FFFFF` 的偶地址 word 写以低三位选择）、system-ROM byte/word（128 KiB 物理窗口镜像、只读）、work RAM 的 byte/word、palette RAM 的 word、已验证 I/O byte lane、MVS DIP/watchdog byte lane 与 system-control 的有效 byte 写。system-control 的 vector 写已准确切换 `$000000-$00007F` 的 system ROM/P-ROM 来源，`$000080-$0FFFFF` 仍为 fixed P-ROM；palette 写尚不影响 palette RAM。I/O word、palette byte、system-control 读/word、open bus、memory-card、backup RAM、LSPC 与保护/非标准 ROM bank 方案一律明确未映射。它不替换合成 `bus.zig`，直到剩余银行 P-ROM 和 68000 总线细节也有证据与回归测试。
 
 `systems/neogeo/fixed.zig` 在 P5b 前提供 S-ROM 固定层的纯 8×8、4bpp 位平面解码：32-byte tile 的四个 8-byte plane 组合为 palette index，输出缓冲由调用方提供。尚未接入 tilemap、palette RAM、`320×224` 合成或真实 ROM；这一步仅锁定图块数据格式。
 
