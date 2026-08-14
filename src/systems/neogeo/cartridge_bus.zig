@@ -7,11 +7,16 @@ const SystemControl = @import("system_control.zig").SystemControl;
 
 /// Partial, asset-free cartridge-system 68000 bus. It composes only address
 /// targets with evidence-backed byte/word device contracts: mirrored work RAM,
-/// word-wide palette RAM, and byte-wide I/O. Program ROM, system ROM, vector
-/// switching, open-bus values, memory cards, backup RAM and LSPC are not
+/// word-wide palette RAM, byte-wide I/O, and caller-supplied system ROM.
+/// Program ROM, vector switching, open-bus values, memory cards, backup RAM
+/// and LSPC are not
 /// silently emulated here.
 pub const CartridgeBus = struct {
     variant: address_map.CartridgeVariant,
+    /// Caller-owned 128 KiB system-ROM image. A shorter slice makes the
+    /// uncovered physical bytes unmapped rather than filling them with a
+    /// guessed open-bus value.
+    system_rom: []const u8 = &.{},
     work_ram: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024),
     palette_ram: PaletteRam = .{},
     io: CartridgeIo,
@@ -26,6 +31,7 @@ pub const CartridgeBus = struct {
         const decoded = self.decode(address) orelse return null;
         return switch (decoded.target) {
             .work_ram => self.work_ram[@intCast(decoded.offset)],
+            .system_rom => readRomByte(self.system_rom, decoded.offset),
             .player_1, .sound, .player_2, .system => self.io.read(decoded),
             .dip_switch_and_watchdog => self.dipswitch_watchdog.read(decoded),
             // Palette accesses are word-wide in this deliberately narrow
@@ -60,6 +66,11 @@ pub const CartridgeBus = struct {
                 if (decoded.offset & 1 != 0) break :blk null;
                 break :blk self.palette_ram.readWord(@intCast(decoded.offset / 2));
             },
+            .system_rom => blk: {
+                const high = readRomByte(self.system_rom, decoded.offset) orelse break :blk null;
+                const low = readRomByte(self.system_rom, decoded.offset + 1) orelse break :blk null;
+                break :blk (@as(u16, high) << 8) | low;
+            },
             // I/O word lane values and their low-byte behavior are not part
             // of this slice. Callers must use the proven byte access path.
             else => null,
@@ -90,6 +101,11 @@ pub const CartridgeBus = struct {
     }
 };
 
+fn readRomByte(rom: []const u8, offset: u32) ?u8 {
+    if (offset >= rom.len) return null;
+    return rom[@intCast(offset)];
+}
+
 test "Neo Geo cartridge bus mirrors work RAM and keeps big-endian word order" {
     var bus = CartridgeBus.init(.mvs);
     try std.testing.expect(bus.writeWord(0x1f1234, 0xbeef));
@@ -107,6 +123,18 @@ test "Neo Geo cartridge bus maps palette words but rejects unproven byte lanes" 
     try std.testing.expectEqual(@as(?u16, 0x7c00), bus.readWord(0x400010));
     try std.testing.expectEqual(@as(?u8, null), bus.readByte(0x400010));
     try std.testing.expect(!bus.writeByte(0x400010, 0xff));
+}
+
+test "Neo Geo cartridge bus mirrors caller-supplied system ROM as read-only big-endian bytes" {
+    const system_rom = [_]u8{ 0x12, 0x34, 0x56 };
+    var bus = CartridgeBus.init(.mvs);
+    bus.system_rom = &system_rom;
+    try std.testing.expectEqual(@as(?u8, 0x12), bus.readByte(0xc00000));
+    try std.testing.expectEqual(@as(?u8, 0x34), bus.readByte(0xc20001));
+    try std.testing.expectEqual(@as(?u16, 0x1234), bus.readWord(0xce0000));
+    try std.testing.expectEqual(@as(?u16, null), bus.readWord(0xc00002));
+    try std.testing.expect(!bus.writeByte(0xc00000, 0));
+    try std.testing.expect(!bus.writeWord(0xc00000, 0));
 }
 
 test "Neo Geo cartridge bus uses decoded I/O byte lanes without I/O word guesses" {

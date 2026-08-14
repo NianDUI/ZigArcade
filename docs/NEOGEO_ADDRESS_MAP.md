@@ -23,7 +23,7 @@
 | `$300000-$3FFFFF` | I/O | 仅已列寄存器的译码已建模 |
 | `$400000-$401FFF` | 8 KiB palette RAM；至 `$7FFFFF` 镜像 | 地址与镜像已建模；尚未接入 `PaletteRam` |
 | `$800000-$BFFFFF` | AES memory-card window | 仅 `.aes` 译码；不读取或创建持久卡数据 |
-| `$C00000-$C1FFFF` | 128 KiB system ROM；至 `$CFFFFF` 镜像 | 地址已建模；BIOS 内容/映射尚未接入 |
+| `$C00000-$C1FFFF` | 128 KiB system ROM；至 `$CFFFFF` 镜像 | `cartridge_bus.zig` 可读取调用方提供的只读 byte slice（不足 128 KiB 的部分保持未映射），镜像与 big-endian word 已回归；不绑定 BIOS/vector 或开放总线行为 |
 | `$D00000-$D0FFFF` | MVS backup RAM；至 `$DFFFFF` 镜像 | 仅 `.mvs` 译码，尚不创建持久存档 |
 
 ## 已锁定 I/O 基址
@@ -42,11 +42,11 @@
 
 ## 代码落点与测试顺序
 
-`src/systems/neogeo/address_map.zig` 是纯函数地址译码层：调用方必须传入 `.mvs` 或 `.aes`，它才返回设备目标和归一化后的物理 byte offset。`system_control.zig` 消费其中的 system-control 目标，建模 74HC259 风格的地址触发锁存：写数据无意义，只有 odd byte lane 有效，地址 bit 4 选择 set/reset；当前仅接受有明确证据的 vector source 和 palette bank 两组状态。`dipswitch_watchdog.zig` 是 MVS `REG_DIPSW` 的 raw-byte 注入与 watchdog-kick 观测边界；它不伪造默认 DIP 配置或 watchdog 复位时序。`cartridge_bus.zig` 是独立的、无资产的卡带总线组合切片：目前接入 work RAM 的 byte/word、palette RAM 的 word、已验证 I/O byte lane、MVS DIP/watchdog byte lane 与 system-control 写入；system-control 只更新本地锁存状态，读/word lane、ROM、open bus、memory-card、backup RAM、LSPC 都明确保持未映射。`bus.zig` 仍是旧的合成诊断总线，不能被误称为真实硬件总线。
+`src/systems/neogeo/address_map.zig` 是纯函数地址译码层：调用方必须传入 `.mvs` 或 `.aes`，它才返回设备目标和归一化后的物理 byte offset。`system_control.zig` 消费其中的 system-control 目标，建模 74HC259 风格的地址触发锁存：写数据无意义，只有 odd byte lane 有效，地址 bit 4 选择 set/reset；当前仅接受有明确证据的 vector source 和 palette bank 两组状态。`dipswitch_watchdog.zig` 是 MVS `REG_DIPSW` 的 raw-byte 注入与 watchdog-kick 观测边界；它不伪造默认 DIP 配置或 watchdog 复位时序。`cartridge_bus.zig` 是独立的、无资产的卡带总线组合切片：目前接入调用方提供的 system ROM byte/word、work RAM 的 byte/word、palette RAM 的 word、已验证 I/O byte lane、MVS DIP/watchdog byte lane 与 system-control 写入；system-control 只更新本地锁存状态，读/word lane、P-ROM、open bus、memory-card、backup RAM、LSPC 都明确保持未映射。`bus.zig` 仍是旧的合成诊断总线，不能被误称为真实硬件总线。
 
 后续必须按以下顺序接入：
 
-1. 将固定/银行 P-ROM、system ROM、已建模的 vector switch 以显式设备接入 `cartridge_bus.zig`，并先锁定 ROM wait/open-bus 规则。
+1. 将固定/银行 P-ROM、已建模的 vector switch 以显式设备接入 `cartridge_bus.zig`，并先锁定 ROM wait/open-bus 规则；system ROM 的静态只读镜像已接入，仍不参与 vector 选择。
 2. 扩充经资料验证的 byte/word lane：palette byte 写 mask、I/O word 低字节，并在两组 palette 存储均有明确模型后接入已建模的 palette bank 开关。
 3. 再实现 LSPC VRAM port、timer/IRQ 与真正 68000 exception/interrupt 边界。
 
