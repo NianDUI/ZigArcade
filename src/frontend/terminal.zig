@@ -53,6 +53,8 @@ pub const Session = struct {
     signal_handlers_installed: bool = false,
     pending_input: [256]u8 = undefined,
     pending_input_len: usize = 0,
+    apc_discarding: bool = false,
+    apc_previous_was_escape: bool = false,
 
     pub fn enter(self: *Session, io: std.Io, output: *std.Io.Writer) !void {
         if (!try std.Io.File.stdin().isTty(io) or !try std.Io.File.stdout().isTty(io)) {
@@ -92,6 +94,7 @@ pub const Session = struct {
     /// original 50 ms lifecycle cadence through `nextEvent`.
     pub fn nextEventTimeout(self: *Session, timeout_ms: i32) !Event {
         if (takePendingSignal()) |signal| return eventForSignal(signal);
+        if (self.apc_discarding) return self.continueDiscardingApc(timeout_ms);
 
         var fds = [_]std.posix.pollfd{.{
             .fd = std.posix.STDIN_FILENO,
@@ -108,6 +111,15 @@ pub const Session = struct {
             .timeout => return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } },
             .input_closed => return .{ .exit = .input_closed },
         };
+        // Kitty graphics replies are APC sequences (`ESC _ ... ESC \\`) on
+        // the same TTY as user input. They are terminal protocol traffic, not
+        // an Escape key; consuming them here prevents a quiet image response
+        // from ending a game session.
+        if (csi == '_') {
+            self.apc_discarding = true;
+            self.apc_previous_was_escape = false;
+            return self.continueDiscardingApc(0);
+        }
         if (csi != '[') return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
 
         var params: [32]u8 = undefined;
@@ -125,6 +137,30 @@ pub const Session = struct {
             len += 1;
         }
         return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
+    }
+
+    /// Discards a terminal APC reply over as many event-loop calls as needed.
+    /// A non-blocking follow-up avoids holding up the emulation loop when a
+    /// terminal splits a large graphics reply across several reads.
+    fn continueDiscardingApc(self: *Session, initial_timeout_ms: i32) !Event {
+        var timeout_ms = initial_timeout_ms;
+        while (true) {
+            switch (try self.readByteWithTimeout(timeout_ms)) {
+                .timeout => return .none,
+                .input_closed => {
+                    self.apc_discarding = false;
+                    return .{ .exit = .input_closed };
+                },
+                .byte => |byte| {
+                    if (self.apc_previous_was_escape and byte == '\\') {
+                        self.apc_discarding = false;
+                        return .none;
+                    }
+                    self.apc_previous_was_escape = byte == 0x1b;
+                    timeout_ms = 0;
+                },
+            }
+        }
     }
 
     fn readByte(self: *Session) !?u8 {
@@ -325,4 +361,15 @@ test "terminal queues probe-time user input in order" {
     try session.queueInput("zx");
     try std.testing.expectEqual(@as(?u8, 'z'), try session.readByte());
     try std.testing.expectEqual(@as(?u8, 'x'), try session.readByte());
+}
+
+test "terminal discards fragmented Kitty APC replies without generating Escape" {
+    var session: Session = .{};
+    session.apc_discarding = true;
+    try session.queueInput("Gi=1");
+    try std.testing.expectEqual(Event.none, try session.continueDiscardingApc(0));
+    try std.testing.expect(session.apc_discarding);
+    try session.queueInput(";OK\x1b\\");
+    try std.testing.expectEqual(Event.none, try session.continueDiscardingApc(0));
+    try std.testing.expect(!session.apc_discarding);
 }
