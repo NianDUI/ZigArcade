@@ -123,7 +123,7 @@ fn presentDemoFrame(init: std.process.Init, renderer: *Renderer, frame: Frame) !
     if (renderer.* == .auto) renderer.* = if (try probeKitty(init.io, output, &session)) .kitty else .ansi;
 
     try appendPresentedFrame(init.io, output, renderer.*, frame);
-    try appendExitPrompt(output);
+    try appendExitPrompt(init.io, output);
     try output.flush();
     while (true) {
         switch (try session.nextEvent()) {
@@ -132,7 +132,7 @@ fn presentDemoFrame(init: std.process.Init, renderer: *Renderer, frame: Frame) !
                 try kitty.appendDeleteAll(output);
                 try session.suspendAndResume(output);
                 try appendPresentedFrame(init.io, output, renderer.*, frame);
-                try appendExitPrompt(output);
+                try appendExitPrompt(init.io, output);
                 try output.flush();
             },
             .none => {},
@@ -140,8 +140,10 @@ fn presentDemoFrame(init: std.process.Init, renderer: *Renderer, frame: Frame) !
     }
 }
 
-fn appendExitPrompt(output: *std.Io.Writer) !void {
-    try output.writeAll("\x1b[0m\x1b[1;1HPress any key to exit…");
+fn appendExitPrompt(io: std.Io, output: *std.Io.Writer) !void {
+    const row = if (try terminal.viewport(io)) |view| view.rows else 61;
+    if (row <= 1) return;
+    try output.print("\x1b[0m\x1b[{d};1H\x1b[2KEsc 退出 · WASD 移动 · Z/X A/B · Enter Start", .{row});
 }
 
 /// Loads a supported iNES 1.0 cartridge and presents its RGB frames. ROM
@@ -290,7 +292,7 @@ fn runNesWithRenderer(init: std.process.Init, rom_path: []const u8, requested_re
         // the emulated clock just because a frame was not presented.
         if (shouldPresentFrame(frame.frame_number)) {
             try appendPresentedFrame(init.io, output, renderer, frame);
-            try appendExitPrompt(output);
+            try appendExitPrompt(init.io, output);
             try output.flush();
         }
         switch (try session.nextEventTimeout(nes_frame_interval_ms)) {
