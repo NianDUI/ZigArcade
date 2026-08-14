@@ -122,8 +122,8 @@ fn presentDemoFrame(init: std.process.Init, renderer: *Renderer, frame: Frame) !
 
     if (renderer.* == .auto) renderer.* = if (try probeKitty(init.io, output, &session)) .kitty else .ansi;
 
-    try appendPresentedFrame(init.io, output, renderer.*, frame);
     try appendExitPrompt(init.io, output);
+    try appendPresentedFrame(init.io, output, renderer.*, frame);
     try output.flush();
     while (true) {
         switch (try session.nextEvent()) {
@@ -131,8 +131,8 @@ fn presentDemoFrame(init: std.process.Init, renderer: *Renderer, frame: Frame) !
             .suspended => {
                 try kitty.appendDeleteAll(output);
                 try session.suspendAndResume(output);
-                try appendPresentedFrame(init.io, output, renderer.*, frame);
                 try appendExitPrompt(init.io, output);
+                try appendPresentedFrame(init.io, output, renderer.*, frame);
                 try output.flush();
             },
             .none => {},
@@ -142,8 +142,10 @@ fn presentDemoFrame(init: std.process.Init, renderer: *Renderer, frame: Frame) !
 
 fn appendExitPrompt(io: std.Io, output: *std.Io.Writer) !void {
     const row = if (try terminal.viewport(io)) |view| view.rows else 61;
-    if (row <= 1) return;
-    try output.print("\x1b[0m\x1b[{d};1H\x1b[2KEsc 退出 · WASD 移动 · Z/X A/B · Enter Start", .{row});
+    if (row > 1) {
+        try output.print("\x1b[0m\x1b[{d};1H\x1b[2KEsc 退出 · WASD 移动 · Z/X A/B · Enter Start", .{row});
+    }
+    try output.writeAll("\x1b[H");
 }
 
 /// Loads a supported iNES 1.0 cartridge and presents its RGB frames. ROM
@@ -291,8 +293,8 @@ fn runNesWithRenderer(init: std.process.Init, rom_path: []const u8, requested_re
         // cap the initial presentation path near 30 FPS; never slow or skip
         // the emulated clock just because a frame was not presented.
         if (shouldPresentFrame(frame.frame_number)) {
-            try appendPresentedFrame(init.io, output, renderer, frame);
             try appendExitPrompt(init.io, output);
+            try appendPresentedFrame(init.io, output, renderer, frame);
             try output.flush();
         }
         switch (try session.nextEventTimeout(nes_frame_interval_ms)) {
