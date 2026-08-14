@@ -1,6 +1,8 @@
 const std = @import("std");
 
 const poll_interval_ms = 50;
+const escape_prefix_grace_timeouts = 8;
+const apc_discard_grace_timeouts = 16;
 var pending_signal = std.atomic.Value(u32).init(0);
 
 pub const Key = union(enum) {
@@ -55,6 +57,9 @@ pub const Session = struct {
     pending_input_len: usize = 0,
     apc_discarding: bool = false,
     apc_previous_was_escape: bool = false,
+    apc_discard_timeouts: u8 = 0,
+    escape_prefix_pending: bool = false,
+    escape_prefix_timeouts: u8 = 0,
 
     pub fn enter(self: *Session, io: std.Io, output: *std.Io.Writer) !void {
         if (!try std.Io.File.stdin().isTty(io) or !try std.Io.File.stdout().isTty(io)) {
@@ -95,6 +100,7 @@ pub const Session = struct {
     pub fn nextEventTimeout(self: *Session, timeout_ms: i32) !Event {
         if (takePendingSignal()) |signal| return eventForSignal(signal);
         if (self.apc_discarding) return self.continueDiscardingApc(timeout_ms);
+        if (self.escape_prefix_pending) return self.continueEscapePrefix(timeout_ms);
 
         var fds = [_]std.posix.pollfd{.{
             .fd = std.posix.STDIN_FILENO,
@@ -106,11 +112,26 @@ pub const Session = struct {
 
         const byte = try self.readByte() orelse return .{ .exit = .input_closed };
         if (byte != 0x1b) return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
-        const csi = switch (try self.readByteWithTimeout(5)) {
+        self.escape_prefix_pending = true;
+        self.escape_prefix_timeouts = 0;
+        return self.continueEscapePrefix(5);
+    }
+
+    fn continueEscapePrefix(self: *Session, timeout_ms: i32) !Event {
+        const csi = switch (try self.readByteWithTimeout(timeout_ms)) {
             .byte => |value| value,
-            .timeout => return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } },
-            .input_closed => return .{ .exit = .input_closed },
+            .timeout => {
+                self.escape_prefix_timeouts +%= 1;
+                if (self.escape_prefix_timeouts < escape_prefix_grace_timeouts) return .none;
+                self.escape_prefix_pending = false;
+                return .{ .key = .{ .key = .{ .byte = 0x1b }, .state = .legacy } };
+            },
+            .input_closed => {
+                self.escape_prefix_pending = false;
+                return .{ .exit = .input_closed };
+            },
         };
+        self.escape_prefix_pending = false;
         // Kitty graphics replies are APC sequences (`ESC _ ... ESC \\`) on
         // the same TTY as user input. They are terminal protocol traffic, not
         // an Escape key; consuming them here prevents a quiet image response
@@ -118,25 +139,30 @@ pub const Session = struct {
         if (csi == '_') {
             self.apc_discarding = true;
             self.apc_previous_was_escape = false;
+            self.apc_discard_timeouts = 0;
             return self.continueDiscardingApc(0);
         }
-        if (csi != '[') return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
+        // ST terminates APC, OSC, and DCS terminal control strings. An orphan
+        // terminator may arrive after a fragmented reply; it is never a game
+        // key and must not become a legacy Escape event.
+        if (csi == '\\') return .none;
+        if (csi != '[') return .{ .key = .{ .key = .{ .byte = 0x1b }, .state = .legacy } };
 
         var params: [32]u8 = undefined;
         var len: usize = 0;
         while (len < params.len) {
             const next = switch (try self.readByteWithTimeout(5)) {
                 .byte => |value| value,
-                .timeout => return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } },
+                .timeout => return .{ .key = .{ .key = .{ .byte = 0x1b }, .state = .legacy } },
                 .input_closed => return .{ .exit = .input_closed },
             };
             if (next >= 0x40 and next <= 0x7e) {
-                return .{ .key = keyEventForCsi(params[0..len], next) orelse .{ .key = .{ .byte = byte }, .state = .legacy } };
+                return .{ .key = keyEventForCsi(params[0..len], next) orelse .{ .key = .{ .byte = 0x1b }, .state = .legacy } };
             }
             params[len] = next;
             len += 1;
         }
-        return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
+        return .{ .key = .{ .key = .{ .byte = 0x1b }, .state = .legacy } };
     }
 
     /// Discards a terminal APC reply over as many event-loop calls as needed.
@@ -146,7 +172,14 @@ pub const Session = struct {
         var timeout_ms = initial_timeout_ms;
         while (true) {
             switch (try self.readByteWithTimeout(timeout_ms)) {
-                .timeout => return .none,
+                .timeout => {
+                    self.apc_discard_timeouts +%= 1;
+                    if (self.apc_discard_timeouts >= apc_discard_grace_timeouts) {
+                        self.apc_discarding = false;
+                        self.apc_previous_was_escape = false;
+                    }
+                    return .none;
+                },
                 .input_closed => {
                     self.apc_discarding = false;
                     return .{ .exit = .input_closed };
@@ -157,6 +190,7 @@ pub const Session = struct {
                         return .none;
                     }
                     self.apc_previous_was_escape = byte == 0x1b;
+                    self.apc_discard_timeouts = 0;
                     timeout_ms = 0;
                 },
             }
@@ -372,4 +406,34 @@ test "terminal discards fragmented Kitty APC replies without generating Escape" 
     try session.queueInput(";OK\x1b\\");
     try std.testing.expectEqual(Event.none, try session.continueDiscardingApc(0));
     try std.testing.expect(!session.apc_discarding);
+}
+
+test "terminal abandons an unterminated Kitty APC reply after a bounded wait" {
+    var session: Session = .{};
+    session.apc_discarding = true;
+    for (0..apc_discard_grace_timeouts) |_| {
+        try std.testing.expectEqual(Event.none, try session.continueDiscardingApc(0));
+    }
+    try std.testing.expect(!session.apc_discarding);
+}
+
+test "terminal retains a fragmented escape prefix until it becomes a Kitty APC reply" {
+    var session: Session = .{};
+    // The initial ESC arrived in a previous read. Ghostty can deliver the
+    // following underscore and APC body later than the old five-millisecond
+    // look-ahead window.
+    session.escape_prefix_pending = true;
+    try session.queueInput("_");
+    try std.testing.expectEqual(Event.none, try session.continueEscapePrefix(0));
+    try std.testing.expect(session.apc_discarding);
+    try session.queueInput("Gi=1;OK\x1b\\");
+    try std.testing.expectEqual(Event.none, try session.continueDiscardingApc(0));
+    try std.testing.expect(!session.apc_discarding);
+}
+
+test "terminal ignores an orphan terminal string terminator" {
+    var session: Session = .{};
+    session.escape_prefix_pending = true;
+    try session.queueInput("\\");
+    try std.testing.expectEqual(Event.none, try session.continueEscapePrefix(0));
 }
