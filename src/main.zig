@@ -344,7 +344,10 @@ fn runNesWithOptions(init: std.process.Init, rom_path: []const u8, options: NesR
             }
         }
         switch (try waitForNextNesFrame(init.io, &session, &next_frame_deadline, &held_actions, &held_frames)) {
-            .exit => break,
+            .exit => |reason| {
+                try logger.write(init.io, "frame={d} terminal=exit reason={s}\n", .{ frame.frame_number, @tagName(reason) });
+                break;
+            },
             .suspended => {
                 try logger.write(init.io, "frame={d} terminal=suspended\n", .{frame.frame_number});
                 try kitty.appendDeleteAll(output);
@@ -414,7 +417,7 @@ fn waitForNextNesFrame(
         const remaining_ns: u64 = @intCast(now.durationTo(deadline.*).raw.nanoseconds);
         switch (try session.nextEventTimeout(timeoutMsForRemaining(remaining_ns))) {
             .key => |event| {
-                if (event.state != .release and isEscapeKey(event.key)) return .exit;
+                if (event.state != .release and isEscapeKey(event.key)) return .{ .exit = .escape };
                 switch (event.state) {
                     .legacy => {
                         held_actions.* = actionsForKey(event.key);
@@ -424,7 +427,7 @@ fn waitForNextNesFrame(
                     .release => applyKeyAction(held_actions, event.key, false),
                 }
             },
-            .exit => return .exit,
+            .exit => |reason| return .{ .exit = reason },
             .suspended => return .suspended,
             .none => {},
         }

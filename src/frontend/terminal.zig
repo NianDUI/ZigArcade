@@ -20,7 +20,12 @@ pub const KeyEvent = struct {
     state: KeyState,
 };
 
-pub const Event = union(enum) { none, key: KeyEvent, exit, suspended };
+/// Every terminal-initiated exit carries its observable source so callers can
+/// diagnose a vanished fullscreen session instead of treating EOF, signals,
+/// and an explicit Escape key as indistinguishable.
+pub const ExitReason = enum { escape, input_closed, interrupt, terminate, hangup };
+
+pub const Event = union(enum) { none, key: KeyEvent, exit: ExitReason, suspended };
 
 pub const Viewport = struct { columns: u16, rows: u16 };
 
@@ -96,15 +101,23 @@ pub const Session = struct {
         if (try std.posix.poll(&fds, timeout_ms) == 0) return .none;
         if (takePendingSignal()) |signal| return eventForSignal(signal);
 
-        const byte = try self.readByte() orelse return .exit;
+        const byte = try self.readByte() orelse return .{ .exit = .input_closed };
         if (byte != 0x1b) return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
-        const csi = try self.readByteWithTimeout(5) orelse return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
+        const csi = switch (try self.readByteWithTimeout(5)) {
+            .byte => |value| value,
+            .timeout => return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } },
+            .input_closed => return .{ .exit = .input_closed },
+        };
         if (csi != '[') return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
 
         var params: [32]u8 = undefined;
         var len: usize = 0;
         while (len < params.len) {
-            const next = try self.readByteWithTimeout(5) orelse return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } };
+            const next = switch (try self.readByteWithTimeout(5)) {
+                .byte => |value| value,
+                .timeout => return .{ .key = .{ .key = .{ .byte = byte }, .state = .legacy } },
+                .input_closed => return .{ .exit = .input_closed },
+            };
             if (next >= 0x40 and next <= 0x7e) {
                 return .{ .key = keyEventForCsi(params[0..len], next) orelse .{ .key = .{ .byte = byte }, .state = .legacy } };
             }
@@ -124,15 +137,17 @@ pub const Session = struct {
         return readStdinByte();
     }
 
-    fn readByteWithTimeout(self: *Session, timeout_ms: i32) !?u8 {
-        if (self.pending_input_len != 0) return self.readByte();
+    const TimedByte = union(enum) { timeout, byte: u8, input_closed };
+
+    fn readByteWithTimeout(self: *Session, timeout_ms: i32) !TimedByte {
+        if (self.pending_input_len != 0) return .{ .byte = (try self.readByte()).? };
         var fds = [_]std.posix.pollfd{.{
             .fd = std.posix.STDIN_FILENO,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
-        if (try std.posix.poll(&fds, timeout_ms) == 0) return null;
-        return self.readByte();
+        if (try std.posix.poll(&fds, timeout_ms) == 0) return .timeout;
+        return if (try self.readByte()) |byte| .{ .byte = byte } else .input_closed;
     }
 
     /// Restore terminal state before yielding to default SIGTSTP. A SIGCONT
@@ -271,14 +286,16 @@ fn takePendingSignal() ?std.posix.SIG {
 fn eventForSignal(signal: std.posix.SIG) Event {
     return switch (signal) {
         .TSTP => .suspended,
-        .INT, .TERM, .HUP => .exit,
+        .INT => .{ .exit = .interrupt },
+        .TERM => .{ .exit = .terminate },
+        .HUP => .{ .exit = .hangup },
         else => .none,
     };
 }
 
 test "terminal signals map to lifecycle events" {
-    try std.testing.expectEqual(Event.exit, eventForSignal(.INT));
-    try std.testing.expectEqual(Event.exit, eventForSignal(.TERM));
+    try std.testing.expectEqual(Event{ .exit = .interrupt }, eventForSignal(.INT));
+    try std.testing.expectEqual(Event{ .exit = .terminate }, eventForSignal(.TERM));
     try std.testing.expectEqual(Event.suspended, eventForSignal(.TSTP));
 }
 
