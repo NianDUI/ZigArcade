@@ -36,6 +36,11 @@ const raw_input_hold_frames: u8 = 8;
 const presentation_divisor: u64 = 2;
 const max_framehash_frames: u32 = 10_000;
 
+const NesRunOptions = struct {
+    renderer: Renderer = .auto,
+    log_path: ?[]const u8 = null,
+};
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len == 3 and std.mem.eql(u8, args[1], "--demo")) return runDemo(init, args[2]);
@@ -44,9 +49,8 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 5 and std.mem.eql(u8, args[1], "framehash") and std.mem.eql(u8, args[3], "--frames")) {
         return hashNesFrames(init, args[2], try parseFrameCount(args[4]));
     }
-    if (args.len == 3 and std.mem.eql(u8, args[1], "nes")) return runNes(init, args[2]);
-    if (args.len == 5 and std.mem.eql(u8, args[1], "nes") and std.mem.eql(u8, args[3], "--renderer")) {
-        return runNesWithRenderer(init, args[2], try parseRenderer(args[4]));
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "nes")) {
+        return runNesWithOptions(init, args[2], try parseNesRunOptions(args[3..]));
     }
     try printUsage(init.io);
     return error.InvalidArguments;
@@ -93,6 +97,26 @@ fn parseRenderer(value: []const u8) !Renderer {
         .auto
     else
         error.InvalidArguments;
+}
+
+fn parseNesRunOptions(args: []const []const u8) !NesRunOptions {
+    if (args.len % 2 != 0) return error.InvalidArguments;
+    var options = NesRunOptions{};
+    var renderer_seen = false;
+    var index: usize = 0;
+    while (index < args.len) : (index += 2) {
+        if (std.mem.eql(u8, args[index], "--renderer")) {
+            if (renderer_seen) return error.InvalidArguments;
+            options.renderer = try parseRenderer(args[index + 1]);
+            renderer_seen = true;
+        } else if (std.mem.eql(u8, args[index], "--log")) {
+            if (options.log_path != null or args[index + 1].len == 0) return error.InvalidArguments;
+            options.log_path = args[index + 1];
+        } else {
+            return error.InvalidArguments;
+        }
+    }
+    return options;
 }
 
 fn runDemo(init: std.process.Init, renderer_name: []const u8) !void {
@@ -156,7 +180,7 @@ fn appendExitPrompt(io: std.Io, output: *std.Io.Writer) !void {
 /// bytes live in the process arena for the whole run, keeping the cartridge's
 /// borrowed PRG/CHR slices valid.
 fn runNes(init: std.process.Init, rom_path: []const u8) !void {
-    return runNesWithRenderer(init, rom_path, .auto);
+    return runNesWithOptions(init, rom_path, .{});
 }
 
 /// Validates a ROM without entering raw terminal mode. This is intentionally
@@ -265,7 +289,7 @@ fn mirroringName(mirroring: @import("systems/nes/cartridge.zig").Mirroring) []co
     };
 }
 
-fn runNesWithRenderer(init: std.process.Init, rom_path: []const u8, requested_renderer: Renderer) !void {
+fn runNesWithOptions(init: std.process.Init, rom_path: []const u8, options: NesRunOptions) !void {
     const image = try std.Io.Dir.cwd().readFileAlloc(
         init.io,
         rom_path,
@@ -286,9 +310,14 @@ fn runNesWithRenderer(init: std.process.Init, rom_path: []const u8, requested_re
     try session.enter(init.io, output);
     defer leavePresentation(&session, output);
 
-    var renderer = try selectRenderer(init.io, output, &session, requested_renderer);
+    var renderer = try selectRenderer(init.io, output, &session, options.renderer);
+    var logger = RunLogger{};
+    try logger.open(init.io, options.log_path);
+    defer logger.deinit(init.io);
+    try logger.write(init.io, "start renderer={s} rom={s}\n", .{ @tagName(renderer), rom_path });
     var held_actions = Actions{};
     var held_frames: u8 = 0;
+    var presented_frames: u64 = 0;
     var next_frame_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).addDuration(nesFrameDuration());
     while (true) {
         nes.controllers.ports[0].setHostButtons(buttonsFromActions(consumeHeldActions(&held_actions, &held_frames)));
@@ -298,22 +327,72 @@ fn runNesWithRenderer(init: std.process.Init, rom_path: []const u8, requested_re
         // cap the initial presentation path near 30 FPS; never slow or skip
         // the emulated clock just because a frame was not presented.
         if (shouldPresentFrame(frame.frame_number)) {
+            const logged_frame = shouldLogNesFrame(frame.frame_number);
+            if (logged_frame) try logger.write(init.io, "frame={d} present=begin\n", .{frame.frame_number});
+            const present_started = std.Io.Clock.Timestamp.now(init.io, .awake);
             try appendExitPrompt(init.io, output);
             try appendPresentedFrame(init.io, output, renderer, frame);
             try output.flush();
+            presented_frames += 1;
+            if (logged_frame) {
+                const present_finished = std.Io.Clock.Timestamp.now(init.io, .awake);
+                try logger.write(
+                    init.io,
+                    "frame={d} present=end duration_ms={d} presented={d}\n",
+                    .{ frame.frame_number, elapsedMilliseconds(present_started, present_finished), presented_frames },
+                );
+            }
         }
         switch (try waitForNextNesFrame(init.io, &session, &next_frame_deadline, &held_actions, &held_frames)) {
             .exit => break,
             .suspended => {
+                try logger.write(init.io, "frame={d} terminal=suspended\n", .{frame.frame_number});
                 try kitty.appendDeleteAll(output);
                 try session.suspendAndResume(output);
-                renderer = try selectRenderer(init.io, output, &session, requested_renderer);
+                renderer = try selectRenderer(init.io, output, &session, options.renderer);
                 next_frame_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).addDuration(nesFrameDuration());
+                try logger.write(init.io, "frame={d} terminal=resumed renderer={s}\n", .{ frame.frame_number, @tagName(renderer) });
             },
             .none => {},
             .key => unreachable,
         }
     }
+}
+
+const RunLogger = struct {
+    file: ?std.Io.File = null,
+    storage: [512]u8 = undefined,
+    writer: ?std.Io.File.Writer = null,
+
+    fn open(self: *RunLogger, io: std.Io, path: ?[]const u8) !void {
+        return self.openInDir(io, std.Io.Dir.cwd(), path);
+    }
+
+    fn openInDir(self: *RunLogger, io: std.Io, dir: std.Io.Dir, path: ?[]const u8) !void {
+        const value = path orelse return;
+        self.file = try dir.createFile(io, value, .{});
+        self.writer = self.file.?.writer(io, &self.storage);
+    }
+
+    fn deinit(self: *RunLogger, io: std.Io) void {
+        if (self.file) |file| file.close(io);
+    }
+
+    fn write(self: *RunLogger, io: std.Io, comptime format: []const u8, args: anytype) !void {
+        _ = io;
+        if (self.writer) |*writer| {
+            try writer.interface.print(format, args);
+            try writer.interface.flush();
+        }
+    }
+};
+
+fn shouldLogNesFrame(frame_number: u64) bool {
+    return frame_number % 60 == 1;
+}
+
+fn elapsedMilliseconds(start: std.Io.Clock.Timestamp, end: std.Io.Clock.Timestamp) u64 {
+    return @intCast(@max(@as(i96, 0), @divTrunc(start.durationTo(end).raw.nanoseconds, std.time.ns_per_ms)));
 }
 
 /// Waits only until the next emulated-frame deadline. Rendering and input
@@ -476,7 +555,7 @@ fn printUsage(io: std.Io) !void {
             "  zigarcade --demo-neogeo <ansi|kitty|auto>\n" ++
             "  zigarcade inspect <path/to/rom.nes>\n" ++
             "  zigarcade framehash <path/to/rom.nes> --frames <1-10000>\n" ++
-            "  zigarcade nes <path/to/rom.nes> [--renderer ansi|kitty|auto]\n",
+            "  zigarcade nes <path/to/rom.nes> [--renderer ansi|kitty|auto] [--log <path>]\n",
     );
     try stderr_writer.interface.flush();
 }
@@ -508,6 +587,26 @@ test "renderer parser accepts documented values and rejects others" {
     try std.testing.expectEqual(Renderer.kitty, try parseRenderer("kitty"));
     try std.testing.expectEqual(Renderer.auto, try parseRenderer("auto"));
     try std.testing.expectError(error.InvalidArguments, parseRenderer("sixel"));
+}
+
+test "NES run options accept an optional renderer and file log" {
+    const options = try parseNesRunOptions(&.{ "--renderer", "kitty", "--log", "run.log" });
+    try std.testing.expectEqual(Renderer.kitty, options.renderer);
+    try std.testing.expectEqualStrings("run.log", options.log_path.?);
+    try std.testing.expectError(error.InvalidArguments, parseNesRunOptions(&.{ "--renderer", "auto", "--renderer", "ansi" }));
+}
+
+test "runtime log retains multiple phase records" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var logger = RunLogger{};
+    try logger.openInDir(std.testing.io, temporary.dir, "run.log");
+    try logger.write(std.testing.io, "first={d}\n", .{1});
+    try logger.write(std.testing.io, "second={d}\n", .{2});
+    logger.deinit(std.testing.io);
+    const logged = try temporary.dir.readFileAlloc(std.testing.io, "run.log", std.testing.allocator, .limited(128));
+    defer std.testing.allocator.free(logged);
+    try std.testing.expectEqualStrings("first=1\nsecond=2\n", logged);
 }
 
 test "Neo Geo diagnostic demo reuses the renderer selection contract" {

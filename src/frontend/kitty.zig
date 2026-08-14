@@ -3,6 +3,11 @@ const Frame = @import("../core/frame.zig").Frame;
 
 pub const max_base64_payload = 4096;
 pub const raw_chunk_bytes = 3072;
+/// The largest current terminal source is the 320x240 diagnostic frame. A
+/// compressed payload can be slightly larger than its RGB source, so reserve
+/// a small margin and fall back to raw Kitty transmission beyond this bound.
+pub const max_compressed_frame_bytes = 320 * 240 * 3 + 4096;
+const compression_threshold_bytes = 64 * 1024;
 pub const probe_image_id: u32 = 0x5A_4741;
 
 pub const ProbeResult = enum { pending, supported, rejected };
@@ -133,27 +138,31 @@ pub fn fitOptions(frame: Frame, max_columns: u16, max_rows: u16) Options {
     return .{ .columns = columns, .rows = rows };
 }
 
-/// Encodes one raw RGB/RGBA frame as Kitty APC transmit-and-display commands.
-/// The output owns no terminal state; callers must write it atomically relative
-/// to other terminal escape sequences.
+/// Encodes one RGB frame as Kitty APC transmit-and-display commands. Large
+/// frames use zlib because uncompressed 256x240 RGB at 30 FPS can saturate a
+/// terminal's graphics queue and make the UI appear frozen. The output owns no
+/// terminal state; callers must write it atomically relative to other terminal
+/// escape sequences.
 pub fn appendFrame(writer: *std.Io.Writer, frame: Frame, options: Options) !void {
     if (frame.format != .rgb888) return error.UnsupportedPixelFormat;
     if (frame.stride != @as(u32, frame.width) * 3) return error.UnsupportedStride;
     if (frame.pixels.len != @as(usize, frame.stride) * frame.height) return error.InvalidFrame;
 
+    var compressed: [max_compressed_frame_bytes]u8 = undefined;
+    const transmission = try compressFrame(frame, &compressed);
     var raw_offset: usize = 0;
     var first = true;
-    while (raw_offset < frame.pixels.len) {
-        const raw_len = @min(raw_chunk_bytes, frame.pixels.len - raw_offset);
-        const raw = frame.pixels[raw_offset..][0..raw_len];
+    while (raw_offset < transmission.bytes.len) {
+        const raw_len = @min(raw_chunk_bytes, transmission.bytes.len - raw_offset);
+        const raw = transmission.bytes[raw_offset..][0..raw_len];
         var encoded: [max_base64_payload]u8 = undefined;
         const payload = std.base64.standard.Encoder.encode(&encoded, raw);
-        const more = raw_offset + raw_len < frame.pixels.len;
+        const more = raw_offset + raw_len < transmission.bytes.len;
 
         try writer.writeAll("\x1b_G");
         if (first) {
             try writer.print(
-                "a=T,q={d},t=d,f=24,s={d},v={d},i={d},p={d},c={d},r={d},C=1,m={d};",
+                "a=T,q={d},t=d,f=24,s={d},v={d},i={d},p={d},c={d},r={d},C=1{s},m={d};",
                 .{
                     @intFromBool(options.quiet),
                     frame.width,
@@ -162,6 +171,7 @@ pub fn appendFrame(writer: *std.Io.Writer, frame: Frame, options: Options) !void
                     options.placement_id,
                     options.columns,
                     options.rows,
+                    if (transmission.compressed) ",o=z" else "",
                     @intFromBool(more),
                 },
             );
@@ -174,6 +184,24 @@ pub fn appendFrame(writer: *std.Io.Writer, frame: Frame, options: Options) !void
         raw_offset += raw_len;
         first = false;
     }
+}
+
+const Transmission = struct {
+    bytes: []const u8,
+    compressed: bool,
+};
+
+fn compressFrame(frame: Frame, storage: []u8) !Transmission {
+    if (frame.pixels.len < compression_threshold_bytes or frame.pixels.len > storage.len) {
+        return .{ .bytes = frame.pixels, .compressed = false };
+    }
+
+    var output: std.Io.Writer = .fixed(storage);
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&output, &history, .zlib, .fastest);
+    try compressor.writer.writeAll(frame.pixels);
+    try compressor.finish();
+    return .{ .bytes = output.buffered(), .compressed = true };
 }
 
 pub fn appendDeleteAll(writer: *std.Io.Writer) !void {
@@ -205,6 +233,23 @@ test "Kitty frame splits RGB source into 3072-byte chunks" {
     try std.testing.expect(std.mem.indexOf(u8, result, "m=1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "m=0;") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, result, "\x1b_G"));
+}
+
+test "Kitty zlib-compresses a terminal-sized RGB frame" {
+    const pixels = [_]u8{0x7f} ** (256 * 240 * 3);
+    const frame = Frame{
+        .pixels = &pixels,
+        .width = 256,
+        .height = 240,
+        .stride = 256 * 3,
+        .format = .rgb888,
+        .frame_number = 0,
+    };
+    var output: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&output);
+    try appendFrame(&writer, frame, .{});
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "o=z") != null);
+    try std.testing.expect(writer.buffered().len < 4096);
 }
 
 test "Kitty fit options preserve NES aspect ratio within terminal cells" {
