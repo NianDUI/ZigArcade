@@ -335,18 +335,20 @@ test "AOROM boots from bank zero, switches PRG, and the PPU follows one-screen m
 test "NROM CPU program configures PPU palette and produces an RGB frame" {
     var image: [16 + 16 * 1024]u8 = [_]u8{0} ** (16 + 16 * 1024);
     image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-    // Enable background; select $3F00 through PPUADDR; write palette entry
-    // 0 via PPUDATA; then loop. CHR-RAM and nametable default to tile/color 0,
-    // so every framebuffer pixel must become the selected backdrop color.
+    // Select $3F00 through PPUADDR and write palette entry 0 before enabling
+    // rendering. Once rendering is active, the PPU itself advances v during
+    // tile fetches, so visible-region palette updates must synchronize first.
+    // CHR-RAM and nametable default to tile/color 0, so every framebuffer
+    // pixel becomes the selected backdrop color.
     image[16..][0..23].* = .{
-        0xa9, 0x0a, // LDA #$0A
-        0x8d, 0x01, 0x20, // STA $2001
         0xa9, 0x3f, // LDA #$3F
         0x8d, 0x06, 0x20, // STA $2006
         0xa9, 0x00, // LDA #$00
         0x8d, 0x06, 0x20, // STA $2006
         0xa9, 0x21, // LDA #$21
         0x8d, 0x07, 0x20, // STA $2007
+        0xa9, 0x0a, // LDA #$0A
+        0x8d, 0x01, 0x20, // STA $2001
         0x4c, 0x14, 0x80, // JMP $8014
     };
     image[16 + 0x3ffc] = 0x00;

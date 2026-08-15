@@ -151,6 +151,7 @@ pub const Ppu = struct {
             if (self.dot == 65) self.clockSpriteOverflow();
             if (self.dot > 0 and self.dot <= frame_width) self.clockSpriteZeroHit(@intCast(self.dot - 1));
         }
+        self.clockScrollAddress();
 
         // NTSC odd frames omit the final pre-render dot while either layer
         // is enabled. Keep this in the canonical dot clock: render sampling
@@ -175,6 +176,61 @@ pub const Ppu = struct {
 
     fn renderingEnabled(self: *const Ppu) bool {
         return self.mask & 0x18 != 0;
+    }
+
+    /// During visible and pre-render scanlines the PPU, rather than the CPU,
+    /// owns `v`: every tile fetch advances coarse X, dot 256 advances Y, dot
+    /// 257 reloads horizontal bits from `t`, and pre-render dots 280–304
+    /// reload vertical bits. These transfers are observable through later
+    /// PPUDATA accesses and are required before a fetch pipeline can use `v`
+    /// directly, so they belong to the dot clock even while presentation is
+    /// still framebuffer based.
+    fn clockScrollAddress(self: *Ppu) void {
+        if (!self.renderingEnabled()) return;
+        if (self.scanline >= frame_height and self.scanline != 261) return;
+
+        if ((self.dot >= 8 and self.dot <= 256 and self.dot % 8 == 0) or
+            (self.dot >= 328 and self.dot <= 336 and self.dot % 8 == 0))
+        {
+            self.incrementHorizontalScroll();
+        }
+        if (self.dot == 256) self.incrementVerticalScroll();
+        if (self.dot == 257) self.copyHorizontalScroll();
+        if (self.scanline == 261 and self.dot >= 280 and self.dot <= 304) self.copyVerticalScroll();
+    }
+
+    fn incrementHorizontalScroll(self: *Ppu) void {
+        if (self.v & 0x001f == 31) {
+            self.v &= ~@as(u16, 0x001f);
+            self.v ^= 0x0400;
+        } else {
+            self.v += 1;
+        }
+    }
+
+    fn incrementVerticalScroll(self: *Ppu) void {
+        if (self.v & 0x7000 != 0x7000) {
+            self.v += 0x1000;
+            return;
+        }
+        self.v &= ~@as(u16, 0x7000);
+        const coarse_y = (self.v & 0x03e0) >> 5;
+        if (coarse_y == 29) {
+            self.v &= ~@as(u16, 0x03e0);
+            self.v ^= 0x0800;
+        } else if (coarse_y == 31) {
+            self.v &= ~@as(u16, 0x03e0);
+        } else {
+            self.v += 0x0020;
+        }
+    }
+
+    fn copyHorizontalScroll(self: *Ppu) void {
+        self.v = (self.v & ~@as(u16, 0x041f)) | (self.t & 0x041f);
+    }
+
+    fn copyVerticalScroll(self: *Ppu) void {
+        self.v = (self.v & ~@as(u16, 0x7be0)) | (self.t & 0x7be0);
     }
 
     /// Evaluates the pixel currently passing the sprite-0 detector. This is
@@ -846,6 +902,54 @@ test "rendering odd frame skips the final pre-render dot" {
     ppu.tickDot();
     try std.testing.expectEqual(@as(u16, 340), ppu.dot);
     try std.testing.expectEqual(@as(u16, 261), ppu.scanline);
+}
+
+test "rendering dots advance and reload the PPU scroll address" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x08;
+
+    // Coarse X wraps from 31 to 0 and toggles the horizontal nametable bit.
+    ppu.v = 0x001f;
+    ppu.scanline = 0;
+    ppu.dot = 8;
+    ppu.tickDot();
+    try std.testing.expectEqual(@as(u16, 0x0400), ppu.v);
+
+    // At dot 256 fine Y wraps; coarse Y 29 wraps and toggles vertical NT.
+    ppu.v = 0x73a0;
+    ppu.dot = 256;
+    ppu.tickDot();
+    try std.testing.expectEqual(@as(u16, 0x0801), ppu.v);
+
+    // Dot 257 copies coarse X and horizontal nametable from t only.
+    ppu.v = 0x7be0;
+    ppu.t = 0x0415;
+    ppu.dot = 257;
+    ppu.tickDot();
+    try std.testing.expectEqual(@as(u16, 0x7ff5), ppu.v);
+
+    // Pre-render dots 280–304 copy fine/coarse Y and vertical nametable.
+    ppu.v = 0x0415;
+    ppu.t = 0x7ba0;
+    ppu.scanline = 261;
+    ppu.dot = 280;
+    ppu.tickDot();
+    try std.testing.expectEqual(@as(u16, 0x7fb5), ppu.v);
+
+    // Disabling rendering leaves v entirely under CPU control.
+    ppu.mask = 0;
+    ppu.v = 0x001f;
+    ppu.scanline = 0;
+    ppu.dot = 8;
+    ppu.tickDot();
+    try std.testing.expectEqual(@as(u16, 0x001f), ppu.v);
 }
 
 test "sprite-0 hit is raised on the overlapping visible PPU dot" {
