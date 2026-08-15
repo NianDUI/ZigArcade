@@ -76,6 +76,17 @@ pub const Ppu = struct {
     v: u16 = 0,
     t: u16 = 0,
     fine_x: u3 = 0,
+    /// Background fetch latches and shift registers. They are clocked by
+    /// `tickDot` on the same dots as the RP2C02's name/attribute/pattern
+    /// reads, independently of the framebuffer presentation readout.
+    bg_next_tile: u8 = 0,
+    bg_next_attribute: u2 = 0,
+    bg_next_pattern_low: u8 = 0,
+    bg_next_pattern_high: u8 = 0,
+    bg_pattern_shift_low: u16 = 0,
+    bg_pattern_shift_high: u16 = 0,
+    bg_attribute_shift_low: u16 = 0,
+    bg_attribute_shift_high: u16 = 0,
     /// CPU writes configure the *next* visible state. The frame renderer
     /// samples a separate copy at VBlank, before a game's next NMI starts
     /// using the PPU registers as temporary VRAM-update registers.
@@ -151,6 +162,7 @@ pub const Ppu = struct {
             if (self.dot == 65) self.clockSpriteOverflow();
             if (self.dot > 0 and self.dot <= frame_width) self.clockSpriteZeroHit(@intCast(self.dot - 1));
         }
+        self.clockBackgroundFetchPipeline();
         self.clockScrollAddress();
 
         // NTSC odd frames omit the final pre-render dot while either layer
@@ -176,6 +188,57 @@ pub const Ppu = struct {
 
     fn renderingEnabled(self: *const Ppu) bool {
         return self.mask & 0x18 != 0;
+    }
+
+    /// Clocks the background side of the RP2C02 fetch pipeline. On visible
+    /// and pre-render scanlines, the PPU fetches name table, attribute table,
+    /// and pattern bytes on dots 1/3/5/7 of each 8-dot tile slot; dot 0 of
+    /// the slot transfers them into the low byte of 16-bit shift registers.
+    /// The two 8-dot prefetch slots at 321–336 prime the next scanline.
+    ///
+    /// This is intentionally independent of `renderBackgroundWithOpacity`:
+    /// the latter remains a presentation readout while this state provides
+    /// the timing-accurate background data path required by sprite evaluation
+    /// and future PPU A12-driven mapper IRQs.
+    fn clockBackgroundFetchPipeline(self: *Ppu) void {
+        if (!self.renderingEnabled()) return;
+        if (self.scanline >= frame_height and self.scanline != 261) return;
+        const fetch_slot = (self.dot >= 1 and self.dot <= 256) or
+            (self.dot >= 321 and self.dot <= 336);
+        if (!fetch_slot) return;
+
+        self.bg_pattern_shift_low <<= 1;
+        self.bg_pattern_shift_high <<= 1;
+        self.bg_attribute_shift_low <<= 1;
+        self.bg_attribute_shift_high <<= 1;
+
+        switch (self.dot & 7) {
+            1 => self.bg_next_tile = self.readMemory(0x2000 | (self.v & 0x0fff)),
+            3 => {
+                const address = 0x23c0 | (self.v & 0x0c00) | ((self.v >> 4) & 0x38) | ((self.v >> 2) & 0x07);
+                const shift: u3 = @truncate(((self.v >> 4) & 4) | (self.v & 2));
+                self.bg_next_attribute = @truncate((self.readMemory(address) >> shift) & 3);
+            },
+            5 => {
+                const fine_y = (self.v >> 12) & 7;
+                const pattern_base: u16 = if (self.ctrl & 0x10 != 0) 0x1000 else 0;
+                self.bg_next_pattern_low = self.readMemory(pattern_base + @as(u16, self.bg_next_tile) * 16 + fine_y);
+            },
+            7 => {
+                const fine_y = (self.v >> 12) & 7;
+                const pattern_base: u16 = if (self.ctrl & 0x10 != 0) 0x1000 else 0;
+                self.bg_next_pattern_high = self.readMemory(pattern_base + @as(u16, self.bg_next_tile) * 16 + fine_y + 8);
+            },
+            0 => {
+                self.bg_pattern_shift_low = (self.bg_pattern_shift_low & 0xff00) | self.bg_next_pattern_low;
+                self.bg_pattern_shift_high = (self.bg_pattern_shift_high & 0xff00) | self.bg_next_pattern_high;
+                self.bg_attribute_shift_low = (self.bg_attribute_shift_low & 0xff00) |
+                    @as(u16, if (self.bg_next_attribute & 1 != 0) 0x00ff else 0);
+                self.bg_attribute_shift_high = (self.bg_attribute_shift_high & 0xff00) |
+                    @as(u16, if (self.bg_next_attribute & 2 != 0) 0x00ff else 0);
+            },
+            else => {},
+        }
     }
 
     /// During visible and pre-render scanlines the PPU, rather than the CPU,
@@ -950,6 +1013,58 @@ test "rendering dots advance and reload the PPU scroll address" {
     ppu.dot = 8;
     ppu.tickDot();
     try std.testing.expectEqual(@as(u16, 0x001f), ppu.v);
+}
+
+test "background fetch pipeline reads tile data and loads shift registers every eight dots" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x08;
+    ppu.v = 0;
+    ppu.writeMemory(0x2000, 1);
+    ppu.writeMemory(0x23c0, 3);
+    mapper.chr_ram[16] = 0x80;
+    mapper.chr_ram[24] = 0x40;
+
+    ppu.scanline = 0;
+    ppu.dot = 1;
+    for (0..8) |_| ppu.tickDot();
+
+    try std.testing.expectEqual(@as(u8, 1), ppu.bg_next_tile);
+    try std.testing.expectEqual(@as(u2, 3), ppu.bg_next_attribute);
+    try std.testing.expectEqual(@as(u16, 0x0080), ppu.bg_pattern_shift_low);
+    try std.testing.expectEqual(@as(u16, 0x0040), ppu.bg_pattern_shift_high);
+    try std.testing.expectEqual(@as(u16, 0x00ff), ppu.bg_attribute_shift_low);
+    try std.testing.expectEqual(@as(u16, 0x00ff), ppu.bg_attribute_shift_high);
+    // Dot 8 completed the tile slot and then advanced coarse X.
+    try std.testing.expectEqual(@as(u16, 1), ppu.v & 0x001f);
+}
+
+test "background fetch pipeline primes the pre-render scanline" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x08;
+    ppu.v = 0;
+    ppu.writeMemory(0x2000, 2);
+    mapper.chr_ram[32] = 0x80;
+
+    ppu.scanline = 261;
+    ppu.dot = 321;
+    for (0..8) |_| ppu.tickDot();
+
+    try std.testing.expectEqual(@as(u8, 2), ppu.bg_next_tile);
+    try std.testing.expectEqual(@as(u16, 0x0080), ppu.bg_pattern_shift_low);
 }
 
 test "sprite-0 hit is raised on the overlapping visible PPU dot" {
