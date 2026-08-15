@@ -2,9 +2,12 @@ const std = @import("std");
 const Frame = @import("core/frame.zig").Frame;
 const PixelFormat = @import("core/frame.zig").PixelFormat;
 const ansi = @import("frontend/ansi.zig");
+const audio_host = @import("frontend/audio_host.zig");
+const audio_queue_host = @import("frontend/audio_queue_host.zig");
 const kitty = @import("frontend/kitty.zig");
 const terminal = @import("frontend/terminal.zig");
 const Actions = @import("core/input.zig").Actions;
+const CoreAudioSink = @import("core/audio.zig").AudioSink;
 const Cartridge = @import("systems/nes/cartridge.zig").Cartridge;
 const actionsForByte = @import("systems/nes/input.zig").actionsForByte;
 const buttonsFromActions = @import("systems/nes/input.zig").buttonsFromActions;
@@ -28,18 +31,50 @@ comptime {
 }
 
 const Renderer = enum { ansi, kitty, auto };
+const AudioBackend = enum { unit, queue };
 const nes_frame_interval_ns: u64 = 16_639_267;
 /// Traditional terminal input has no reliable key-up event. Retain a sampled
 /// game key long enough for games to register movement; terminal key-repeat
 /// refreshes this window while the player holds the key.
 const raw_input_hold_frames: u8 = 8;
-const presentation_divisor: u64 = 2;
+const ansi_presentation_divisor: u64 = 2;
 const max_framehash_frames: u32 = 10_000;
+/// Full runtime logs contain several diagnostic lines per frame. Keep replay
+/// useful for extended recordings without accepting unbounded input.
+const max_replay_log_bytes = 64 * 1024 * 1024;
 
 const NesRunOptions = struct {
     renderer: Renderer = .auto,
+    audio: bool = false,
+    audio_backend: AudioBackend = .unit,
     log_path: ?[]const u8 = null,
     replay_path: ?[]const u8 = null,
+};
+
+const HostAudioSink = union(AudioBackend) {
+    unit: audio_host.Sink,
+    queue: audio_queue_host.Sink,
+
+    fn init(self: *HostAudioSink) !void {
+        switch (self.*) {
+            .unit => |*sink| try sink.init(),
+            .queue => |*sink| try sink.init(),
+        }
+    }
+
+    fn deinit(self: *HostAudioSink) void {
+        switch (self.*) {
+            .unit => |*sink| sink.deinit(),
+            .queue => |*sink| sink.deinit(),
+        }
+    }
+
+    fn asSink(self: *HostAudioSink) CoreAudioSink {
+        return switch (self.*) {
+            .unit => |*sink| sink.asSink(),
+            .queue => |*sink| sink.asSink(),
+        };
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -100,16 +135,36 @@ fn parseRenderer(value: []const u8) !Renderer {
         error.InvalidArguments;
 }
 
+fn parseAudioBackend(value: []const u8) !AudioBackend {
+    return if (std.mem.eql(u8, value, "unit"))
+        .unit
+    else if (std.mem.eql(u8, value, "queue"))
+        .queue
+    else
+        error.InvalidArguments;
+}
+
 fn parseNesRunOptions(args: []const []const u8) !NesRunOptions {
-    if (args.len % 2 != 0) return error.InvalidArguments;
     var options = NesRunOptions{};
     var renderer_seen = false;
+    var audio_backend_seen = false;
     var index: usize = 0;
-    while (index < args.len) : (index += 2) {
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--audio")) {
+            if (options.audio) return error.InvalidArguments;
+            options.audio = true;
+            index += 1;
+            continue;
+        }
+        if (index + 1 >= args.len) return error.InvalidArguments;
         if (std.mem.eql(u8, args[index], "--renderer")) {
             if (renderer_seen) return error.InvalidArguments;
             options.renderer = try parseRenderer(args[index + 1]);
             renderer_seen = true;
+        } else if (std.mem.eql(u8, args[index], "--audio-backend")) {
+            if (audio_backend_seen) return error.InvalidArguments;
+            options.audio_backend = try parseAudioBackend(args[index + 1]);
+            audio_backend_seen = true;
         } else if (std.mem.eql(u8, args[index], "--log")) {
             if (options.log_path != null or args[index + 1].len == 0) return error.InvalidArguments;
             options.log_path = args[index + 1];
@@ -119,7 +174,9 @@ fn parseNesRunOptions(args: []const []const u8) !NesRunOptions {
         } else {
             return error.InvalidArguments;
         }
+        index += 2;
     }
+    if (audio_backend_seen and !options.audio) return error.InvalidArguments;
     return options;
 }
 
@@ -305,7 +362,11 @@ fn runNesWithOptions(init: std.process.Init, rom_path: []const u8, options: NesR
         return err;
     };
     var nes: Nes = undefined;
-    nes.init(cartridge);
+    var audio_sink: HostAudioSink = switch (options.audio_backend) {
+        .unit => .{ .unit = .{} },
+        .queue => .{ .queue = .{} },
+    };
+    defer if (options.audio) audio_sink.deinit();
 
     var output_storage: [8192]u8 = undefined;
     var output_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &output_storage);
@@ -319,10 +380,16 @@ fn runNesWithOptions(init: std.process.Init, rom_path: []const u8, options: NesR
     // lone legacy Escape remains a reliable fallback when keyboard-event
     // negotiation is unavailable.
     session.setLegacyEscapeEnabled(true);
+    if (options.audio) {
+        try audio_sink.init();
+        nes.initWithAudioSink(cartridge, audio_sink.asSink());
+    } else {
+        nes.init(cartridge);
+    }
     var logger = RunLogger{};
     try logger.open(init.io, options.log_path);
     defer logger.deinit(init.io);
-    try logger.write(init.io, "start renderer={s} rom={s}\n", .{ @tagName(renderer), rom_path });
+    try logger.write(init.io, "start renderer={s} audio={s} audio_backend={s} rom={s}\n", .{ @tagName(renderer), if (options.audio) "on" else "off", @tagName(options.audio_backend), rom_path });
     var replay = if (options.replay_path) |path| try InputReplay.load(init.io, path, init.arena.allocator()) else null;
     var held_actions = Actions{};
     var legacy_actions = Actions{};
@@ -346,6 +413,7 @@ fn runNesWithOptions(init: std.process.Init, rom_path: []const u8, options: NesR
         if (logged_frame) {
             const emulation_finished = std.Io.Clock.Timestamp.now(init.io, .awake);
             const sprite_zero_hit = nes.ppu.spriteZeroHitTelemetry();
+            const presentation = nes.ppu.presentationTelemetry();
             const player = smbPlayerTelemetry(&nes.bus.memory);
             try logger.write(
                 init.io,
@@ -365,12 +433,25 @@ fn runNesWithOptions(init: std.process.Init, rom_path: []const u8, options: NesR
                 "frame={d} player state={x:0>2} x={d} y={d} xs={d} ys={d}\n",
                 .{ frame.frame_number, player.state, player.world_x, player.y, player.x_speed, player.y_speed },
             );
+            try logger.write(
+                init.io,
+                "frame={d} hardware cpu_cycles={d} ppu={d}:{d} live_oam={d}:{d} presentation_oam={d}:{d}\n",
+                .{
+                    frame.frame_number,
+                    nes.cpu.cycles,
+                    nes.ppu.scanline,
+                    nes.ppu.dot,
+                    presentation.live_visible_sprites,
+                    presentation.live_oam_hash,
+                    presentation.presentation_visible_sprites,
+                    presentation.presentation_oam_hash,
+                },
+            );
         }
-        // Emulation advances one NTSC frame each loop (about 60 Hz). The
-        // terminal is intentionally updated every second emulated frame to
-        // cap the initial presentation path near 30 FPS; never slow or skip
-        // the emulated clock just because a frame was not presented.
-        if (shouldPresentFrame(frame.frame_number)) {
+        // Emulation advances one NTSC frame each loop (about 60 Hz). Kitty
+        // presents each frame, while the ANSI fallback stays capped near 30
+        // FPS; neither renderer slows or skips emulation itself.
+        if (shouldPresentFrame(renderer, frame.frame_number)) {
             if (logged_frame) try logger.write(init.io, "frame={d} present=begin\n", .{frame.frame_number});
             const present_started = std.Io.Clock.Timestamp.now(init.io, .awake);
             try appendExitPrompt(init.io, output);
@@ -387,7 +468,9 @@ fn runNesWithOptions(init: std.process.Init, rom_path: []const u8, options: NesR
                 );
             }
         }
-        switch (try waitForNextNesFrame(init.io, &session, &next_frame_deadline, &held_actions, &legacy_actions, &legacy_frames, &logger)) {
+        if (logged_frame) try logger.write(init.io, "frame={d} wait=begin\n", .{frame.frame_number});
+        const terminal_event = try waitForNextNesFrame(init.io, &session, &next_frame_deadline, &held_actions, &legacy_actions, &legacy_frames, &logger);
+        switch (terminal_event) {
             .exit => |reason| {
                 try logger.write(init.io, "frame={d} terminal=exit reason={s}\n", .{ frame.frame_number, @tagName(reason) });
                 break;
@@ -401,10 +484,34 @@ fn runNesWithOptions(init: std.process.Init, rom_path: []const u8, options: NesR
                 next_frame_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).addDuration(nesFrameDuration());
                 try logger.write(init.io, "frame={d} terminal=resumed renderer={s}\n", .{ frame.frame_number, @tagName(renderer) });
             },
-            .none => {},
+            .none => if (logged_frame) try logger.write(init.io, "frame={d} wait=end\n", .{frame.frame_number}),
             .key => unreachable,
         }
     }
+    if (options.audio) {
+        switch (audio_sink) {
+            .unit => |*sink| try logAudioTelemetry(init.io, &logger, sink.telemetry()),
+            .queue => |*sink| try logAudioTelemetry(init.io, &logger, sink.telemetry()),
+        }
+    }
+}
+
+fn logAudioTelemetry(io: std.Io, logger: *RunLogger, audio: anytype) !void {
+    try logger.write(
+        io,
+        "audio received_samples={d} non_silent_samples={d} callbacks={d} rendered_samples={d} underrun_samples={d} running={d} running_status={d} last_render_error={d} last_render_error_status={d}\n",
+        .{
+            audio.received_samples,
+            audio.non_silent_samples,
+            audio.callback_count,
+            audio.rendered_samples,
+            audio.underrun_samples,
+            audio.is_running,
+            audio.is_running_status,
+            audio.last_render_error,
+            audio.last_render_error_status,
+        },
+    );
 }
 
 const RunLogger = struct {
@@ -446,7 +553,7 @@ const InputReplay = struct {
     frame_count: usize,
 
     fn load(io: std.Io, path: []const u8, allocator: std.mem.Allocator) !InputReplay {
-        const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8 * 1024 * 1024));
+        const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_replay_log_bytes));
         return parse(allocator, contents);
     }
 
@@ -529,8 +636,7 @@ fn waitForNextNesFrame(
             while (deadline.*.compare(.lte, now)) deadline.* = deadline.*.addDuration(nesFrameDuration());
             return .none;
         }
-        const remaining_ns: u64 = @intCast(now.durationTo(deadline.*).raw.nanoseconds);
-        switch (try session.nextEventTimeout(timeoutMsForRemaining(remaining_ns))) {
+        switch (try session.nextEventTimeout(0)) {
             .key => |event| {
                 if (logger.enabled()) {
                     try logger.write(
@@ -558,9 +664,18 @@ fn waitForNextNesFrame(
             },
             .exit => |reason| return .{ .exit = reason },
             .suspended => return .suspended,
-            .none => {},
+            .none => sleepNanoseconds(@min(@as(u64, std.time.ns_per_ms), @as(u64, @intCast(now.durationTo(deadline.*).raw.nanoseconds)))),
         }
     }
+}
+
+fn sleepNanoseconds(nanoseconds: u64) void {
+    if (nanoseconds == 0) return;
+    const duration = std.c.timespec{
+        .sec = @intCast(nanoseconds / std.time.ns_per_s),
+        .nsec = @intCast(nanoseconds % std.time.ns_per_s),
+    };
+    _ = std.c.nanosleep(&duration, null);
 }
 
 fn keyName(key: terminal.Key) []const u8 {
@@ -582,12 +697,6 @@ fn keyName(key: terminal.Key) []const u8 {
 
 fn nesFrameDuration() std.Io.Clock.Duration {
     return .{ .raw = .fromNanoseconds(nes_frame_interval_ns), .clock = .awake };
-}
-
-fn timeoutMsForRemaining(remaining_ns: u64) i32 {
-    std.debug.assert(remaining_ns != 0);
-    const rounded_up = (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
-    return @intCast(@min(rounded_up, @as(u64, std.math.maxInt(i32))));
 }
 
 fn isEscapeKey(key: terminal.Key) bool {
@@ -638,8 +747,12 @@ fn applyKeyAction(actions: *Actions, key: terminal.Key, pressed: bool) void {
     actions.* = @bitCast(if (pressed) current | changed else current & ~changed);
 }
 
-fn shouldPresentFrame(frame_number: u64) bool {
-    return frame_number % presentation_divisor == 1;
+fn shouldPresentFrame(renderer: Renderer, frame_number: u64) bool {
+    return switch (renderer) {
+        .kitty => true,
+        .ansi => frame_number % ansi_presentation_divisor == 1,
+        .auto => unreachable,
+    };
 }
 
 fn appendPresentedFrame(io: std.Io, output: *std.Io.Writer, renderer: Renderer, frame: Frame) !void {
@@ -718,7 +831,7 @@ fn printUsage(io: std.Io) !void {
             "  zigarcade --demo-neogeo <ansi|kitty|auto>\n" ++
             "  zigarcade inspect <path/to/rom.nes>\n" ++
             "  zigarcade framehash <path/to/rom.nes> --frames <1-10000>\n" ++
-            "  zigarcade nes <path/to/rom.nes> [--renderer ansi|kitty|auto] [--log <path>] [--replay <log>]\n",
+            "  zigarcade nes <path/to/rom.nes> [--renderer ansi|kitty|auto] [--audio [--audio-backend unit|queue]] [--log <path>] [--replay <log>]\n",
     );
     try stderr_writer.interface.flush();
 }
@@ -752,12 +865,25 @@ test "renderer parser accepts documented values and rejects others" {
     try std.testing.expectError(error.InvalidArguments, parseRenderer("sixel"));
 }
 
-test "NES run options accept an optional renderer and file log" {
-    const options = try parseNesRunOptions(&.{ "--renderer", "kitty", "--log", "run.log", "--replay", "input.log" });
+test "audio backend parser accepts both macOS output paths" {
+    try std.testing.expectEqual(AudioBackend.unit, try parseAudioBackend("unit"));
+    try std.testing.expectEqual(AudioBackend.queue, try parseAudioBackend("queue"));
+    try std.testing.expectError(error.InvalidArguments, parseAudioBackend("engine"));
+}
+
+test "NES run options accept an opt-in audio switch" {
+    const defaults = try parseNesRunOptions(&.{});
+    try std.testing.expect(!defaults.audio);
+
+    const options = try parseNesRunOptions(&.{ "--renderer", "kitty", "--audio", "--audio-backend", "queue", "--log", "run.log", "--replay", "input.log" });
     try std.testing.expectEqual(Renderer.kitty, options.renderer);
+    try std.testing.expect(options.audio);
+    try std.testing.expectEqual(AudioBackend.queue, options.audio_backend);
     try std.testing.expectEqualStrings("run.log", options.log_path.?);
     try std.testing.expectEqualStrings("input.log", options.replay_path.?);
     try std.testing.expectError(error.InvalidArguments, parseNesRunOptions(&.{ "--renderer", "auto", "--renderer", "ansi" }));
+    try std.testing.expectError(error.InvalidArguments, parseNesRunOptions(&.{ "--audio", "--audio" }));
+    try std.testing.expectError(error.InvalidArguments, parseNesRunOptions(&.{ "--audio-backend", "queue" }));
 }
 
 test "input replay restores frame-indexed controller actions" {
@@ -868,15 +994,13 @@ test "cartridge errors explain current compatibility boundary" {
     try std.testing.expectEqualStrings("电池存档 ROM 尚不支持", cartridgeErrorDescription(CartridgeError.UnsupportedBatteryBackedRam));
 }
 
-test "30 FPS presentation retains every 60 Hz emulation frame" {
-    try std.testing.expect(shouldPresentFrame(1));
-    try std.testing.expect(!shouldPresentFrame(2));
-    try std.testing.expect(shouldPresentFrame(3));
-}
-
-test "frame scheduler waits to the 60 Hz deadline without sub-millisecond spin" {
-    try std.testing.expectEqual(@as(i32, 1), timeoutMsForRemaining(1));
-    try std.testing.expectEqual(@as(i32, 17), timeoutMsForRemaining(nes_frame_interval_ns));
+test "Kitty presents every frame while ANSI remains capped at 30 FPS" {
+    try std.testing.expect(shouldPresentFrame(.kitty, 1));
+    try std.testing.expect(shouldPresentFrame(.kitty, 2));
+    try std.testing.expect(shouldPresentFrame(.kitty, 3));
+    try std.testing.expect(shouldPresentFrame(.ansi, 1));
+    try std.testing.expect(!shouldPresentFrame(.ansi, 2));
+    try std.testing.expect(shouldPresentFrame(.ansi, 3));
 }
 
 test "terminal cursor keys and lone Escape map to stable actions" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const AudioSink = @import("../../core/audio.zig").AudioSink;
 const NullAudioSink = @import("../../core/audio.zig").NullAudioSink;
 const Frame = @import("../../core/frame.zig").Frame;
 const Apu = @import("apu.zig").Apu;
@@ -32,6 +33,13 @@ pub const Nes = struct {
     background_opaque: [ppu_frame_width * ppu_frame_height]u8 = undefined,
 
     pub fn init(self: *Nes, cartridge: Cartridge) void {
+        self.null_audio_sink = .{};
+        self.initWithAudioSink(cartridge, self.null_audio_sink.asSink());
+    }
+
+    /// Host audio is injected at the machine boundary; the default initializer
+    /// deliberately retains its silent deterministic sink for tests and tools.
+    pub fn initWithAudioSink(self: *Nes, cartridge: Cartridge, sink: AudioSink) void {
         self.mapper = switch (cartridge.mapper) {
             .nrom => .{ .nrom = Mapper0.init(cartridge) },
             .mmc1 => .{ .mmc1 = Mapper1.init(cartridge) },
@@ -41,8 +49,7 @@ pub const Nes = struct {
         };
         const mapper = self.mapperRef();
         self.ppu = Ppu.init(mapper);
-        self.null_audio_sink = .{};
-        self.apu = Apu.init(self.null_audio_sink.asSink());
+        self.apu = Apu.init(sink);
         self.controllers = .{};
         self.bus = .{};
         self.bus.setTraceEnabled(false);

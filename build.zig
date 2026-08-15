@@ -12,6 +12,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.root_module.link_libc = true;
+    if (target.result.os.tag == .macos) exe.root_module.linkFramework("AudioToolbox", .{});
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run ZigArcade");
@@ -26,6 +28,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    if (target.result.os.tag == .macos) unit_tests.root_module.linkFramework("AudioToolbox", .{});
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);

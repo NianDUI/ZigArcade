@@ -2,6 +2,10 @@ const std = @import("std");
 
 const poll_interval_ms = 50;
 const escape_prefix_grace_timeouts = 8;
+// A complete keyboard sequence normally arrives in one read, but terminal
+// multiplexers may split it. Keep the parser state long enough that a slow
+// fragment cannot leak its suffix into game input as ordinary bytes.
+const csi_grace_timeouts = 50;
 const apc_discard_grace_timeouts = 16;
 const kitty_keyboard_push_state = "\x1b[>u";
 const kitty_keyboard_enable_all_events = "\x1b[=11;1u";
@@ -192,7 +196,7 @@ pub const Session = struct {
             .byte => |value| value,
             .timeout => {
                 self.csi_timeouts +%= 1;
-                if (self.csi_timeouts >= escape_prefix_grace_timeouts) self.csi_pending = false;
+                if (self.csi_timeouts >= csi_grace_timeouts) self.csi_pending = false;
                 return .none;
             },
             .input_closed => {
@@ -221,7 +225,10 @@ pub const Session = struct {
     /// terminal splits a large graphics reply across several reads.
     fn continueDiscardingApc(self: *Session, initial_timeout_ms: i32) !Event {
         var timeout_ms = initial_timeout_ms;
-        while (true) {
+        // Kitty may stream a large graphics reply while frames are still
+        // being presented. Bound each event-loop turn so protocol traffic
+        // cannot monopolize input processing and freeze emulation.
+        for (0..256) |_| {
             switch (try self.readByteWithTimeout(timeout_ms)) {
                 .timeout => {
                     self.apc_discard_timeouts +%= 1;
@@ -246,6 +253,7 @@ pub const Session = struct {
                 },
             }
         }
+        return .none;
     }
 
     fn readByte(self: *Session) !?u8 {
@@ -477,6 +485,24 @@ test "fragmented CSI input retains its prefix until completed" {
     try std.testing.expectEqual(KeyState.press, event.key.state);
     try std.testing.expectEqual(Key{ .byte = 'z' }, event.key.key);
     try std.testing.expect(!session.csi_pending);
+}
+
+test "fragmented CSI input survives the grace window before completion" {
+    var session: Session = .{};
+    session.escape_prefix_pending = true;
+    try session.queueInput("[122;1:");
+    try std.testing.expectEqual(Event.none, try session.continueEscapePrefix(0));
+    // The parser has already consumed one no-data poll while recognizing the
+    // initial fragment, so leave one poll before its configured reset point.
+    for (0..csi_grace_timeouts - 2) |_| {
+        try std.testing.expectEqual(Event.none, try session.continueCsi(0));
+        try std.testing.expect(session.csi_pending);
+    }
+
+    try session.queueInput("2u");
+    const event = try session.continueCsi(0);
+    try std.testing.expectEqual(KeyState.repeat, event.key.state);
+    try std.testing.expectEqual(Key{ .byte = 'z' }, event.key.key);
 }
 
 test "terminal enables and restores Kitty keyboard event reporting" {

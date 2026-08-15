@@ -4,6 +4,8 @@ test {
     _ = @import("core/input.zig");
     _ = @import("frontend/kitty.zig");
     _ = @import("frontend/ansi.zig");
+    _ = @import("frontend/audio_host.zig");
+    _ = @import("frontend/audio_queue_host.zig");
     _ = @import("systems/nes/bus.zig");
     _ = @import("systems/nes/apu.zig");
     _ = @import("systems/nes/cartridge.zig");

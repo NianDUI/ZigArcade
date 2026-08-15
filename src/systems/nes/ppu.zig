@@ -57,6 +57,7 @@ pub const Ppu = struct {
     presentation_nametable: u2 = 0,
     presentation_ctrl: u8 = 0,
     presentation_mask: u8 = 0,
+    presentation_oam: [256]u8 = [_]u8{0} ** 256,
     // The simplified renderer samples a whole frame at VBlank, but games
     // commonly split the next frame after Sprite 0. Keep the initial display
     // state for hit detection separate from later gameplay scroll writes.
@@ -183,12 +184,25 @@ pub const Ppu = struct {
         };
     }
 
+    /// Presentation diagnostics deliberately expose both the OAM that a game
+    /// is preparing for its next frame and the VBlank snapshot used by the
+    /// host renderer. A difference is normal during NMI/DMA, but recording
+    /// both makes a visual transition reproducible without terminal capture.
+    pub fn presentationTelemetry(self: *const Ppu) PresentationTelemetry {
+        return .{
+            .live_oam_hash = std.hash.Wyhash.hash(0, &self.oam),
+            .presentation_oam_hash = std.hash.Wyhash.hash(0, &self.presentation_oam),
+            .live_visible_sprites = visibleSpriteCount(&self.oam),
+            .presentation_visible_sprites = visibleSpriteCount(&self.presentation_oam),
+        };
+    }
+
     /// Sprite evaluation starts shortly after each visible scanline begins.
     /// Model the useful overflow result at its first observable point, rather
     /// than leaking it from the asynchronous host-frame renderer.
     fn clockSpriteOverflow(self: *Ppu) void {
         if (self.mask & 0x18 == 0) return;
-        if (self.spritesThroughIndexOnScanline(63, self.scanline, if (self.ctrl & 0x20 != 0) 16 else 8) > 8) {
+        if (spritesThroughIndexOnScanline(&self.oam, 63, self.scanline, if (self.ctrl & 0x20 != 0) 16 else 8) > 8) {
             self.status |= 0x20;
         }
     }
@@ -232,6 +246,7 @@ pub const Ppu = struct {
         self.presentation_nametable = self.pending_nametable;
         self.presentation_ctrl = self.ctrl;
         self.presentation_mask = self.mask;
+        self.presentation_oam = self.oam;
     }
 
     fn latchSpriteZeroState(self: *Ppu) void {
@@ -326,10 +341,11 @@ pub const Ppu = struct {
         }
     }
 
-    /// Presentation-side sprite overlay for the current OAM. It preserves the
-    /// OAM priority order, color-0 transparency, palette selection, both
-    /// flips, and the background-priority bit. Sprite evaluation limits and
-    /// sprite-0 hit remain timing work in the dot-clock path.
+    /// Presentation-side sprite overlay for the OAM captured with the
+    /// background state at VBlank. It preserves OAM priority order, color-0
+    /// transparency, palette selection, both flips, and the background-
+    /// priority bit. Sprite evaluation limits and sprite-0 hit remain timing
+    /// work in the dot-clock path.
     pub fn renderSprites(self: *Ppu, rgb: []u8) RenderError!void {
         return self.renderSpritesWithBackground(rgb, null);
     }
@@ -346,14 +362,14 @@ pub const Ppu = struct {
         while (sprite_index > 0) {
             sprite_index -= 1;
             const offset = sprite_index * 4;
-            const sprite_y = self.oam[offset];
-            const tile = self.oam[offset + 1];
-            const attributes = self.oam[offset + 2];
-            const sprite_x = self.oam[offset + 3];
+            const sprite_y = self.presentation_oam[offset];
+            const tile = self.presentation_oam[offset + 1];
+            const attributes = self.presentation_oam[offset + 2];
+            const sprite_x = self.presentation_oam[offset + 3];
             for (0..sprite_height) |local_y| {
                 const screen_y = @as(usize, sprite_y) + 1 + local_y;
                 if (screen_y >= frame_height) continue;
-                if (self.spritesThroughIndexOnScanline(sprite_index, screen_y, sprite_height) > 8) continue;
+                if (spritesThroughIndexOnScanline(&self.presentation_oam, sprite_index, screen_y, sprite_height) > 8) continue;
                 const source_y = if (attributes & 0x80 != 0) sprite_height - 1 - local_y else local_y;
                 const tile_address = self.spriteTileAddress(tile, source_y);
                 const low_plane = self.readMemory(tile_address);
@@ -391,10 +407,10 @@ pub const Ppu = struct {
     /// on a scanline are rendered; any ninth sprite makes overflow observable.
     /// The hardware's buggy overflow-search behavior is a later dot-level
     /// refinement, but this models the normal practical limit correctly.
-    fn spritesThroughIndexOnScanline(self: *const Ppu, inclusive_index: usize, screen_y: usize, sprite_height: usize) u8 {
+    fn spritesThroughIndexOnScanline(oam: []const u8, inclusive_index: usize, screen_y: usize, sprite_height: usize) u8 {
         var count: u8 = 0;
         for (0..(inclusive_index + 1)) |index| {
-            const top = @as(usize, self.oam[index * 4]) + 1;
+            const top = @as(usize, oam[index * 4]) + 1;
             if (screen_y >= top and screen_y < top + sprite_height) count += 1;
         }
         return count;
@@ -555,6 +571,23 @@ pub const SpriteZeroHitTelemetry = struct {
     scanline: u16,
     dot: u16,
 };
+
+pub const PresentationTelemetry = struct {
+    live_oam_hash: u64,
+    presentation_oam_hash: u64,
+    live_visible_sprites: u8,
+    presentation_visible_sprites: u8,
+};
+
+fn visibleSpriteCount(oam: []const u8) u8 {
+    var count: u8 = 0;
+    for (0..64) |index| {
+        // The PPU displays a sprite one scanline below its OAM Y byte; $EF
+        // is the last value that still reaches row 239.
+        if (oam[index * 4] < frame_height - 1) count += 1;
+    }
+    return count;
+}
 
 test "PPU nametable and palette mirrors follow Mapper 0 mirroring" {
     var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
@@ -844,7 +877,6 @@ test "sprite overlay handles palette flips transparency and background priority"
     };
     var ppu = Ppu.init(&mapper);
     ppu.mask = 0x14;
-    ppu.latchPresentationState();
     // Tile 1 has color 1 at its left edge and color 2 at its right edge.
     for (0..8) |row| {
         mapper.chr_ram[16 + row] = 0x80;
@@ -855,6 +887,7 @@ test "sprite overlay handles palette flips transparency and background priority"
     ppu.palette[0x12] = 0x16;
     ppu.oam[0..4].* = .{ 9, 1, 0x40, 20 }; // x flip
     ppu.oam[4..8].* = .{ 9, 1, 0x20, 40 }; // behind opaque background
+    ppu.latchPresentationState();
     var rgb: [frame_rgb_bytes]u8 = undefined;
     @memset(&rgb, 0);
     try ppu.renderSprites(&rgb);
@@ -869,6 +902,39 @@ test "sprite overlay handles palette flips transparency and background priority"
     try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, rgb[behind_offset..][0..3]);
 }
 
+test "sprite presentation uses the OAM captured with its frame state" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x14;
+    @memset(&ppu.oam, 0xf8);
+    for (0..8) |row| mapper.chr_ram[16 + row] = 0x80;
+    ppu.palette[0x11] = 0x21;
+    ppu.oam[0..4].* = .{ 9, 1, 0, 20 };
+    ppu.latchPresentationState();
+    // The following DMA has begun preparing the next frame. It must not
+    // replace the sprite belonging to the already-latched background.
+    ppu.oam[0..4].* = .{ 0xf8, 1, 0, 40 };
+
+    const hardware = ppu.presentationTelemetry();
+    try std.testing.expectEqual(@as(u8, 0), hardware.live_visible_sprites);
+    try std.testing.expectEqual(@as(u8, 1), hardware.presentation_visible_sprites);
+    try std.testing.expect(hardware.live_oam_hash != hardware.presentation_oam_hash);
+
+    var rgb: [frame_rgb_bytes]u8 = undefined;
+    @memset(&rgb, 0);
+    try ppu.renderSprites(&rgb);
+    const captured_pixel = (10 * frame_width + 20) * 3;
+    const next_frame_pixel = (10 * frame_width + 40) * 3;
+    try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, rgb[captured_pixel..][0..3]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, rgb[next_frame_pixel..][0..3]);
+}
+
 test "lower OAM index wins where opaque sprites overlap" {
     var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
     var mapper = Mapper0{
@@ -879,7 +945,6 @@ test "lower OAM index wins where opaque sprites overlap" {
     };
     var ppu = Ppu.init(&mapper);
     ppu.mask = 0x14;
-    ppu.latchPresentationState();
     for (0..8) |row| {
         mapper.chr_ram[16 + row] = 0xff; // tile 1 color 1
         mapper.chr_ram[32 + 8 + row] = 0xff; // tile 2 color 2
@@ -888,6 +953,7 @@ test "lower OAM index wins where opaque sprites overlap" {
     ppu.palette[0x12] = 0x16;
     ppu.oam[0..4].* = .{ 19, 1, 0, 30 };
     ppu.oam[4..8].* = .{ 19, 2, 0, 30 };
+    ppu.latchPresentationState();
     var rgb: [frame_rgb_bytes]u8 = undefined;
     @memset(&rgb, 0);
     try ppu.renderSprites(&rgb);
@@ -906,7 +972,6 @@ test "8x16 sprites select pattern table from tile bit and span two tiles" {
     var ppu = Ppu.init(&mapper);
     ppu.ctrl = 0x20; // 8x16 sprites
     ppu.mask = 0x14;
-    ppu.latchPresentationState();
     // Tile byte 3 chooses $1000. The top half is tile 2 (color 1), bottom
     // half tile 3 (color 2) in that table.
     for (0..8) |row| {
@@ -916,6 +981,7 @@ test "8x16 sprites select pattern table from tile bit and span two tiles" {
     ppu.palette[0x11] = 0x21;
     ppu.palette[0x12] = 0x16;
     ppu.oam[0..4].* = .{ 29, 3, 0, 50 };
+    ppu.latchPresentationState();
     var rgb: [frame_rgb_bytes]u8 = undefined;
     @memset(&rgb, 0);
     try ppu.renderSprites(&rgb);
@@ -935,10 +1001,10 @@ test "sprite renderer limits each scanline to eight and raises overflow plus spr
     };
     var ppu = Ppu.init(&mapper);
     ppu.mask = 0x14;
-    ppu.latchPresentationState();
     for (0..8) |row| mapper.chr_ram[16 + row] = 0x80;
     ppu.palette[0x11] = 0x21;
     for (0..9) |index| ppu.oam[index * 4 ..][0..4].* = .{ 39, 1, 0, 60 };
+    ppu.latchPresentationState();
     var rgb: [frame_rgb_bytes]u8 = undefined;
     @memset(&rgb, 0);
     var background: [frame_width * frame_height]u8 = [_]u8{0} ** (frame_width * frame_height);
