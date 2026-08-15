@@ -30,12 +30,16 @@ pub const Apu = struct {
     pulse1_envelope_divider: u8 = 0,
     pulse1_envelope_decay: u4 = 0,
     pulse1_envelope_start: bool = false,
+    pulse1_sweep_divider: u8 = 0,
+    pulse1_sweep_reload: bool = false,
     pulse2_divider: u16 = 0,
     pulse2_step: u3 = 0,
     pulse2_length: u8 = 0,
     pulse2_envelope_divider: u8 = 0,
     pulse2_envelope_decay: u4 = 0,
     pulse2_envelope_start: bool = false,
+    pulse2_sweep_divider: u8 = 0,
+    pulse2_sweep_reload: bool = false,
     triangle_divider: u16 = 0,
     triangle_step: u5 = 0,
     triangle_length: u8 = 0,
@@ -59,6 +63,8 @@ pub const Apu = struct {
             if (address == 0x4006 or address == 0x4007) self.reloadPulseTimer(.two);
             if (address == 0x400a or address == 0x400b) self.reloadTriangleTimer();
             if (address == 0x400e) self.reloadNoiseTimer();
+            if (address == 0x4001) self.pulse1_sweep_reload = true;
+            if (address == 0x4005) self.pulse2_sweep_reload = true;
             if (address == 0x4003 and self.channel_enable & 1 != 0) {
                 self.pulse1_length = length_table[value >> 3];
                 self.pulse1_envelope_start = true;
@@ -101,6 +107,7 @@ pub const Apu = struct {
                 if (self.frame_mode_5_step) {
                     self.clockQuarterFrame();
                     self.clockLengthCounters();
+                    self.clockPulseSweeps();
                 }
                 return true;
             },
@@ -150,15 +157,18 @@ pub const Apu = struct {
         if (cycle == 7457) {
             self.clockQuarterFrame();
             self.clockLengthCounters();
+            self.clockPulseSweeps();
         }
         if (!self.frame_mode_5_step and cycle == 14915) {
             self.clockQuarterFrame();
             self.clockLengthCounters();
+            self.clockPulseSweeps();
             if (!self.frame_irq_inhibit) self.frame_irq = true;
             self.frame_counter_cycles = 0;
         } else if (self.frame_mode_5_step and cycle == 18641) {
             self.clockQuarterFrame();
             self.clockLengthCounters();
+            self.clockPulseSweeps();
             self.frame_counter_cycles = 0;
         }
     }
@@ -167,6 +177,11 @@ pub const Apu = struct {
         self.clockTriangleLinearCounter();
         self.clockPulseEnvelope(.one);
         self.clockPulseEnvelope(.two);
+    }
+
+    fn clockPulseSweeps(self: *Apu) void {
+        self.clockPulseSweep(.one);
+        self.clockPulseSweep(.two);
     }
 
     const Pulse = enum { one, two };
@@ -209,7 +224,7 @@ pub const Apu = struct {
         const enable_mask: u8 = if (pulse == .one) 1 else 2;
         const length = if (pulse == .one) self.pulse1_length else self.pulse2_length;
         const step = if (pulse == .one) self.pulse1_step else self.pulse2_step;
-        if (self.channel_enable & enable_mask == 0 or length == 0 or self.pulseTimerPeriod(pulse) < 8) return 0;
+        if (self.channel_enable & enable_mask == 0 or length == 0 or self.pulseTimerPeriod(pulse) < 8 or self.pulseSweepMutes(pulse)) return 0;
         const duty = (self.registers[offset] >> 6) & 3;
         const high = pulseHigh(duty, step);
         const amplitude = @as(i16, self.pulseVolume(pulse)) * 2048;
@@ -220,6 +235,50 @@ pub const Apu = struct {
         const offset: usize = if (pulse == .one) 0 else 4;
         if (self.registers[offset] & 0x10 != 0) return @truncate(self.registers[offset]);
         return if (pulse == .one) self.pulse1_envelope_decay else self.pulse2_envelope_decay;
+    }
+
+    fn clockPulseSweep(self: *Apu, pulse: Pulse) void {
+        const offset: usize = if (pulse == .one) 0 else 4;
+        const register = self.registers[offset + 1];
+        const divider = switch (pulse) {
+            .one => &self.pulse1_sweep_divider,
+            .two => &self.pulse2_sweep_divider,
+        };
+        const reload = switch (pulse) {
+            .one => &self.pulse1_sweep_reload,
+            .two => &self.pulse2_sweep_reload,
+        };
+        if (divider.* == 0 and register & 0x80 != 0) self.applyPulseSweep(pulse, register);
+        if (divider.* == 0 or reload.*) {
+            divider.* = (register >> 4) & 7;
+            reload.* = false;
+        } else divider.* -= 1;
+    }
+
+    fn applyPulseSweep(self: *Apu, pulse: Pulse, register: u8) void {
+        const target = self.pulseSweepTarget(pulse, register) orelse return;
+        const offset: usize = if (pulse == .one) 0 else 4;
+        self.registers[offset + 2] = @truncate(target);
+        self.registers[offset + 3] = (self.registers[offset + 3] & 0xf8) | @as(u8, @truncate(target >> 8));
+    }
+
+    fn pulseSweepMutes(self: *const Apu, pulse: Pulse) bool {
+        const offset: usize = if (pulse == .one) 0 else 4;
+        const register = self.registers[offset + 1];
+        return register & 0x80 != 0 and register & 7 != 0 and self.pulseSweepTarget(pulse, register) == null;
+    }
+
+    fn pulseSweepTarget(self: *const Apu, pulse: Pulse, register: u8) ?u16 {
+        const shift: u4 = @truncate(register & 7);
+        if (shift == 0) return self.pulseTimerPeriod(pulse);
+        const timer = self.pulseTimerPeriod(pulse);
+        const delta = timer >> shift;
+        const target: i32 = if (register & 0x08 != 0)
+            @as(i32, timer) - @as(i32, delta) - @as(i32, if (pulse == .one) 1 else 0)
+        else
+            @as(i32, timer) + @as(i32, delta);
+        if (target < 8 or target > 0x7ff) return null;
+        return @intCast(target);
     }
 
     fn clockPulseEnvelope(self: *Apu, pulse: Pulse) void {
@@ -415,6 +474,32 @@ test "APU pulse envelope decays and loops at quarter-frame timing" {
     apu.pulse2_envelope_decay = 0;
     apu.tick(3729);
     try std.testing.expectEqual(@as(u4, 15), apu.pulse2_envelope_decay);
+}
+
+test "APU pulse sweep adjusts channels with their hardware negate difference" {
+    var null_sink = NullAudioSink{};
+    var apu = Apu.init(null_sink.asSink());
+    _ = apu.cpuWrite(0x4002, 100);
+    _ = apu.cpuWrite(0x4006, 100);
+    _ = apu.cpuWrite(0x4001, 0x89); // enabled, negate, period 0, shift 1
+    _ = apu.cpuWrite(0x4005, 0x89);
+    apu.clockPulseSweeps();
+    try std.testing.expectEqual(@as(u16, 49), apu.pulseTimerPeriod(.one));
+    try std.testing.expectEqual(@as(u16, 50), apu.pulseTimerPeriod(.two));
+}
+
+test "APU invalid pulse sweep target mutes without changing its timer" {
+    var null_sink = NullAudioSink{};
+    var apu = Apu.init(null_sink.asSink());
+    _ = apu.cpuWrite(0x4000, 0xdf);
+    _ = apu.cpuWrite(0x4002, 0x00);
+    _ = apu.cpuWrite(0x4003, 0x07); // timer $700
+    _ = apu.cpuWrite(0x4001, 0x81); // positive sweep, shift 1 -> overflow
+    _ = apu.cpuWrite(0x4015, 1);
+    try std.testing.expect(apu.pulseSweepMutes(.one));
+    try std.testing.expectEqual(@as(i16, 0), apu.pulseSample(.one));
+    apu.clockPulseSweeps();
+    try std.testing.expectEqual(@as(u16, 0x700), apu.pulseTimerPeriod(.one));
 }
 
 test "APU triangle clocks its linear counter and timer independently" {
