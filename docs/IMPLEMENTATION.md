@@ -6,7 +6,7 @@ ZigArcade 是在 macOS/Linux 终端运行的 Zig 多主机模拟器。首发使�
 
 **唯一支持的 Zig 工具链是 0.16.0。** 所有 `std`、构建脚本、I/O 和错误处理都以 Zig 0.16 API 为准；不为 0.13/0.14/0.15 维护兼容代码。每次升级 Zig 必须先更新本节版本、跑完整测试并记录破坏性变更。
 
-MVP（FC）包含 iNES 1.0、Mapper 0/NROM、2A03 CPU、dot 级 PPU 背景/精灵/NMI、逐总线周期 OAM DMA、两个手柄端口、`256×240` RGB 输出。当前实现还覆盖 MMC1、UNROM 与 CNROM 的基础 bank 行为，以及只送入 `NullAudioSink` 的 Pulse 1 音频链；仍不含持久存档、真实宿主音频、录像或联网。
+MVP（FC）包含 iNES 1.0、Mapper 0/NROM、2A03 CPU、dot 时钟驱动的 PPU 寄存器/NMI/滚动地址时序、逐总线周期 OAM DMA、两个手柄端口和 `256×240` RGB 输出。当前实现还覆盖 MMC1、UNROM、CNROM 和 AOROM 的基础 bank 行为；PPU 已实现 `v/t/x/w`、奇帧 dot skip、渲染期 `v/t` 推进与可见区寄存器写入回放，但尚未完成逐 dot fetch/shift-register 渲染管线。APU 已有 Pulse 1/2、Triangle、Noise 与 DMC 的基础时钟和 PCM 链，macOS 在显式 `--audio` 下可输出到 CoreAudio AudioUnit（AudioQueue 为试验后端）。仍不含持久存档、录像或联网。
 
 仓库不分发商业 ROM、Neo Geo BIOS、密钥或其派生数据。测试资产必须有来源、许可证和 SHA-256 记录。P0 前必须确定本仓库的发布许可证，并创建 `THIRD_PARTY_NOTICES.md`、`REFERENCES.md` 与 `tests/fixtures/MANIFEST.md`；没有明确再分发许可的资产不得提交。
 
@@ -16,9 +16,9 @@ MVP（FC）包含 iNES 1.0、Mapper 0/NROM、2A03 CPU、dot 级 PPU 背景/精�
 |---|---|---|
 | P0 | Zig 0.16 可行性 spike、CLI、TTY guard、Kitty/ANSI 呈现、色条 | macOS/Linux 上固定 Zig 0.16.0 通过 build/test/fmt；Ghostty 显示 `256×240`；正常退出、SIGTERM、SIGTSTP/SIGCONT 后终端恢复 |
 | P1 | 2A03、逐总线周期 CPU 总线、trace runner | `nestest` 在约定入口逐行匹配 PC、寄存器、周期；中断、RMW、dummy-read bus trace 通过 |
-| P2 | iNES、NROM、dot 级 PPU、寄存器/NMI、背景 | 锁定版本的公开 CPU/PPU 测试 ROM 通过，含 VBlank/NMI 边界测试 |
+| P2 | iNES、NROM、dot 时钟 PPU、寄存器/NMI、背景 | 锁定版本的公开 CPU/PPU 测试 ROM 通过，含 VBlank/NMI 边界测试；现已具备 dot clock、`v/t` 推进及光栅寄存器回放，仍待逐 dot fetch/shift-register 管线 |
 | P3 | DMA、控制器、精灵、滚动 | NROM 自制 ROM 可操作，固定帧 RGB 哈希匹配 |
-| P4 | Mapper 1/2/3/4、APU、NullAudioSink | 每个 mapper 有 bank/mirroring 单测和公开 ROM 回归；音频时钟、采样输出、underrun 统计可测 |
+| P4 | Mapper 1/2/3/4、APU、可选宿主音频 | 每个 mapper 有 bank/mirroring 单测和公开 ROM 回归；现已覆盖 Mapper 1/2/3/7 与多通道 APU 基础链，仍待 Mapper 4 和公开音频精度基线 |
 | P5a | Neo Geo 68000、BIOS/地址图、输入、IRQ 诊断 | 锁定的 68000 指令测试和 BIOS memory-map 诊断通过 |
 | P5b | Neo Geo Z80、sound latch、VRAM/palette/fixed layer | Z80 map 与 CPU 间命令/应答测试通过；`320×224` 固定层诊断画面匹配 |
 | P6 | Neo Geo 精灵视频、YM2610 | 用户合法 ROM/BIOS 的兼容性矩阵达标 |
@@ -75,7 +75,7 @@ pub const InputState = struct { ports: [4]ActionBits = .{ .{}, .{}, .{}, .{} } }
 
 `core/input.zig` 定义稳定的 packed `Actions(u16)`；`stride` 必须被呈现器尊重。NES 映射 `primary_1/2` 为 A/B、`select` 为 Select；Neo Geo 映射 `primary_1..4` 为 A..D、`coin` 为 Coin。公共位的语义在此锁定，不在主机接入时破坏 ABI。
 
-音频从 P0 就预留为独立时钟域：`AudioSink` 接收带模拟 cycle timestamp 的交错 PCM；MVP 注入 `NullAudioSink`，但 APU/YM2610 必须按 CPU/master clock 推进、重采样后写入环形缓冲。需要定义目标采样率、最大缓冲帧数、underrun/overrun 计数与回压规则，且绝不以 wall clock 修正模拟周期。
+音频是独立时钟域：`AudioSink` 接收带模拟 cycle timestamp 的交错 PCM；默认仍注入 `NullAudioSink`，而 NES APU 已按 CPU 时钟生成 44.1 kHz 单声道 PCM。macOS 的显式 `--audio` 使用 AudioUnit SPSC 环形缓冲输出，`--audio-backend queue` 保留为可比较稳定性的 AudioQueue 试验路径；宿主缓冲满时只丢弃新样本，绝不以 wall clock 修正模拟周期。仍需以公开基线验证精确混音、帧计数器边界和 underrun/overrun 行为。
 
 ## 5. Ghostty 与终端呈现
 
@@ -92,7 +92,7 @@ Kitty APC 格式：`ESC _ G <键值参数> ; <Base64 数据> ESC \\`。第一帧
 - 帧数据 184,320 bytes，Base64 后约 245,760 bytes。
 - 每个 APC 的 **Base64 payload** 至多 4096 bytes；原始块固定为 3072 bytes（3 的倍数），尾块更短。首块含完整元数据，续块仅含必要的 `m=1/0`（及静默设置）；所有 APC 都经 `writeAll` 处理短写。
 - 每帧以同一 image id/placement id 直接发送 `a=T`：Ghostty 对同 ID 重传会替换旧 image 并删除其 placement，随后创建一个 placement。不得先额外 delete；泄漏回归断言连续 N 帧后恰有 1 image 和 1 placement。仅在退出或终端挂起前发送 `a=d,d=A` 释放该会话的图像状态。
-- 预分配 RGB、Base64 和协议缓冲，禁止每帧分配；模拟循环仍以约 60 Hz 逐帧推进，默认只呈现每第二帧（约 30 FPS），不得因降低呈现频率而放慢或跳过模拟；`--fps 60` 需经基准验证。
+- 预分配 RGB、Base64 和协议缓冲，禁止每帧分配；模拟循环以约 60 Hz 逐帧推进，Kitty 路径当前每帧展示，ANSI 回退为约 30 FPS；降低呈现频率不得放慢或跳过模拟。
 - 生命周期是显式状态机。启动前保存 termios；SIGINT/SIGTERM/SIGHUP 仅置退出标志并唤醒主循环；SIGTSTP 触发主循环删除图像、恢复 termios/屏幕、还原默认 handler 并重新 raise，SIGCONT 后重新进入 raw/alternate screen 并重绘。清理输出不能与 APC 混写；阻塞 write 必须可中断。SIGKILL/硬崩溃不承诺恢复。
 
 ANSI 回退使用 `▀` 的前景/背景真彩色压缩上下两个像素。原尺寸需要 `256×120` 字符格，当前实现以无堆分配的 2×2 最近邻降采样输出 `128×60` 字符格；可配置缩放是后续工作。每帧整体构造后单次写入并移动光标至左上，禁止持续产生 scrollback。
@@ -122,9 +122,9 @@ CPU `read/write` 和无副作用 `peek` 必须分开；CPU 绝不使用 `peek`�
 
 ### 6.2 PPU、卡带与控制器
 
-PPU 为 341 dot × 262 scanline，约 60.0988 FPS。**从 P2 开始 `tickDot()` 就是唯一驱动寄存器、NMI、取数与 IRQ 可观察状态的规范实现**；scanline renderer 只可作为已验证的视觉优化，不能驱动时序。CPU bus 访问须有绝对 CPU/PPU tick；实现 pre-render odd-frame dot skip、PPU open bus、VBlank/NMI 抑制边界，后续 MMC3 以 PPU A12 上升沿驱动 IRQ。
+PPU 为 341 dot × 262 scanline，约 60.0988 FPS。`tickDot()` 是唯一驱动寄存器、NMI、滚动地址和后续取数/IRQ 可观察状态的规范实现；当前 framebuffer renderer 只消费在 VBlank 锁存的状态及可见区寄存器写入回放，不能替代 dot 时钟。CPU bus 访问须有绝对 CPU/PPU tick；已实现 pre-render odd-frame dot skip、PPU open bus、渲染期 coarse X/fine Y 推进、dot 257 水平拷贝与 pre-render 280–304 垂直拷贝。仍待完整 VBlank/NMI 抑制边界、背景/精灵 fetch 与 shift-register 管线；后续 MMC3 以 PPU A12 上升沿驱动 IRQ。
 
-必须实现：`$2000-$2007` 的 `v/t/x/w` 锁存、`$2002` 清 VBlank/重置写锁存、pattern/nametable/palette 镜像、VBlank NMI、背景 tile/attribute、精灵透明/优先级/8 精灵限制/sprite-0 hit。明确 `$3000-$3EFF` nametable mirror 与 `$3F10/$14/$18/$1C` palette mirror。内部先输出调色板索引，再映射 64 色 RGB。
+已实现：`$2000-$2007` 的 `v/t/x/w` 锁存、`$2002` 清 VBlank/重置写锁存、pattern/nametable/palette 镜像、VBlank NMI、背景 tile/attribute、精灵透明/优先级/基础 8 精灵限制及 sprite-0 hit。明确 `$3000-$3EFF` nametable mirror 与 `$3F10/$14/$18/$1C` palette mirror。内部先输出调色板索引，再映射 64 色 RGB。待完成：逐 dot 背景/精灵取数和移位寄存器、精灵评估的真实 overflow bug，以及上述边界的公开 ROM 验证。
 
 `Cartridge` 仅解析校验 iNES；Mapper 提供 `cpuRead/cpuWrite/ppuRead/ppuWrite/mirroring`。当前支持 Mapper 0：16 KiB PRG-ROM `$8000-$FFFF` 镜像或 32 KiB 直映射、CHR-ROM 写忽略或 CHR size=0 时的 8 KiB CHR-RAM；Mapper 1/MMC1：5-bit 串行寄存器、16/32 KiB PRG 与 4/8 KiB CHR bank、单屏/垂直/水平 mirroring，支持 CHR-ROM 或 8 KiB CHR-RAM；标准 iNES MMC1 范围限定为 32–256 KiB PRG 和至多 128 KiB CHR，外部 bank 的板型变种暂不接受；Mapper 2/UNROM：可切换 `$8000-$BFFF` 的 16 KiB PRG bank、固定 `$C000-$FFFF` 的末 bank 和 8 KiB CHR-RAM；Mapper 3/CNROM：16/32 KiB 固定 PRG 映射、CPU 写 `$8000-$FFFF` 选择一个 8 KiB CHR-ROM bank（至少两个 bank），CHR-ROM 不可写；Mapper 7/AOROM：32–256 KiB PRG，CPU 写 `$8000-$FFFF` 选择一个 32 KiB PRG bank（低三位）及单屏名称表（bit 4），仅支持 8 KiB CHR-RAM。Mapper 0/1/2/3 有易失 8 KiB PRG-RAM `$6000-$7FFF`，MMC1 以 PRG bank bit 4 控制这段 RAM 的读写；标准 AOROM 不暴露 PRG-RAM。battery 标志仍拒绝，不创建持久存档。初版拒绝 NES 2.0、trainer、four-screen 和其他未知 mapper。
 
