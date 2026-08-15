@@ -78,6 +78,7 @@ pub const Nes = struct {
         if (self.apu.frameIrqPending()) self.cpu.requestIrq();
         const cycles = try self.cpu.step(&self.bus);
         self.advanceDevices(cycles);
+        var dmc_cycles = self.serviceDmcDma();
         if (self.bus.takeDmaRequest()) |page| {
             var dma = OamDma.init(page, self.cpu.pc, self.cpu.cycles);
             var dma_cycles: u16 = 0;
@@ -85,18 +86,31 @@ pub const Nes = struct {
                 dma_cycles += 1;
                 const active = dma.tick(&self.bus, &self.ppu);
                 self.apu.tick(1);
+                dmc_cycles += self.serviceDmcDma();
                 for (0..3) |_| self.ppu.tickDot();
                 if (!active) break;
             }
-            self.cpu.cycles += dma_cycles;
-            return @as(u16, cycles) + dma_cycles;
+            self.cpu.cycles += dma_cycles + dmc_cycles;
+            return @as(u16, cycles) + dma_cycles + dmc_cycles;
         }
-        return cycles;
+        self.cpu.cycles += dmc_cycles;
+        return @as(u16, cycles) + dmc_cycles;
     }
 
     fn advanceDevices(self: *Nes, cpu_cycles: u8) void {
         self.apu.tick(cpu_cycles);
         for (0..@as(usize, cpu_cycles) * 3) |_| self.ppu.tickDot();
+    }
+
+    /// A DMC sample fetch occupies the CPU bus for four cycles. Service it
+    /// outside the CPU instruction boundary and inside OAM DMA alike, keeping
+    /// device clocks and the CPU cycle counter in the same timeline.
+    fn serviceDmcDma(self: *Nes) u16 {
+        const address = self.apu.takeDmcReadRequest() orelse return 0;
+        self.apu.provideDmcSample(self.bus.read(address));
+        self.apu.tick(4);
+        for (0..12) |_| self.ppu.tickDot();
+        return 4;
     }
 
     /// Runs until the next PPU frame boundary. The renderer is intentionally
@@ -133,6 +147,25 @@ test "Nes steps CPU from NROM and advances PPU three dots per CPU cycle" {
     try std.testing.expectEqual(@as(u16, 0x8001), nes.cpu.pc);
     try std.testing.expectEqual(@as(u16, 6), nes.ppu.dot);
     try std.testing.expectEqual(@as(u16, 0), nes.ppu.scanline);
+}
+
+test "Nes DMC fetch stalls the CPU four cycles and advances device clocks" {
+    var image: [16 + 16 * 1024]u8 = [_]u8{0} ** (16 + 16 * 1024);
+    image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    image[16] = 0xea; // NOP
+    image[16 + 0x3ffc] = 0x00;
+    image[16 + 0x3ffd] = 0x80;
+    const cartridge = try Cartridge.parse(&image);
+    var nes: Nes = undefined;
+    nes.init(cartridge);
+    _ = nes.apu.cpuWrite(0x4010, 0x0f);
+    _ = nes.apu.cpuWrite(0x4015, 0x10);
+
+    try std.testing.expectEqual(@as(u16, 6), try nes.step());
+    try std.testing.expectEqual(@as(u64, 13), nes.cpu.cycles); // reset's seven cycles plus NOP and DMC fetch
+    try std.testing.expectEqual(@as(u64, 6), nes.apu.cpu_cycles);
+    try std.testing.expectEqual(@as(u16, 18), nes.ppu.dot);
+    try std.testing.expect(nes.apu.dmc_sample_buffer != null);
 }
 
 test "Nes delivers PPU NMI at the next CPU instruction boundary" {

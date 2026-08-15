@@ -10,6 +10,7 @@ const length_table = [_]u8{
     12, 16,  24, 18, 48, 20, 96, 22, 192, 24, 72, 26, 16, 28, 32, 30,
 };
 const noise_period_table = [_]u16{ 4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068 };
+const dmc_period_table = [_]u16{ 428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 85, 72, 54 };
 
 /// RP2A03 APU slice. It produces deterministic mono PCM at 44.1 kHz in
 /// emulated CPU-cycle time. The pulse channels share their half-rate timer
@@ -48,6 +49,18 @@ pub const Apu = struct {
     noise_divider: u16 = 0,
     noise_shift: u15 = 1,
     noise_length: u8 = 0,
+    dmc_divider: u16 = 0,
+    dmc_output: u7 = 0,
+    dmc_sample_address: u16 = 0xc000,
+    dmc_sample_length: u16 = 1,
+    dmc_current_address: u16 = 0xc000,
+    dmc_bytes_remaining: u16 = 0,
+    dmc_sample_buffer: ?u8 = null,
+    dmc_shift: u8 = 0,
+    dmc_bits_remaining: u4 = 8,
+    dmc_silence: bool = true,
+    dmc_request_pending: bool = false,
+    dmc_irq: bool = false,
     sample_phase: u32 = 0,
 
     pub fn init(sink: AudioSink) Apu {
@@ -63,6 +76,11 @@ pub const Apu = struct {
             if (address == 0x4006 or address == 0x4007) self.reloadPulseTimer(.two);
             if (address == 0x400a or address == 0x400b) self.reloadTriangleTimer();
             if (address == 0x400e) self.reloadNoiseTimer();
+            if (address == 0x4010) self.reloadDmcTimer();
+            if (address == 0x4010 and value & 0x80 == 0) self.dmc_irq = false;
+            if (address == 0x4011) self.dmc_output = @truncate(value);
+            if (address == 0x4012) self.dmc_sample_address = 0xc000 | (@as(u16, value) << 6);
+            if (address == 0x4013) self.dmc_sample_length = (@as(u16, value) << 4) | 1;
             if (address == 0x4001) self.pulse1_sweep_reload = true;
             if (address == 0x4005) self.pulse2_sweep_reload = true;
             if (address == 0x4003 and self.channel_enable & 1 != 0) {
@@ -83,6 +101,7 @@ pub const Apu = struct {
         switch (address) {
             0x4015 => {
                 self.channel_enable = value & 0x1f;
+                self.dmc_irq = false;
                 if (self.channel_enable & 1 == 0) {
                     self.pulse1_step = 0;
                     self.pulse1_length = 0;
@@ -97,6 +116,7 @@ pub const Apu = struct {
                     self.triangle_linear_counter = 0;
                 }
                 if (self.channel_enable & 8 == 0) self.noise_length = 0;
+                if (self.channel_enable & 0x10 == 0) self.dmc_bytes_remaining = 0 else if (self.dmc_bytes_remaining == 0) self.restartDmc();
                 return true;
             },
             0x4017 => {
@@ -122,9 +142,11 @@ pub const Apu = struct {
             (@as(u8, @intFromBool(self.pulse2_length != 0)) << 1) |
             (@as(u8, @intFromBool(self.triangle_length != 0)) << 2) |
             (@as(u8, @intFromBool(self.noise_length != 0)) << 3) |
+            (@as(u8, @intFromBool(self.dmc_bytes_remaining != 0)) << 4) |
             (@as(u8, @intFromBool(self.frame_irq)) << 6);
+        const with_dmc_irq = value | (@as(u8, @intFromBool(self.dmc_irq)) << 7);
         self.frame_irq = false;
-        return value;
+        return with_dmc_irq;
     }
 
     /// Advances exactly one APU tick per CPU cycle. The 4-step sequence makes
@@ -138,6 +160,7 @@ pub const Apu = struct {
             self.tickPulses();
             self.tickTriangle();
             self.tickNoise();
+            self.tickDmc();
             self.sample_phase += sample_rate_hz;
             if (self.sample_phase >= cpu_clock_hz) {
                 self.sample_phase -= cpu_clock_hz;
@@ -148,7 +171,24 @@ pub const Apu = struct {
     }
 
     pub fn frameIrqPending(self: *const Apu) bool {
-        return self.frame_irq;
+        return self.frame_irq or self.dmc_irq;
+    }
+
+    pub fn takeDmcReadRequest(self: *Apu) ?u16 {
+        if (!self.dmc_request_pending) return null;
+        self.dmc_request_pending = false;
+        return self.dmc_current_address;
+    }
+
+    pub fn provideDmcSample(self: *Apu, value: u8) void {
+        if (self.dmc_sample_buffer != null or self.dmc_bytes_remaining == 0) return;
+        self.dmc_sample_buffer = value;
+        self.dmc_current_address +%= 1;
+        if (self.dmc_current_address == 0) self.dmc_current_address = 0x8000;
+        self.dmc_bytes_remaining -= 1;
+        if (self.dmc_bytes_remaining == 0) {
+            if (self.registers[16] & 0x40 != 0) self.restartDmc() else if (self.registers[16] & 0x80 != 0) self.dmc_irq = true;
+        }
     }
 
     fn clockFrameSequencer(self: *Apu) void {
@@ -358,8 +398,46 @@ pub const Apu = struct {
         return @as(i16, self.registers[12] & 0x0f) * 1024;
     }
 
+    fn reloadDmcTimer(self: *Apu) void {
+        self.dmc_divider = dmc_period_table[self.registers[16] & 0x0f] - 1;
+    }
+
+    fn restartDmc(self: *Apu) void {
+        self.dmc_current_address = self.dmc_sample_address;
+        self.dmc_bytes_remaining = self.dmc_sample_length;
+    }
+
+    fn tickDmc(self: *Apu) void {
+        if (self.dmc_sample_buffer == null and self.dmc_bytes_remaining != 0) self.dmc_request_pending = true;
+        if (self.dmc_divider != 0) {
+            self.dmc_divider -= 1;
+            return;
+        }
+        self.reloadDmcTimer();
+        if (!self.dmc_silence) {
+            if (self.dmc_shift & 1 != 0) {
+                if (self.dmc_output <= 125) self.dmc_output += 2;
+            } else if (self.dmc_output >= 2) self.dmc_output -= 2;
+        }
+        self.dmc_shift >>= 1;
+        self.dmc_bits_remaining -= 1;
+        if (self.dmc_bits_remaining == 0) {
+            self.dmc_bits_remaining = 8;
+            if (self.dmc_sample_buffer) |sample| {
+                self.dmc_shift = sample;
+                self.dmc_sample_buffer = null;
+                self.dmc_silence = false;
+            } else self.dmc_silence = true;
+        }
+    }
+
+    fn dmcSample(self: *const Apu) i16 {
+        if (self.channel_enable & 0x10 == 0) return 0;
+        return (@as(i16, self.dmc_output) - 64) * 256;
+    }
+
     fn mixedSample(self: *const Apu) i16 {
-        const mixed: i32 = @as(i32, self.mixedPulseSample()) + self.triangleSample() + self.noiseSample();
+        const mixed: i32 = @as(i32, self.mixedPulseSample()) + self.triangleSample() + self.noiseSample() + self.dmcSample();
         return @intCast(std.math.clamp(mixed, @as(i32, std.math.minInt(i16)), @as(i32, std.math.maxInt(i16))));
     }
 
@@ -387,7 +465,7 @@ test "APU stores CPU-visible registers and reports frame IRQ through $4015" {
 
     apu.tick(14915);
     try std.testing.expect(apu.frameIrqPending());
-    try std.testing.expectEqual(@as(?u8, 0x40), apu.cpuRead(0x4015));
+    try std.testing.expectEqual(@as(?u8, 0x50), apu.cpuRead(0x4015));
     try std.testing.expect(!apu.frameIrqPending());
 }
 
@@ -500,6 +578,27 @@ test "APU invalid pulse sweep target mutes without changing its timer" {
     try std.testing.expectEqual(@as(i16, 0), apu.pulseSample(.one));
     apu.clockPulseSweeps();
     try std.testing.expectEqual(@as(u16, 0x700), apu.pulseTimerPeriod(.one));
+}
+
+test "APU DMC requests CPU memory and raises IRQ at sample end" {
+    var null_sink = NullAudioSink{};
+    var apu = Apu.init(null_sink.asSink());
+    _ = apu.cpuWrite(0x4010, 0x8f); // IRQ enabled, fastest rate
+    _ = apu.cpuWrite(0x4012, 2);
+    _ = apu.cpuWrite(0x4013, 0);
+    _ = apu.cpuWrite(0x4015, 0x10);
+    apu.tick(1);
+    try std.testing.expectEqual(@as(?u16, 0xc080), apu.takeDmcReadRequest());
+    apu.provideDmcSample(0x01);
+    try std.testing.expectEqual(@as(u16, 0), apu.dmc_bytes_remaining);
+    try std.testing.expect(apu.dmc_irq);
+    try std.testing.expectEqual(@as(?u8, 0x80), apu.cpuRead(0x4015));
+    _ = apu.cpuWrite(0x4011, 0x7f);
+    try std.testing.expectEqual(@as(u7, 0x7f), apu.dmc_output);
+    _ = apu.cpuWrite(0x4010, 0x0f);
+    try std.testing.expect(!apu.dmc_irq);
+    _ = apu.cpuWrite(0x4015, 0);
+    try std.testing.expect(!apu.dmc_irq);
 }
 
 test "APU triangle clocks its linear counter and timer independently" {
