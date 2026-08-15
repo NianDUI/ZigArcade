@@ -3,6 +3,9 @@ const std = @import("std");
 const poll_interval_ms = 50;
 const escape_prefix_grace_timeouts = 8;
 const apc_discard_grace_timeouts = 16;
+const kitty_keyboard_push_state = "\x1b[>u";
+const kitty_keyboard_enable_all_events = "\x1b[=11;1u";
+const kitty_keyboard_pop_state = "\x1b[<u";
 var pending_signal = std.atomic.Value(u32).init(0);
 
 pub const Key = union(enum) {
@@ -11,6 +14,7 @@ pub const Key = union(enum) {
     down,
     left,
     right,
+    interrupt,
 };
 
 /// Legacy terminals expose only a press-like byte stream. Kitty Keyboard
@@ -60,6 +64,12 @@ pub const Session = struct {
     apc_discard_timeouts: u8 = 0,
     escape_prefix_pending: bool = false,
     escape_prefix_timeouts: u8 = 0,
+    csi_pending: bool = false,
+    csi_params: [32]u8 = undefined,
+    csi_params_len: usize = 0,
+    csi_timeouts: u8 = 0,
+    legacy_escape_enabled: bool = true,
+    reports_key_state_events: bool = false,
 
     pub fn enter(self: *Session, io: std.Io, output: *std.Io.Writer) !void {
         if (!try std.Io.File.stdin().isTty(io) or !try std.Io.File.stdout().isTty(io)) {
@@ -76,6 +86,25 @@ pub const Session = struct {
         self.deactivate(output);
         self.restoreSignalHandlers();
         self.* = .{};
+    }
+
+    /// Kitty Keyboard Protocol reports an explicit press/release state for
+    /// Escape. Once a Kitty graphics session is active, a bare ESC byte can
+    /// instead be fragmented terminal protocol traffic, so callers can turn
+    /// off that ambiguous legacy exit path.
+    pub fn setLegacyEscapeEnabled(self: *Session, enabled: bool) void {
+        self.legacy_escape_enabled = enabled;
+    }
+
+    pub fn legacyEscapeEnabled(self: *const Session) bool {
+        return self.legacy_escape_enabled;
+    }
+
+    /// Some terminals send a plain text byte for the initial press but still
+    /// report later repeat/release events. Once such an event is observed,
+    /// callers can safely hold that initial byte until its release.
+    pub fn reportsKeyStateEvents(self: *const Session) bool {
+        return self.reports_key_state_events;
     }
 
     /// Queues ordinary bytes observed by a protocol probe so the game input
@@ -100,6 +129,7 @@ pub const Session = struct {
     pub fn nextEventTimeout(self: *Session, timeout_ms: i32) !Event {
         if (takePendingSignal()) |signal| return eventForSignal(signal);
         if (self.apc_discarding) return self.continueDiscardingApc(timeout_ms);
+        if (self.csi_pending) return self.continueCsi(timeout_ms);
         if (self.escape_prefix_pending) return self.continueEscapePrefix(timeout_ms);
 
         var fds = [_]std.posix.pollfd{.{
@@ -124,7 +154,7 @@ pub const Session = struct {
                 self.escape_prefix_timeouts +%= 1;
                 if (self.escape_prefix_timeouts < escape_prefix_grace_timeouts) return .none;
                 self.escape_prefix_pending = false;
-                return .{ .key = .{ .key = .{ .byte = 0x1b }, .state = .legacy } };
+                return .{ .exit = .escape };
             },
             .input_closed => {
                 self.escape_prefix_pending = false;
@@ -146,23 +176,44 @@ pub const Session = struct {
         // terminator may arrive after a fragmented reply; it is never a game
         // key and must not become a legacy Escape event.
         if (csi == '\\') return .none;
-        if (csi != '[') return .{ .key = .{ .key = .{ .byte = 0x1b }, .state = .legacy } };
+        if (csi != '[') return .none;
 
-        var params: [32]u8 = undefined;
-        var len: usize = 0;
-        while (len < params.len) {
-            const next = switch (try self.readByteWithTimeout(5)) {
-                .byte => |value| value,
-                .timeout => return .{ .key = .{ .key = .{ .byte = 0x1b }, .state = .legacy } },
-                .input_closed => return .{ .exit = .input_closed },
-            };
-            if (next >= 0x40 and next <= 0x7e) {
-                return .{ .key = keyEventForCsi(params[0..len], next) orelse .{ .key = .{ .byte = 0x1b }, .state = .legacy } };
-            }
-            params[len] = next;
-            len += 1;
+        self.csi_pending = true;
+        self.csi_params_len = 0;
+        self.csi_timeouts = 0;
+        return self.continueCsi(5);
+    }
+
+    /// A CSI sequence can be split across OS reads just like an APC reply.
+    /// Preserve its parsed parameters until a final byte arrives so a delayed
+    /// suffix is never reinterpreted as ordinary game input.
+    fn continueCsi(self: *Session, timeout_ms: i32) !Event {
+        const next = switch (try self.readByteWithTimeout(timeout_ms)) {
+            .byte => |value| value,
+            .timeout => {
+                self.csi_timeouts +%= 1;
+                if (self.csi_timeouts >= escape_prefix_grace_timeouts) self.csi_pending = false;
+                return .none;
+            },
+            .input_closed => {
+                self.csi_pending = false;
+                return .{ .exit = .input_closed };
+            },
+        };
+        self.csi_timeouts = 0;
+        if (next >= 0x40 and next <= 0x7e) {
+            self.csi_pending = false;
+            const event = keyEventForCsi(self.csi_params[0..self.csi_params_len], next) orelse return .none;
+            if (event.state != .legacy) self.reports_key_state_events = true;
+            return .{ .key = event };
         }
-        return .{ .key = .{ .key = .{ .byte = 0x1b }, .state = .legacy } };
+        if (self.csi_params_len == self.csi_params.len) {
+            self.csi_pending = false;
+            return .none;
+        }
+        self.csi_params[self.csi_params_len] = next;
+        self.csi_params_len += 1;
+        return self.continueCsi(0);
     }
 
     /// Discards a terminal APC reply over as many event-loop calls as needed.
@@ -241,16 +292,17 @@ pub const Session = struct {
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw);
         errdefer std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, saved) catch {};
 
-        // 0b1011: disambiguate escape, report press/repeat/release, and
-        // encode text keys too. Unsupported terminals ignore this request and
-        // keep their normal legacy byte stream.
-        try output.writeAll("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[>11u");
+        // Save the terminal's mode, then enable 0b1011: disambiguated
+        // escapes, press/repeat/release events, and text keys encoded as
+        // CSI-u. Unsupported terminals ignore both requests and retain their
+        // legacy byte stream.
+        try output.writeAll("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H" ++ kitty_keyboard_push_state ++ kitty_keyboard_enable_all_events);
         self.active = true;
     }
 
     fn deactivate(self: *Session, output: *std.Io.Writer) void {
         if (!self.active) return;
-        output.writeAll("\x1b[<u\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
+        output.writeAll(kitty_keyboard_pop_state ++ "\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
         if (self.original_termios) |saved| std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, saved) catch {};
         self.active = false;
     }
@@ -307,10 +359,22 @@ fn keyForCursorSequence(final: u8) ?Key {
 fn keyEventForCsi(params: []const u8, final: u8) ?KeyEvent {
     const key = switch (final) {
         'A', 'B', 'C', 'D' => keyForCursorSequence(final).?,
-        'u' => keyForCodepoint(params) orelse return null,
+        'u' => if (isControlC(params)) .interrupt else keyForCodepoint(params) orelse return null,
         else => return null,
     };
     return .{ .key = key, .state = keyStateForCsi(params) };
+}
+
+/// Kitty keyboard mode encodes Ctrl-C as CSI 99;5[:event]u instead of the
+/// ETX byte, so the operating system never raises SIGINT. Preserve the
+/// conventional terminal escape hatch as an explicit event for the caller.
+fn isControlC(params: []const u8) bool {
+    const separator = std.mem.indexOfScalar(u8, params, ';') orelse return false;
+    if (!std.mem.eql(u8, params[0..separator], "99")) return false;
+    var end = separator + 1;
+    while (end < params.len and params[end] != ':') : (end += 1) {}
+    const encoded_modifiers = std.fmt.parseInt(u8, params[separator + 1 .. end], 10) catch return false;
+    return encoded_modifiers > 0 and (encoded_modifiers - 1) & 0b100 != 0;
 }
 
 fn keyForCodepoint(params: []const u8) ?Key {
@@ -387,7 +451,38 @@ test "Kitty keyboard events preserve press repeat and release" {
     try std.testing.expectEqual(KeyState.release, released.state);
     try std.testing.expectEqual(Key{ .byte = 'w' }, released.key);
     try std.testing.expectEqual(KeyState.legacy, keyEventForCsi("", 'C').?.state);
+    try std.testing.expectEqual(Key.interrupt, keyEventForCsi("99;5:1", 'u').?.key);
+    try std.testing.expectEqual(Key{ .byte = 0x1b }, keyEventForCsi("27;1:1", 'u').?.key);
     try std.testing.expect(keyEventForCsi("57358;1:1", 'u') == null);
+}
+
+test "terminal detects repeat and release capable input" {
+    var session: Session = .{};
+    session.escape_prefix_pending = true;
+    try session.queueInput("[122;1:2u");
+    const event = try session.continueEscapePrefix(0);
+    try std.testing.expectEqual(KeyState.repeat, event.key.state);
+    try std.testing.expect(session.reportsKeyStateEvents());
+}
+
+test "fragmented CSI input retains its prefix until completed" {
+    var session: Session = .{};
+    session.escape_prefix_pending = true;
+    try session.queueInput("[122;1:");
+    try std.testing.expectEqual(Event.none, try session.continueEscapePrefix(0));
+    try std.testing.expect(session.csi_pending);
+
+    try session.queueInput("1u");
+    const event = try session.continueCsi(0);
+    try std.testing.expectEqual(KeyState.press, event.key.state);
+    try std.testing.expectEqual(Key{ .byte = 'z' }, event.key.key);
+    try std.testing.expect(!session.csi_pending);
+}
+
+test "terminal enables and restores Kitty keyboard event reporting" {
+    try std.testing.expectEqualStrings("\x1b[>u", kitty_keyboard_push_state);
+    try std.testing.expectEqualStrings("\x1b[=11;1u", kitty_keyboard_enable_all_events);
+    try std.testing.expectEqualStrings("\x1b[<u", kitty_keyboard_pop_state);
 }
 
 test "terminal queues probe-time user input in order" {
@@ -436,4 +531,28 @@ test "terminal ignores an orphan terminal string terminator" {
     session.escape_prefix_pending = true;
     try session.queueInput("\\");
     try std.testing.expectEqual(Event.none, try session.continueEscapePrefix(0));
+}
+
+test "only a lone legacy Escape exits" {
+    var session: Session = .{};
+    session.escape_prefix_pending = true;
+    session.escape_prefix_timeouts = escape_prefix_grace_timeouts - 1;
+    try std.testing.expectEqual(Event{ .exit = .escape }, try session.continueEscapePrefix(0));
+
+    session = .{};
+    session.escape_prefix_pending = true;
+    try session.queueInput("O"); // an SS3-style non-Escape sequence
+    try std.testing.expectEqual(Event.none, try session.continueEscapePrefix(0));
+
+    session = .{};
+    session.escape_prefix_pending = true;
+    try session.queueInput("[999~"); // unrecognized CSI, never a lone Escape
+    try std.testing.expectEqual(Event.none, try session.continueEscapePrefix(0));
+}
+
+test "Kitty sessions can reject an ambiguous legacy Escape byte" {
+    var session: Session = .{};
+    try std.testing.expect(session.legacyEscapeEnabled());
+    session.setLegacyEscapeEnabled(false);
+    try std.testing.expect(!session.legacyEscapeEnabled());
 }

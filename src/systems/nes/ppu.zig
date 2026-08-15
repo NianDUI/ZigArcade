@@ -57,6 +57,16 @@ pub const Ppu = struct {
     presentation_nametable: u2 = 0,
     presentation_ctrl: u8 = 0,
     presentation_mask: u8 = 0,
+    // The simplified renderer samples a whole frame at VBlank, but games
+    // commonly split the next frame after Sprite 0. Keep the initial display
+    // state for hit detection separate from later gameplay scroll writes.
+    sprite_zero_scroll_x: u8 = 0,
+    sprite_zero_scroll_y: u8 = 0,
+    sprite_zero_nametable: u2 = 0,
+    sprite_zero_ctrl: u8 = 0,
+    sprite_zero_setup_pending: bool = true,
+    sprite_zero_scroll_writes: u2 = 0,
+    sprite_zero_ctrl_captured: bool = false,
     write_toggle: bool = false,
     read_buffer: u8 = 0,
     open_bus: u8 = 0,
@@ -64,6 +74,12 @@ pub const Ppu = struct {
     dot: u16 = 0,
     frame_number: u64 = 0,
     nmi_pending: bool = false,
+    /// Observable timing telemetry for diagnosing games that synchronize on
+    /// PPUSTATUS bit 6. It does not influence emulation state or rendering.
+    sprite_zero_hit_count: u64 = 0,
+    last_sprite_zero_hit_frame: u64 = 0,
+    last_sprite_zero_hit_scanline: u16 = 0,
+    last_sprite_zero_hit_dot: u16 = 0,
 
     pub fn init(mapper: anytype) Ppu {
         return switch (@TypeOf(mapper)) {
@@ -78,6 +94,7 @@ pub const Ppu = struct {
     pub fn tickDot(self: *Ppu) void {
         if (self.scanline == 241 and self.dot == 1) {
             self.latchPresentationState();
+            self.latchSpriteZeroState();
             self.status |= 0x80;
             if (self.ctrl & 0x80 != 0) self.nmi_pending = true;
         } else if (self.scanline == 261 and self.dot == 1) {
@@ -131,7 +148,7 @@ pub const Ppu = struct {
         if (screen_x == 255) return;
 
         const sprite_y = @as(usize, self.oam[0]) + 1;
-        const sprite_height: usize = if (self.ctrl & 0x20 != 0) 16 else 8;
+        const sprite_height: usize = if (self.sprite_zero_ctrl & 0x20 != 0) 16 else 8;
         if (self.scanline < sprite_y or self.scanline >= sprite_y + sprite_height) return;
 
         const sprite_x = @as(usize, self.oam[3]);
@@ -141,7 +158,7 @@ pub const Ppu = struct {
         const attributes = self.oam[2];
         const local_y = @as(usize, self.scanline) - sprite_y;
         const source_y = if (attributes & 0x80 != 0) sprite_height - 1 - local_y else local_y;
-        const tile_address = self.currentSpriteTileAddress(self.oam[1], source_y);
+        const tile_address = spriteTileAddressForControl(self.sprite_zero_ctrl, self.oam[1], source_y);
         const local_x = screen_x - sprite_x;
         const source_x = if (attributes & 0x40 != 0) local_x else 7 - local_x;
         const bit: u3 = @intCast(source_x);
@@ -151,6 +168,19 @@ pub const Ppu = struct {
         if (!self.currentBackgroundOpaque(screen_x, self.scanline)) return;
 
         self.status |= 0x40;
+        self.sprite_zero_hit_count += 1;
+        self.last_sprite_zero_hit_frame = self.frame_number;
+        self.last_sprite_zero_hit_scanline = self.scanline;
+        self.last_sprite_zero_hit_dot = self.dot;
+    }
+
+    pub fn spriteZeroHitTelemetry(self: *const Ppu) SpriteZeroHitTelemetry {
+        return .{
+            .count = self.sprite_zero_hit_count,
+            .frame = self.last_sprite_zero_hit_frame,
+            .scanline = self.last_sprite_zero_hit_scanline,
+            .dot = self.last_sprite_zero_hit_dot,
+        };
     }
 
     /// Sprite evaluation starts shortly after each visible scanline begins.
@@ -163,9 +193,9 @@ pub const Ppu = struct {
         }
     }
 
-    fn currentSpriteTileAddress(self: *const Ppu, tile: u8, source_y: usize) u16 {
-        if (self.ctrl & 0x20 == 0) {
-            const pattern_base: u16 = if (self.ctrl & 0x08 != 0) 0x1000 else 0;
+    fn spriteTileAddressForControl(ctrl: u8, tile: u8, source_y: usize) u16 {
+        if (ctrl & 0x20 == 0) {
+            const pattern_base: u16 = if (ctrl & 0x08 != 0) 0x1000 else 0;
             return pattern_base + @as(u16, tile) * 16 + @as(u16, @intCast(source_y));
         }
         const pattern_base: u16 = if (tile & 1 != 0) 0x1000 else 0;
@@ -175,10 +205,10 @@ pub const Ppu = struct {
 
     fn currentBackgroundOpaque(self: *const Ppu, screen_x: usize, screen_y: usize) bool {
         if (screen_x < 8 and self.mask & 0x02 == 0) return false;
-        const world_x = (screen_x + self.pending_scroll_x) % 512;
-        const world_y = (screen_y + self.pending_scroll_y) % 480;
-        const base_x: u16 = self.pending_nametable & 1;
-        const base_y: u16 = self.pending_nametable >> 1;
+        const world_x = (screen_x + self.sprite_zero_scroll_x) % 512;
+        const world_y = (screen_y + self.sprite_zero_scroll_y) % 480;
+        const base_x: u16 = self.sprite_zero_nametable & 1;
+        const base_y: u16 = self.sprite_zero_nametable >> 1;
         const nametable_x = (base_x + @as(u16, @intCast(world_x / 256))) & 1;
         const nametable_y = (base_y + @as(u16, @intCast(world_y / 240))) & 1;
         const nametable_base = 0x2000 + ((nametable_y << 1 | nametable_x) << 10);
@@ -186,7 +216,7 @@ pub const Ppu = struct {
         const local_y = world_y % 240;
         const tile = self.readMemory(nametable_base + @as(u16, @intCast((local_y / 8) * 32 + local_x / 8)));
         const row: u16 = @intCast(local_y & 7);
-        const pattern_base: u16 = if (self.ctrl & 0x10 != 0) 0x1000 else 0;
+        const pattern_base: u16 = if (self.sprite_zero_ctrl & 0x10 != 0) 0x1000 else 0;
         const tile_address = pattern_base + @as(u16, tile) * 16 + row;
         const shift: u3 = @intCast(7 - (local_x & 7));
         return ((self.readMemory(tile_address) >> shift) & 1) |
@@ -202,6 +232,16 @@ pub const Ppu = struct {
         self.presentation_nametable = self.pending_nametable;
         self.presentation_ctrl = self.ctrl;
         self.presentation_mask = self.mask;
+    }
+
+    fn latchSpriteZeroState(self: *Ppu) void {
+        self.sprite_zero_scroll_x = self.pending_scroll_x;
+        self.sprite_zero_scroll_y = self.pending_scroll_y;
+        self.sprite_zero_nametable = self.pending_nametable;
+        self.sprite_zero_ctrl = self.ctrl;
+        self.sprite_zero_setup_pending = true;
+        self.sprite_zero_scroll_writes = 0;
+        self.sprite_zero_ctrl_captured = false;
     }
 
     pub fn takeNmi(self: *Ppu) bool {
@@ -398,6 +438,11 @@ pub const Ppu = struct {
                 self.ctrl = value;
                 self.t = (self.t & ~@as(u16, 0x0c00)) | (@as(u16, value & 0x03) << 10);
                 self.pending_nametable = @truncate(value);
+                if (!self.sprite_zero_ctrl_captured) {
+                    self.sprite_zero_nametable = @truncate(value);
+                    self.sprite_zero_ctrl = value;
+                    self.sprite_zero_ctrl_captured = true;
+                }
                 if (!had_nmi_enabled and value & 0x80 != 0 and self.status & 0x80 != 0) {
                     self.nmi_pending = true;
                 }
@@ -435,13 +480,19 @@ pub const Ppu = struct {
             self.t = (self.t & ~@as(u16, 0x001f)) | @as(u16, value >> 3);
             self.fine_x = @truncate(value);
             self.pending_scroll_x = value;
+            if (self.sprite_zero_setup_pending) self.sprite_zero_scroll_x = value;
         } else {
             self.t = (self.t & ~@as(u16, 0x73e0)) |
                 (@as(u16, value & 0x07) << 12) |
                 (@as(u16, value & 0xf8) << 2);
             self.pending_scroll_y = value;
+            if (self.sprite_zero_setup_pending) self.sprite_zero_scroll_y = value;
         }
         self.write_toggle = !self.write_toggle;
+        if (self.sprite_zero_setup_pending) {
+            self.sprite_zero_scroll_writes += 1;
+            if (self.sprite_zero_scroll_writes == 2) self.sprite_zero_setup_pending = false;
+        }
     }
 
     fn writeAddress(self: *Ppu, value: u8) void {
@@ -496,6 +547,13 @@ pub const Ppu = struct {
         if (index & 0x13 == 0x10) index -%= 0x10;
         return index;
     }
+};
+
+pub const SpriteZeroHitTelemetry = struct {
+    count: u64,
+    frame: u64,
+    scanline: u16,
+    dot: u16,
 };
 
 test "PPU nametable and palette mirrors follow Mapper 0 mirroring" {
@@ -655,12 +713,46 @@ test "sprite-0 hit is raised on the overlapping visible PPU dot" {
     ppu.dot = 1;
     ppu.tickDot();
     try std.testing.expect(ppu.status & 0x40 != 0);
+    const hit = ppu.spriteZeroHitTelemetry();
+    try std.testing.expectEqual(@as(u64, 1), hit.count);
+    try std.testing.expectEqual(@as(u16, 1), hit.scanline);
+    try std.testing.expectEqual(@as(u16, 1), hit.dot);
 
     ppu.status &= ~@as(u8, 0x40);
     ppu.mask = 0x18; // clipped at the left edge
     ppu.dot = 1;
     ppu.tickDot();
     try std.testing.expect(ppu.status & 0x40 == 0);
+}
+
+test "sprite-0 state keeps the first VBlank display setup" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.pending_scroll_x = 44;
+    ppu.pending_scroll_y = 12;
+    ppu.pending_nametable = 1;
+    ppu.ctrl = 0x91;
+    ppu.scanline = 241;
+    ppu.dot = 1;
+    ppu.tickDot();
+
+    // Some games write scroll before PPUCTRL during their VBlank handler;
+    // capture the first display setup regardless of that ordering.
+    ppu.cpuWrite(5, 0);
+    ppu.cpuWrite(5, 0);
+    ppu.cpuWrite(0, 0x10); // display setup for the status-bar scanlines
+    ppu.cpuWrite(0, 0x15); // temporary VRAM-upload increment/nametable mode
+
+    try std.testing.expectEqual(@as(u8, 0), ppu.sprite_zero_scroll_x);
+    try std.testing.expectEqual(@as(u8, 0), ppu.sprite_zero_scroll_y);
+    try std.testing.expectEqual(@as(u2, 0), ppu.sprite_zero_nametable);
+    try std.testing.expectEqual(@as(u8, 0x10), ppu.sprite_zero_ctrl);
 }
 
 test "PPUMASK disables layers and leaves the universal backdrop" {

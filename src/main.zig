@@ -39,6 +39,7 @@ const max_framehash_frames: u32 = 10_000;
 const NesRunOptions = struct {
     renderer: Renderer = .auto,
     log_path: ?[]const u8 = null,
+    replay_path: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -112,6 +113,9 @@ fn parseNesRunOptions(args: []const []const u8) !NesRunOptions {
         } else if (std.mem.eql(u8, args[index], "--log")) {
             if (options.log_path != null or args[index + 1].len == 0) return error.InvalidArguments;
             options.log_path = args[index + 1];
+        } else if (std.mem.eql(u8, args[index], "--replay")) {
+            if (options.replay_path != null or args[index + 1].len == 0) return error.InvalidArguments;
+            options.replay_path = args[index + 1];
         } else {
             return error.InvalidArguments;
         }
@@ -311,27 +315,67 @@ fn runNesWithOptions(init: std.process.Init, rom_path: []const u8, options: NesR
     defer leavePresentation(&session, output);
 
     var renderer = try selectRenderer(init.io, output, &session, options.renderer);
+    // The terminal parser already consumes Kitty graphics APC replies, so a
+    // lone legacy Escape remains a reliable fallback when keyboard-event
+    // negotiation is unavailable.
+    session.setLegacyEscapeEnabled(true);
     var logger = RunLogger{};
     try logger.open(init.io, options.log_path);
     defer logger.deinit(init.io);
     try logger.write(init.io, "start renderer={s} rom={s}\n", .{ @tagName(renderer), rom_path });
+    var replay = if (options.replay_path) |path| try InputReplay.load(init.io, path, init.arena.allocator()) else null;
     var held_actions = Actions{};
-    var held_frames: u8 = 0;
+    var legacy_actions = Actions{};
+    var legacy_frames: u8 = 0;
     var presented_frames: u64 = 0;
     var next_frame_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).addDuration(nesFrameDuration());
     while (true) {
-        nes.controllers.ports[0].setHostButtons(buttonsFromActions(consumeHeldActions(&held_actions, &held_frames)));
+        const next_frame = nes.ppu.frame_number + 1;
+        const actions = if (replay) |*source|
+            source.actionForFrame(next_frame) orelse break
+        else
+            mergeActions(held_actions, consumeLegacyActions(&legacy_actions, &legacy_frames));
+        nes.controllers.ports[0].setHostButtons(buttonsFromActions(actions));
+        const logged_frame = logger.enabled();
+        if (logged_frame) {
+            try logger.write(init.io, "frame={d} input_actions={x:0>4}\n", .{ next_frame, @as(u16, @bitCast(actions)) });
+            try logger.write(init.io, "frame={d} emulate=begin pc={x:0>4}\n", .{ next_frame, nes.cpu.pc });
+        }
+        const emulation_started = if (logged_frame) std.Io.Clock.Timestamp.now(init.io, .awake) else undefined;
         const frame = try nes.runFrame();
+        if (logged_frame) {
+            const emulation_finished = std.Io.Clock.Timestamp.now(init.io, .awake);
+            const sprite_zero_hit = nes.ppu.spriteZeroHitTelemetry();
+            const player = smbPlayerTelemetry(&nes.bus.memory);
+            try logger.write(
+                init.io,
+                "frame={d} emulate=end duration_ms={d} rgb_hash={d} sprite0_hits={d} sprite0_last={d}:{d}:{d}\n",
+                .{
+                    frame.frame_number,
+                    elapsedMilliseconds(emulation_started, emulation_finished),
+                    std.hash.Wyhash.hash(0, frame.pixels),
+                    sprite_zero_hit.count,
+                    sprite_zero_hit.frame,
+                    sprite_zero_hit.scanline,
+                    sprite_zero_hit.dot,
+                },
+            );
+            try logger.write(
+                init.io,
+                "frame={d} player state={x:0>2} x={d} y={d} xs={d} ys={d}\n",
+                .{ frame.frame_number, player.state, player.world_x, player.y, player.x_speed, player.y_speed },
+            );
+        }
         // Emulation advances one NTSC frame each loop (about 60 Hz). The
         // terminal is intentionally updated every second emulated frame to
         // cap the initial presentation path near 30 FPS; never slow or skip
         // the emulated clock just because a frame was not presented.
         if (shouldPresentFrame(frame.frame_number)) {
-            const logged_frame = shouldLogNesFrame(frame.frame_number);
             if (logged_frame) try logger.write(init.io, "frame={d} present=begin\n", .{frame.frame_number});
             const present_started = std.Io.Clock.Timestamp.now(init.io, .awake);
             try appendExitPrompt(init.io, output);
             try appendPresentedFrame(init.io, output, renderer, frame);
+            if (logged_frame) try logger.write(init.io, "frame={d} present=encoded\n", .{frame.frame_number});
             try output.flush();
             presented_frames += 1;
             if (logged_frame) {
@@ -343,7 +387,7 @@ fn runNesWithOptions(init: std.process.Init, rom_path: []const u8, options: NesR
                 );
             }
         }
-        switch (try waitForNextNesFrame(init.io, &session, &next_frame_deadline, &held_actions, &held_frames)) {
+        switch (try waitForNextNesFrame(init.io, &session, &next_frame_deadline, &held_actions, &legacy_actions, &legacy_frames, &logger)) {
             .exit => |reason| {
                 try logger.write(init.io, "frame={d} terminal=exit reason={s}\n", .{ frame.frame_number, @tagName(reason) });
                 break;
@@ -353,6 +397,7 @@ fn runNesWithOptions(init: std.process.Init, rom_path: []const u8, options: NesR
                 try kitty.appendDeleteAll(output);
                 try session.suspendAndResume(output);
                 renderer = try selectRenderer(init.io, output, &session, options.renderer);
+                session.setLegacyEscapeEnabled(true);
                 next_frame_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).addDuration(nesFrameDuration());
                 try logger.write(init.io, "frame={d} terminal=resumed renderer={s}\n", .{ frame.frame_number, @tagName(renderer) });
             },
@@ -381,6 +426,10 @@ const RunLogger = struct {
         if (self.file) |file| file.close(io);
     }
 
+    fn enabled(self: *const RunLogger) bool {
+        return self.writer != null;
+    }
+
     fn write(self: *RunLogger, io: std.Io, comptime format: []const u8, args: anytype) !void {
         _ = io;
         if (self.writer) |*writer| {
@@ -390,8 +439,72 @@ const RunLogger = struct {
     }
 };
 
-fn shouldLogNesFrame(frame_number: u64) bool {
-    return frame_number % 60 == 1;
+/// Final controller state for each emulated frame. This records after host
+/// input has been merged, so replay is independent of terminal event timing.
+const InputReplay = struct {
+    actions: []Actions,
+    frame_count: usize,
+
+    fn load(io: std.Io, path: []const u8, allocator: std.mem.Allocator) !InputReplay {
+        const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8 * 1024 * 1024));
+        return parse(allocator, contents);
+    }
+
+    fn parse(allocator: std.mem.Allocator, contents: []const u8) !InputReplay {
+        var found = false;
+        var expected_frame: usize = 1;
+        var lines = std.mem.splitScalar(u8, contents, '\n');
+        while (lines.next()) |line| {
+            const marker = std.mem.indexOf(u8, line, " input_actions=") orelse continue;
+            if (!std.mem.startsWith(u8, line, "frame=")) return error.InvalidReplay;
+            const frame_number = std.fmt.parseInt(usize, line["frame=".len..marker], 10) catch return error.InvalidReplay;
+            if (frame_number != expected_frame) return error.InvalidReplay;
+            _ = std.fmt.parseInt(u16, line[marker + " input_actions=".len ..], 16) catch return error.InvalidReplay;
+            expected_frame = std.math.add(usize, expected_frame, 1) catch return error.InvalidReplay;
+            found = true;
+        }
+        if (!found) return error.InvalidReplay;
+
+        const frame_count = expected_frame - 1;
+        const actions = try allocator.alloc(Actions, frame_count);
+        errdefer allocator.free(actions);
+        var index: usize = 0;
+        lines = std.mem.splitScalar(u8, contents, '\n');
+        while (lines.next()) |line| {
+            const marker = std.mem.indexOf(u8, line, " input_actions=") orelse continue;
+            const encoded_actions = std.fmt.parseInt(u16, line[marker + " input_actions=".len ..], 16) catch unreachable;
+            actions[index] = @bitCast(encoded_actions);
+            index += 1;
+        }
+        return .{ .actions = actions, .frame_count = frame_count };
+    }
+
+    fn actionForFrame(self: *const InputReplay, frame_number: u64) ?Actions {
+        if (frame_number == 0 or frame_number > self.frame_count) return null;
+        return self.actions[@intCast(frame_number - 1)];
+    }
+};
+
+const SmbPlayerTelemetry = struct {
+    state: u8,
+    world_x: u16,
+    y: u8,
+    x_speed: i8,
+    y_speed: i8,
+};
+
+/// Super Mario Bros. (NROM) player variables. The values are recorded next
+/// to each input frame so an input replay can be compared with its movement,
+/// jump ascent, and landing without relying only on frame hashes.
+fn smbPlayerTelemetry(ram: []const u8) SmbPlayerTelemetry {
+    std.debug.assert(ram.len >= 0x00cf);
+    return .{
+        .state = ram[0x000e],
+        .world_x = (@as(u16, ram[0x006d]) << 8) | ram[0x0086],
+        .y = ram[0x00ce],
+        .x_speed = @bitCast(ram[0x0057]),
+        .y_speed = @bitCast(ram[0x009f]),
+    };
 }
 
 fn elapsedMilliseconds(start: std.Io.Clock.Timestamp, end: std.Io.Clock.Timestamp) u64 {
@@ -406,7 +519,9 @@ fn waitForNextNesFrame(
     session: *terminal.Session,
     deadline: *std.Io.Clock.Timestamp,
     held_actions: *Actions,
-    held_frames: *u8,
+    legacy_actions: *Actions,
+    legacy_frames: *u8,
+    logger: *RunLogger,
 ) !terminal.Event {
     while (true) {
         const now = std.Io.Clock.Timestamp.now(io, .awake);
@@ -417,11 +532,25 @@ fn waitForNextNesFrame(
         const remaining_ns: u64 = @intCast(now.durationTo(deadline.*).raw.nanoseconds);
         switch (try session.nextEventTimeout(timeoutMsForRemaining(remaining_ns))) {
             .key => |event| {
-                if (event.state != .release and isEscapeKey(event.key)) return .{ .exit = .escape };
+                if (logger.enabled()) {
+                    try logger.write(
+                        io,
+                        "input key={s} state={s}\n",
+                        .{ keyName(event.key), @tagName(event.state) },
+                    );
+                }
+                if (event.state != .release and isInterruptKey(event.key)) return .{ .exit = .interrupt };
+                if (event.state != .release and isEscapeKey(event.key) and (event.state != .legacy or session.legacyEscapeEnabled())) {
+                    return .{ .exit = .escape };
+                }
                 switch (event.state) {
                     .legacy => {
-                        held_actions.* = actionsForKey(event.key);
-                        held_frames.* = raw_input_hold_frames;
+                        if (session.reportsKeyStateEvents()) {
+                            applyKeyAction(held_actions, event.key, true);
+                        } else {
+                            legacy_actions.* = actionsForKey(event.key);
+                            legacy_frames.* = raw_input_hold_frames;
+                        }
                     },
                     .press, .repeat => applyKeyAction(held_actions, event.key, true),
                     .release => applyKeyAction(held_actions, event.key, false),
@@ -432,6 +561,23 @@ fn waitForNextNesFrame(
             .none => {},
         }
     }
+}
+
+fn keyName(key: terminal.Key) []const u8 {
+    return switch (key) {
+        .up => "up",
+        .down => "down",
+        .left => "left",
+        .right => "right",
+        .interrupt => "interrupt",
+        .byte => |byte| switch (byte) {
+            '\r' => "enter",
+            '\n' => "newline",
+            '\t' => "tab",
+            0x1b => "escape",
+            else => "byte",
+        },
+    };
 }
 
 fn nesFrameDuration() std.Io.Clock.Duration {
@@ -451,6 +597,13 @@ fn isEscapeKey(key: terminal.Key) bool {
     };
 }
 
+fn isInterruptKey(key: terminal.Key) bool {
+    return switch (key) {
+        .interrupt => true,
+        else => false,
+    };
+}
+
 fn actionsForKey(key: terminal.Key) Actions {
     return switch (key) {
         .byte => |byte| actionsForByte(byte),
@@ -458,18 +611,25 @@ fn actionsForKey(key: terminal.Key) Actions {
         .down => .{ .down = true },
         .left => .{ .left = true },
         .right => .{ .right = true },
+        .interrupt => .{},
     };
 }
 
-/// Returns the sampled terminal action for this emulated frame, then expires
-/// it after its short hold window. Keeping this state here ensures every host
-/// input path still reaches the NES controller only at a frame boundary.
-fn consumeHeldActions(held_actions: *Actions, held_frames: *u8) Actions {
-    const actions = held_actions.*;
-    if (held_frames.* == 0) return actions;
-    held_frames.* -= 1;
-    if (held_frames.* == 0) held_actions.* = .{};
+/// Returns the sampled legacy action for this emulated frame, then expires it
+/// after its short hold window. Kitty press/repeat/release state remains in a
+/// separate action set so legacy expiry can never cancel a held game key.
+fn consumeLegacyActions(legacy_actions: *Actions, legacy_frames: *u8) Actions {
+    const actions = legacy_actions.*;
+    if (legacy_frames.* == 0) return actions;
+    legacy_frames.* -= 1;
+    if (legacy_frames.* == 0) legacy_actions.* = .{};
     return actions;
+}
+
+fn mergeActions(held_actions: Actions, legacy_actions: Actions) Actions {
+    const held: u16 = @bitCast(held_actions);
+    const legacy: u16 = @bitCast(legacy_actions);
+    return @bitCast(held | legacy);
 }
 
 fn applyKeyAction(actions: *Actions, key: terminal.Key, pressed: bool) void {
@@ -558,7 +718,7 @@ fn printUsage(io: std.Io) !void {
             "  zigarcade --demo-neogeo <ansi|kitty|auto>\n" ++
             "  zigarcade inspect <path/to/rom.nes>\n" ++
             "  zigarcade framehash <path/to/rom.nes> --frames <1-10000>\n" ++
-            "  zigarcade nes <path/to/rom.nes> [--renderer ansi|kitty|auto] [--log <path>]\n",
+            "  zigarcade nes <path/to/rom.nes> [--renderer ansi|kitty|auto] [--log <path>] [--replay <log>]\n",
     );
     try stderr_writer.interface.flush();
 }
@@ -593,10 +753,53 @@ test "renderer parser accepts documented values and rejects others" {
 }
 
 test "NES run options accept an optional renderer and file log" {
-    const options = try parseNesRunOptions(&.{ "--renderer", "kitty", "--log", "run.log" });
+    const options = try parseNesRunOptions(&.{ "--renderer", "kitty", "--log", "run.log", "--replay", "input.log" });
     try std.testing.expectEqual(Renderer.kitty, options.renderer);
     try std.testing.expectEqualStrings("run.log", options.log_path.?);
+    try std.testing.expectEqualStrings("input.log", options.replay_path.?);
     try std.testing.expectError(error.InvalidArguments, parseNesRunOptions(&.{ "--renderer", "auto", "--renderer", "ansi" }));
+}
+
+test "input replay restores frame-indexed controller actions" {
+    var replay = try InputReplay.parse(
+        std.testing.allocator,
+        "frame=1 input_actions=0008\n" ++
+            "frame=2 input_actions=0018\n",
+    );
+    defer std.testing.allocator.free(replay.actions);
+    try std.testing.expect(replay.actionForFrame(1).?.right);
+    try std.testing.expect(!replay.actionForFrame(1).?.primary_1);
+    try std.testing.expect(replay.actionForFrame(2).?.right);
+    try std.testing.expect(replay.actionForFrame(2).?.primary_1);
+    try std.testing.expect(replay.actionForFrame(3) == null);
+}
+
+test "input replay is not capped by framehash diagnostics" {
+    var contents: [400_000]u8 = undefined;
+    var written: usize = 0;
+    for (1..max_framehash_frames + 2) |frame| {
+        const line = try std.fmt.bufPrint(contents[written..], "frame={d} input_actions=0008\n", .{frame});
+        written += line.len;
+    }
+    var replay = try InputReplay.parse(std.testing.allocator, contents[0..written]);
+    defer std.testing.allocator.free(replay.actions);
+    try std.testing.expect(replay.actionForFrame(max_framehash_frames + 1).?.right);
+}
+
+test "SMB telemetry decodes player motion variables" {
+    var ram: [0x800]u8 = [_]u8{0} ** 0x800;
+    ram[0x000e] = 0x08;
+    ram[0x006d] = 2;
+    ram[0x0086] = 0x34;
+    ram[0x00ce] = 0x80;
+    ram[0x0057] = @bitCast(@as(i8, -6));
+    ram[0x009f] = @bitCast(@as(i8, 4));
+    const player = smbPlayerTelemetry(&ram);
+    try std.testing.expectEqual(@as(u8, 0x08), player.state);
+    try std.testing.expectEqual(@as(u16, 0x234), player.world_x);
+    try std.testing.expectEqual(@as(u8, 0x80), player.y);
+    try std.testing.expectEqual(@as(i8, -6), player.x_speed);
+    try std.testing.expectEqual(@as(i8, 4), player.y_speed);
 }
 
 test "runtime log retains multiple phase records" {
@@ -684,16 +887,23 @@ test "terminal cursor keys and lone Escape map to stable actions" {
     try std.testing.expect(actionsForKey(.{ .byte = 'z' }).primary_1);
     try std.testing.expect(isEscapeKey(.{ .byte = 0x1b }));
     try std.testing.expect(!isEscapeKey(.left));
+    try std.testing.expect(isInterruptKey(.interrupt));
+}
+
+test "runtime input labels preserve game-control keys" {
+    try std.testing.expectEqualStrings("right", keyName(.right));
+    try std.testing.expectEqualStrings("enter", keyName(.{ .byte = '\r' }));
+    try std.testing.expectEqualStrings("byte", keyName(.{ .byte = 'z' }));
 }
 
 test "raw terminal samples retain buttons for a short movement window" {
     var actions = Actions{ .right = true };
     var remaining = @as(u8, 2);
-    try std.testing.expect(consumeHeldActions(&actions, &remaining).right);
+    try std.testing.expect(consumeLegacyActions(&actions, &remaining).right);
     try std.testing.expectEqual(@as(u8, 1), remaining);
-    try std.testing.expect(consumeHeldActions(&actions, &remaining).right);
+    try std.testing.expect(consumeLegacyActions(&actions, &remaining).right);
     try std.testing.expectEqual(@as(u8, 0), remaining);
-    try std.testing.expect(!consumeHeldActions(&actions, &remaining).right);
+    try std.testing.expect(!consumeLegacyActions(&actions, &remaining).right);
     try std.testing.expectEqual(@as(u8, 8), raw_input_hold_frames);
 }
 
@@ -704,6 +914,21 @@ test "Kitty key releases preserve other held controls" {
     applyKeyAction(&actions, .right, false);
     try std.testing.expect(!actions.right);
     try std.testing.expect(actions.primary_1);
+}
+
+test "legacy expiry cannot release Kitty-held actions" {
+    var held = Actions{};
+    applyKeyAction(&held, .{ .byte = 'z' }, true);
+    var legacy = Actions{ .right = true };
+    var remaining = @as(u8, 1);
+
+    const first = mergeActions(held, consumeLegacyActions(&legacy, &remaining));
+    try std.testing.expect(first.primary_1);
+    try std.testing.expect(first.right);
+
+    const second = mergeActions(held, consumeLegacyActions(&legacy, &remaining));
+    try std.testing.expect(second.primary_1);
+    try std.testing.expect(!second.right);
 }
 
 fn fillColorBarsForSize(rgb: []u8, width: usize, height: usize) void {
