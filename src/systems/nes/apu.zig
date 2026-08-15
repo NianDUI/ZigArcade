@@ -9,6 +9,7 @@ const length_table = [_]u8{
     10, 254, 20, 2,  40, 4,  80, 6,  160, 8,  60, 10, 14, 12, 26, 14,
     12, 16,  24, 18, 48, 20, 96, 22, 192, 24, 72, 26, 16, 28, 32, 30,
 };
+const noise_period_table = [_]u16{ 4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068 };
 
 /// RP2A03 APU slice. It produces deterministic mono PCM at 44.1 kHz in
 /// emulated CPU-cycle time. The pulse channels share their half-rate timer
@@ -34,6 +35,9 @@ pub const Apu = struct {
     triangle_length: u8 = 0,
     triangle_linear_counter: u8 = 0,
     triangle_linear_reload: bool = false,
+    noise_divider: u16 = 0,
+    noise_shift: u15 = 1,
+    noise_length: u8 = 0,
     sample_phase: u32 = 0,
 
     pub fn init(sink: AudioSink) Apu {
@@ -48,6 +52,7 @@ pub const Apu = struct {
             if (address == 0x4002 or address == 0x4003) self.reloadPulseTimer(.one);
             if (address == 0x4006 or address == 0x4007) self.reloadPulseTimer(.two);
             if (address == 0x400a or address == 0x400b) self.reloadTriangleTimer();
+            if (address == 0x400e) self.reloadNoiseTimer();
             if (address == 0x4003 and self.channel_enable & 1 != 0) {
                 self.pulse1_length = length_table[value >> 3];
             }
@@ -58,6 +63,7 @@ pub const Apu = struct {
                 if (self.channel_enable & 4 != 0) self.triangle_length = length_table[value >> 3];
                 self.triangle_linear_reload = true;
             }
+            if (address == 0x400f and self.channel_enable & 8 != 0) self.noise_length = length_table[value >> 3];
             return true;
         }
         switch (address) {
@@ -76,6 +82,7 @@ pub const Apu = struct {
                     self.triangle_length = 0;
                     self.triangle_linear_counter = 0;
                 }
+                if (self.channel_enable & 8 == 0) self.noise_length = 0;
                 return true;
             },
             0x4017 => {
@@ -99,6 +106,7 @@ pub const Apu = struct {
         const value: u8 = @as(u8, @intFromBool(self.pulse1_length != 0)) |
             (@as(u8, @intFromBool(self.pulse2_length != 0)) << 1) |
             (@as(u8, @intFromBool(self.triangle_length != 0)) << 2) |
+            (@as(u8, @intFromBool(self.noise_length != 0)) << 3) |
             (@as(u8, @intFromBool(self.frame_irq)) << 6);
         self.frame_irq = false;
         return value;
@@ -114,6 +122,7 @@ pub const Apu = struct {
             self.clockFrameSequencer();
             self.tickPulses();
             self.tickTriangle();
+            self.tickNoise();
             self.sample_phase += sample_rate_hz;
             if (self.sample_phase >= cpu_clock_hz) {
                 self.sample_phase -= cpu_clock_hz;
@@ -226,8 +235,28 @@ pub const Apu = struct {
         return (ramp - 8) * 1536;
     }
 
+    fn reloadNoiseTimer(self: *Apu) void {
+        self.noise_divider = noise_period_table[self.registers[14] & 0x0f] - 1;
+    }
+
+    fn tickNoise(self: *Apu) void {
+        if (self.noise_divider != 0) {
+            self.noise_divider -= 1;
+            return;
+        }
+        self.reloadNoiseTimer();
+        const tap: u4 = if (self.registers[14] & 0x80 != 0) 6 else 1;
+        const feedback: u15 = (self.noise_shift & 1) ^ ((self.noise_shift >> tap) & 1);
+        self.noise_shift = (self.noise_shift >> 1) | (feedback << 14);
+    }
+
+    fn noiseSample(self: *const Apu) i16 {
+        if (self.channel_enable & 8 == 0 or self.noise_length == 0 or self.noise_shift & 1 != 0) return 0;
+        return @as(i16, self.registers[12] & 0x0f) * 1024;
+    }
+
     fn mixedSample(self: *const Apu) i16 {
-        const mixed: i32 = @as(i32, self.mixedPulseSample()) + self.triangleSample();
+        const mixed: i32 = @as(i32, self.mixedPulseSample()) + self.triangleSample() + self.noiseSample();
         return @intCast(std.math.clamp(mixed, @as(i32, std.math.minInt(i16)), @as(i32, std.math.maxInt(i16))));
     }
 
@@ -235,6 +264,7 @@ pub const Apu = struct {
         if (self.pulse1_length != 0 and self.registers[0] & 0x20 == 0) self.pulse1_length -= 1;
         if (self.pulse2_length != 0 and self.registers[4] & 0x20 == 0) self.pulse2_length -= 1;
         if (self.triangle_length != 0 and self.registers[8] & 0x80 == 0) self.triangle_length -= 1;
+        if (self.noise_length != 0 and self.registers[12] & 0x20 == 0) self.noise_length -= 1;
     }
 };
 
@@ -341,6 +371,22 @@ test "APU triangle clocks its linear counter and timer independently" {
 
     _ = apu.cpuWrite(0x4015, 0);
     try std.testing.expectEqual(@as(u8, 0), apu.triangle_length);
+}
+
+test "APU noise reloads length, shifts its LFSR and reports status" {
+    var null_sink = NullAudioSink{};
+    var apu = Apu.init(null_sink.asSink());
+    _ = apu.cpuWrite(0x400c, 0x3f);
+    _ = apu.cpuWrite(0x400e, 0x00);
+    _ = apu.cpuWrite(0x4015, 8);
+    _ = apu.cpuWrite(0x400f, 0xf8);
+    try std.testing.expectEqual(@as(u8, 30), apu.noise_length);
+    try std.testing.expectEqual(@as(?u8, 0x08), apu.cpuRead(0x4015));
+    const before = apu.noise_shift;
+    apu.tick(4);
+    try std.testing.expect(apu.noise_shift != before);
+    _ = apu.cpuWrite(0x4015, 0);
+    try std.testing.expectEqual(@as(u8, 0), apu.noise_length);
 }
 
 test "APU pulse 1 emits timestamped PCM at the fixed sample rate" {
