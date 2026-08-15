@@ -113,13 +113,13 @@ pub const Nes = struct {
         return 4;
     }
 
-    /// Runs until the next PPU frame boundary. The renderer is intentionally
-    /// sampled only after dot-clock execution; it does not participate in or
-    /// shortcut emulation timing.
+    /// Runs until the next PPU frame boundary. Background pixels are emitted
+    /// by the PPU dot clock itself; only the still-staged sprite overlay runs
+    /// after the completed frame is copied out.
     pub fn runFrame(self: *Nes) !Frame {
         const target_frame = self.ppu.frame_number + 1;
         while (self.ppu.frame_number != target_frame) _ = try self.step();
-        try self.ppu.renderBackgroundWithOpacity(&self.framebuffer, &self.background_opaque);
+        try self.ppu.copyClockedBackground(&self.framebuffer, &self.background_opaque);
         try self.ppu.renderSpritesWithBackground(&self.framebuffer, &self.background_opaque);
         return .{
             .pixels = &self.framebuffer,
@@ -357,6 +357,7 @@ test "NROM CPU program configures PPU palette and produces an RGB frame" {
     var nes: Nes = undefined;
     nes.init(cartridge);
 
+    _ = try nes.runFrame(); // setup occurs during the first visible frame
     const frame = try nes.runFrame();
     try std.testing.expectEqual(@as(u8, 0x0a), nes.ppu.mask);
     try std.testing.expectEqual(@as(u8, 0x21), nes.ppu.palette[0]);

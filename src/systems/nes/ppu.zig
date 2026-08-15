@@ -87,6 +87,11 @@ pub const Ppu = struct {
     bg_pattern_shift_high: u16 = 0,
     bg_attribute_shift_low: u16 = 0,
     bg_attribute_shift_high: u16 = 0,
+    /// The background pixels emitted by the dot clock for the current
+    /// completed frame. Sprite composition still happens separately until
+    /// sprite fetch/evaluation is moved into the same pipeline.
+    clocked_background_rgb: [frame_rgb_bytes]u8 = [_]u8{0} ** frame_rgb_bytes,
+    clocked_background_opaque: [frame_width * frame_height]u8 = [_]u8{0} ** (frame_width * frame_height),
     /// CPU writes configure the *next* visible state. The frame renderer
     /// samples a separate copy at VBlank, before a game's next NMI starts
     /// using the PPU registers as temporary VRAM-update registers.
@@ -99,6 +104,12 @@ pub const Ppu = struct {
     presentation_ctrl: u8 = 0,
     presentation_mask: u8 = 0,
     presentation_oam: [256]u8 = [_]u8{0} ** 256,
+    /// The staged sprite overlay runs after VBlank, so it must retain the
+    /// pattern and palette bytes seen by the completed visible frame rather
+    /// than reading data a game's NMI handler is already preparing for the
+    /// next one.
+    presentation_pattern: [0x2000]u8 = [_]u8{0} ** 0x2000,
+    presentation_palette: [32]u8 = [_]u8{0} ** 32,
     active_raster_state: RasterState = .{
         .scroll_x = 0,
         .scroll_y = 0,
@@ -158,6 +169,7 @@ pub const Ppu = struct {
             self.status &= ~@as(u8, 0x40); // sprite-0 hit
             self.status &= ~@as(u8, 0x20); // sprite overflow
         }
+        self.clockBackgroundPixelOutput();
         if (self.scanline < frame_height) {
             if (self.dot == 65) self.clockSpriteOverflow();
             if (self.dot > 0 and self.dot <= frame_width) self.clockSpriteZeroHit(@intCast(self.dot - 1));
@@ -239,6 +251,39 @@ pub const Ppu = struct {
             },
             else => {},
         }
+    }
+
+    /// Emits one visible background pixel before advancing the fetch shift
+    /// registers for this dot. Pattern and attribute register bit 15 are the
+    /// current pixel at fine-X zero; lower fine-X values select the matching
+    /// bit within that same 16-pixel window.
+    fn clockBackgroundPixelOutput(self: *Ppu) void {
+        if (self.scanline >= frame_height or self.dot == 0 or self.dot > frame_width) return;
+        const x: usize = @intCast(self.dot - 1);
+        const y: usize = self.scanline;
+        const pixel_index = y * frame_width + x;
+        var color: u8 = 0;
+        var palette_select: u8 = 0;
+        if (self.mask & 0x08 != 0 and (x >= 8 or self.mask & 0x02 != 0)) {
+            const shift: u4 = 15 - @as(u4, self.fine_x);
+            color = @truncate(((self.bg_pattern_shift_low >> shift) & 1) |
+                (((self.bg_pattern_shift_high >> shift) & 1) << 1));
+            palette_select = @truncate(((self.bg_attribute_shift_low >> shift) & 1) |
+                (((self.bg_attribute_shift_high >> shift) & 1) << 1));
+        }
+        const palette_entry = if (color == 0) self.palette[0] else self.palette[palette_select * 4 + color];
+        const offset = pixel_index * 3;
+        self.clocked_background_rgb[offset..][0..3].* = rgbForPaletteIndex(palette_entry);
+        self.clocked_background_opaque[pixel_index] = @intFromBool(color != 0);
+    }
+
+    /// Copies the completed frame emitted by `tickDot`. This is the primary
+    /// background presentation path; the older state-replay renderer remains
+    /// available for focused unit tests while sprite fetching is still staged.
+    pub fn copyClockedBackground(self: *const Ppu, rgb: []u8, opacity: []u8) RenderError!void {
+        if (rgb.len != frame_rgb_bytes or opacity.len != frame_width * frame_height) return error.InvalidFrameBuffer;
+        @memcpy(rgb, &self.clocked_background_rgb);
+        @memcpy(opacity, &self.clocked_background_opaque);
     }
 
     /// During visible and pre-render scanlines the PPU, rather than the CPU,
@@ -415,6 +460,10 @@ pub const Ppu = struct {
         self.presentation_ctrl = self.active_raster_state.ctrl;
         self.presentation_mask = self.active_raster_state.mask;
         self.presentation_oam = self.active_oam;
+        for (0..self.presentation_pattern.len) |address| {
+            self.presentation_pattern[address] = self.readMemory(@intCast(address));
+        }
+        self.presentation_palette = self.palette;
         self.presentation_raster_events = self.active_raster_events;
         self.presentation_raster_event_count = self.active_raster_event_count;
     }
@@ -601,8 +650,8 @@ pub const Ppu = struct {
                     if (screen_x < 8 and raster_state.mask & 0x04 == 0) continue;
                     const source_y = if (attributes & 0x80 != 0) sprite_height - 1 - local_y else local_y;
                     const tile_address = spriteTileAddressForControl(raster_state.ctrl, tile, source_y);
-                    const low_plane = self.readMemory(tile_address);
-                    const high_plane = self.readMemory(tile_address + 8);
+                    const low_plane = self.presentation_pattern[tile_address];
+                    const high_plane = self.presentation_pattern[tile_address + 8];
                     const source_x = if (attributes & 0x40 != 0) local_x else 7 - local_x;
                     const bit: u3 = @intCast(source_x);
                     const color: u8 = ((low_plane >> bit) & 1) | (((high_plane >> bit) & 1) << 1);
@@ -611,7 +660,7 @@ pub const Ppu = struct {
                     const background_is_opaque = self.backgroundOpaque(rgb, background, screen_x, screen_y);
                     if (attributes & 0x20 != 0 and background_is_opaque) continue;
                     const palette_select = attributes & 0x03;
-                    const palette_entry = self.palette[0x10 + palette_select * 4 + color];
+                    const palette_entry = self.presentation_palette[0x10 + palette_select * 4 + color];
                     rgb[rgb_offset..][0..3].* = rgbForPaletteIndex(palette_entry);
                 }
             }
@@ -649,7 +698,7 @@ pub const Ppu = struct {
     fn backgroundOpaque(self: *const Ppu, rgb: []const u8, background: ?[]const u8, x: usize, y: usize) bool {
         if (background) |buffer| return buffer[y * frame_width + x] != 0;
         const offset = (y * frame_width + x) * 3;
-        return !std.mem.eql(u8, rgb[offset..][0..3], &rgbForPaletteIndex(self.palette[0]));
+        return !std.mem.eql(u8, rgb[offset..][0..3], &rgbForPaletteIndex(self.presentation_palette[0]));
     }
 
     pub fn rgbForPaletteIndex(index: u8) [3]u8 {
@@ -1067,6 +1116,29 @@ test "background fetch pipeline primes the pre-render scanline" {
     try std.testing.expectEqual(@as(u16, 0x0080), ppu.bg_pattern_shift_low);
 }
 
+test "background pipeline emits its shifted pixel at the visible dot" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x0a;
+    ppu.palette[0] = 0x0f;
+    ppu.palette[5] = 0x21;
+    ppu.bg_pattern_shift_low = 0x8000;
+    ppu.bg_attribute_shift_low = 0x8000;
+    ppu.scanline = 0;
+    ppu.dot = 1;
+
+    ppu.tickDot();
+
+    try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, ppu.clocked_background_rgb[0..3]);
+    try std.testing.expectEqual(@as(u8, 1), ppu.clocked_background_opaque[0]);
+}
+
 test "sprite-0 hit is raised on the overlapping visible PPU dot" {
     var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
     var mapper = Mapper0{
@@ -1398,8 +1470,11 @@ test "sprite presentation uses the OAM captured with its frame state" {
     ppu.oam[0..4].* = .{ 9, 1, 0, 20 };
     ppu.latchPresentationState();
     // The following DMA has begun preparing the next frame. It must not
-    // replace the sprite belonging to the already-latched background.
+    // replace the sprite, pattern data, or palette belonging to the
+    // already-latched background.
     ppu.oam[0..4].* = .{ 0xf8, 1, 0, 40 };
+    mapper.chr_ram[16] = 0;
+    ppu.palette[0x11] = 0x16;
 
     const hardware = ppu.presentationTelemetry();
     try std.testing.expectEqual(@as(u8, 0), hardware.live_visible_sprites);
