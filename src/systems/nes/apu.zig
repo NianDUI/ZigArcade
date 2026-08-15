@@ -27,9 +27,15 @@ pub const Apu = struct {
     pulse1_step: u3 = 0,
     pulse_clock_phase: bool = false,
     pulse1_length: u8 = 0,
+    pulse1_envelope_divider: u8 = 0,
+    pulse1_envelope_decay: u4 = 0,
+    pulse1_envelope_start: bool = false,
     pulse2_divider: u16 = 0,
     pulse2_step: u3 = 0,
     pulse2_length: u8 = 0,
+    pulse2_envelope_divider: u8 = 0,
+    pulse2_envelope_decay: u4 = 0,
+    pulse2_envelope_start: bool = false,
     triangle_divider: u16 = 0,
     triangle_step: u5 = 0,
     triangle_length: u8 = 0,
@@ -55,9 +61,11 @@ pub const Apu = struct {
             if (address == 0x400e) self.reloadNoiseTimer();
             if (address == 0x4003 and self.channel_enable & 1 != 0) {
                 self.pulse1_length = length_table[value >> 3];
+                self.pulse1_envelope_start = true;
             }
             if (address == 0x4007 and self.channel_enable & 2 != 0) {
                 self.pulse2_length = length_table[value >> 3];
+                self.pulse2_envelope_start = true;
             }
             if (address == 0x400b) {
                 if (self.channel_enable & 4 != 0) self.triangle_length = length_table[value >> 3];
@@ -91,7 +99,7 @@ pub const Apu = struct {
                 if (self.frame_irq_inhibit) self.frame_irq = false;
                 self.frame_counter_cycles = 0;
                 if (self.frame_mode_5_step) {
-                    self.clockTriangleLinearCounter();
+                    self.clockQuarterFrame();
                     self.clockLengthCounters();
                 }
                 return true;
@@ -138,21 +146,27 @@ pub const Apu = struct {
 
     fn clockFrameSequencer(self: *Apu) void {
         const cycle = self.frame_counter_cycles;
-        if (cycle == 3729 or cycle == 11186) self.clockTriangleLinearCounter();
+        if (cycle == 3729 or cycle == 11186) self.clockQuarterFrame();
         if (cycle == 7457) {
-            self.clockTriangleLinearCounter();
+            self.clockQuarterFrame();
             self.clockLengthCounters();
         }
         if (!self.frame_mode_5_step and cycle == 14915) {
-            self.clockTriangleLinearCounter();
+            self.clockQuarterFrame();
             self.clockLengthCounters();
             if (!self.frame_irq_inhibit) self.frame_irq = true;
             self.frame_counter_cycles = 0;
         } else if (self.frame_mode_5_step and cycle == 18641) {
-            self.clockTriangleLinearCounter();
+            self.clockQuarterFrame();
             self.clockLengthCounters();
             self.frame_counter_cycles = 0;
         }
+    }
+
+    fn clockQuarterFrame(self: *Apu) void {
+        self.clockTriangleLinearCounter();
+        self.clockPulseEnvelope(.one);
+        self.clockPulseEnvelope(.two);
     }
 
     const Pulse = enum { one, two };
@@ -198,8 +212,38 @@ pub const Apu = struct {
         if (self.channel_enable & enable_mask == 0 or length == 0 or self.pulseTimerPeriod(pulse) < 8) return 0;
         const duty = (self.registers[offset] >> 6) & 3;
         const high = pulseHigh(duty, step);
-        const amplitude = @as(i16, self.registers[offset] & 0x0f) * 2048;
+        const amplitude = @as(i16, self.pulseVolume(pulse)) * 2048;
         return if (high) amplitude else -amplitude;
+    }
+
+    fn pulseVolume(self: *const Apu, pulse: Pulse) u4 {
+        const offset: usize = if (pulse == .one) 0 else 4;
+        if (self.registers[offset] & 0x10 != 0) return @truncate(self.registers[offset]);
+        return if (pulse == .one) self.pulse1_envelope_decay else self.pulse2_envelope_decay;
+    }
+
+    fn clockPulseEnvelope(self: *Apu, pulse: Pulse) void {
+        const offset: usize = if (pulse == .one) 0 else 4;
+        const start = switch (pulse) {
+            .one => &self.pulse1_envelope_start,
+            .two => &self.pulse2_envelope_start,
+        };
+        const divider = switch (pulse) {
+            .one => &self.pulse1_envelope_divider,
+            .two => &self.pulse2_envelope_divider,
+        };
+        const decay = switch (pulse) {
+            .one => &self.pulse1_envelope_decay,
+            .two => &self.pulse2_envelope_decay,
+        };
+        if (start.*) {
+            start.* = false;
+            decay.* = 15;
+            divider.* = self.registers[offset] & 0x0f;
+        } else if (divider.* == 0) {
+            divider.* = self.registers[offset] & 0x0f;
+            if (decay.* != 0) decay.* -= 1 else if (self.registers[offset] & 0x20 != 0) decay.* = 15;
+        } else divider.* -= 1;
     }
 
     fn mixedPulseSample(self: *const Apu) i16 {
@@ -351,6 +395,26 @@ test "APU pulse-2 length and PCM mix are independently enabled" {
 
     _ = apu.cpuWrite(0x4015, 0);
     try std.testing.expectEqual(@as(u8, 0), apu.pulse2_length);
+}
+
+test "APU pulse envelope decays and loops at quarter-frame timing" {
+    var null_sink = NullAudioSink{};
+    var apu = Apu.init(null_sink.asSink());
+    _ = apu.cpuWrite(0x4000, 0x00); // envelope period 0, no loop
+    _ = apu.cpuWrite(0x4015, 1);
+    _ = apu.cpuWrite(0x4003, 0xf8);
+    apu.tick(3729);
+    try std.testing.expectEqual(@as(u4, 15), apu.pulse1_envelope_decay);
+    apu.tick(3729);
+    try std.testing.expectEqual(@as(u4, 14), apu.pulse1_envelope_decay);
+
+    _ = apu.cpuWrite(0x4004, 0x20); // looping pulse 2 envelope
+    _ = apu.cpuWrite(0x4015, 2);
+    _ = apu.cpuWrite(0x4007, 0xf8);
+    apu.tick(3729);
+    apu.pulse2_envelope_decay = 0;
+    apu.tick(3729);
+    try std.testing.expectEqual(@as(u4, 15), apu.pulse2_envelope_decay);
 }
 
 test "APU triangle clocks its linear counter and timer independently" {
