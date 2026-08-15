@@ -146,6 +146,14 @@ pub const Ppu = struct {
     last_sprite_zero_hit_frame: u64 = 0,
     last_sprite_zero_hit_scanline: u16 = 0,
     last_sprite_zero_hit_dot: u16 = 0,
+    /// Visible-scanline sprite-evaluation cursor. After secondary OAM has
+    /// accepted eight in-range sprites, the RP2C02's buggy scan advances the
+    /// byte column together with the primary-OAM index; later tile/attribute
+    /// bytes can therefore be mistaken for Y coordinates.
+    sprite_eval_index: u7 = 0,
+    sprite_eval_byte: u2 = 0,
+    sprite_eval_count: u4 = 0,
+    sprite_eval_delay: u4 = 0,
 
     pub fn init(mapper: anytype) Ppu {
         return switch (@TypeOf(mapper)) {
@@ -170,8 +178,8 @@ pub const Ppu = struct {
             self.status &= ~@as(u8, 0x20); // sprite overflow
         }
         self.clockBackgroundPixelOutput();
+        if (self.scanline < frame_height or self.scanline == 261) self.clockSpriteOverflow();
         if (self.scanline < frame_height) {
-            if (self.dot == 65) self.clockSpriteOverflow();
             if (self.dot > 0 and self.dot <= frame_width) self.clockSpriteZeroHit(@intCast(self.dot - 1));
         }
         self.clockBackgroundFetchPipeline();
@@ -405,14 +413,54 @@ pub const Ppu = struct {
         };
     }
 
-    /// Sprite evaluation starts shortly after each visible scanline begins.
-    /// Model the useful overflow result at its first observable point, rather
-    /// than leaking it from the asynchronous host-frame renderer.
+    /// Sprite evaluation begins at dot 65. A candidate Y check takes two
+    /// dots; copying one of the first eight in-range sprites occupies the
+    /// next eight dots. Once secondary OAM is full, the overflow path follows
+    /// the hardware's erroneous diagonal byte scan: a non-matching Y byte in
+    /// sprite N advances to byte 1 of sprite N+1, then byte 2, byte 3, and
+    /// byte 0 again. This is the source of the well-known false positives.
+    ///
+    /// Secondary-OAM contents and sprite pattern fetch remain separate work;
+    /// this state machine only owns the status-bit timing and faulty search.
     fn clockSpriteOverflow(self: *Ppu) void {
         if (self.mask & 0x18 == 0) return;
-        if (spritesThroughIndexOnScanline(&self.oam, 63, self.scanline, if (self.ctrl & 0x20 != 0) 16 else 8) > 8) {
-            self.status |= 0x20;
+        if (self.dot == 65) {
+            self.sprite_eval_index = 0;
+            self.sprite_eval_byte = 0;
+            self.sprite_eval_count = 0;
+            self.sprite_eval_delay = 0;
         }
+        if (self.dot < 65 or self.dot > 256 or self.sprite_eval_index >= 64) return;
+        if (self.sprite_eval_delay != 0) {
+            self.sprite_eval_delay -= 1;
+            return;
+        }
+
+        const byte_index = @as(usize, self.sprite_eval_index) * 4 + self.sprite_eval_byte;
+        const candidate_y = self.oam[byte_index];
+        const sprite_height: u8 = if (self.ctrl & 0x20 != 0) 16 else 8;
+        // Evaluation on scanline N prepares sprites for N+1; the pre-render
+        // line is the one exception that prepares visible scanline 0. Keep
+        // Y=$FF off-screen rather than allowing u8 addition to wrap it to 0.
+        const target_scanline: u16 = if (self.scanline == 261) 0 else self.scanline + 1;
+        const sprite_top: u16 = @as(u16, candidate_y) + 1;
+        const in_range = target_scanline >= sprite_top and target_scanline < sprite_top + sprite_height;
+        if (self.sprite_eval_count < 8) {
+            self.sprite_eval_index += 1;
+            self.sprite_eval_byte = 0;
+            if (in_range) {
+                self.sprite_eval_count += 1;
+                self.sprite_eval_delay = 7;
+            } else {
+                self.sprite_eval_delay = 1;
+            }
+            return;
+        }
+
+        if (in_range) self.status |= 0x20;
+        self.sprite_eval_index += 1;
+        self.sprite_eval_byte +%= 1;
+        self.sprite_eval_delay = 1;
     }
 
     fn spriteTileAddressForControl(ctrl: u8, tile: u8, source_y: usize) u16 {
@@ -1565,10 +1613,67 @@ test "sprite renderer limits each scanline to eight and raises overflow plus spr
     var background: [frame_width * frame_height]u8 = [_]u8{0} ** (frame_width * frame_height);
     background[40 * frame_width + 60] = 1;
     try ppu.renderSpritesWithBackground(&rgb, &background);
-    ppu.scanline = 40;
+    ppu.scanline = 39; // evaluation on 39 prepares visible scanline 40
     ppu.dot = 65;
-    ppu.tickDot();
+    // Eight in-range sprites take eight dots each; the ninth candidate is
+    // examined at dot 129 and raises overflow there.
+    for (0..65) |_| ppu.tickDot();
     try std.testing.expect(ppu.status & 0x20 != 0);
     const visible = (40 * frame_width + 60) * 3;
     try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, rgb[visible..][0..3]);
+}
+
+test "sprite overflow follows the hardware's faulty diagonal byte search" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x18;
+    @memset(&ppu.oam, 0xf8);
+    // The first eight sprites fill secondary OAM. Sprite 8 is off the
+    // current line, but the tile byte of sprite 9 is in-range. Real hardware
+    // tests that second byte as a Y coordinate and raises overflow.
+    for (0..8) |index| ppu.oam[index * 4] = 39;
+    ppu.oam[9 * 4 + 1] = 39;
+    ppu.scanline = 39; // evaluation on 39 prepares visible scanline 40
+    ppu.dot = 65;
+
+    for (0..66) |_| ppu.tickDot(); // dots 65 through 130
+    try std.testing.expect(ppu.status & 0x20 == 0);
+    ppu.tickDot(); // dot 131: byte 1 of sprite 9 is misread as Y
+    try std.testing.expect(ppu.status & 0x20 != 0);
+}
+
+test "sprite overflow evaluation prepares the next scanline and keeps Y FF off-screen" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x18;
+    for (0..9) |index| ppu.oam[index * 4] = 39;
+    ppu.scanline = 38; // prepares line 39, so Y=39 is not in range yet
+    ppu.dot = 65;
+    for (0..65) |_| ppu.tickDot();
+    try std.testing.expect(ppu.status & 0x20 == 0);
+
+    ppu.status &= ~@as(u8, 0x20);
+    ppu.scanline = 39; // prepares line 40, where all nine sprites match
+    ppu.dot = 65;
+    for (0..65) |_| ppu.tickDot();
+    try std.testing.expect(ppu.status & 0x20 != 0);
+
+    ppu.status &= ~@as(u8, 0x20);
+    @memset(&ppu.oam, 0xff);
+    ppu.scanline = 261; // pre-render evaluation prepares visible line 0
+    ppu.dot = 65;
+    for (0..65) |_| ppu.tickDot();
+    try std.testing.expect(ppu.status & 0x20 == 0);
 }
