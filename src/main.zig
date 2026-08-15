@@ -39,6 +39,7 @@ const nes_frame_interval_ns: u64 = 16_639_267;
 const raw_input_hold_frames: u8 = 8;
 const ansi_presentation_divisor: u64 = 2;
 const max_framehash_frames: u32 = 10_000;
+const max_nes_run_frames: u32 = 100_000;
 /// Full runtime logs contain several diagnostic lines per frame. Keep replay
 /// useful for extended recordings without accepting unbounded input.
 const max_replay_log_bytes = 64 * 1024 * 1024;
@@ -49,6 +50,7 @@ const NesRunOptions = struct {
     audio_backend: AudioBackend = .unit,
     log_path: ?[]const u8 = null,
     replay_path: ?[]const u8 = null,
+    max_frames: ?u32 = null,
 };
 
 const HostAudioSink = union(AudioBackend) {
@@ -124,6 +126,12 @@ fn parseFrameCount(value: []const u8) !u32 {
     return count;
 }
 
+fn parseNesRunFrameCount(value: []const u8) !u32 {
+    const count = std.fmt.parseInt(u32, value, 10) catch return error.InvalidArguments;
+    if (count == 0 or count > max_nes_run_frames) return error.InvalidArguments;
+    return count;
+}
+
 fn parseRenderer(value: []const u8) !Renderer {
     return if (std.mem.eql(u8, value, "ansi"))
         .ansi
@@ -171,6 +179,9 @@ fn parseNesRunOptions(args: []const []const u8) !NesRunOptions {
         } else if (std.mem.eql(u8, args[index], "--replay")) {
             if (options.replay_path != null or args[index + 1].len == 0) return error.InvalidArguments;
             options.replay_path = args[index + 1];
+        } else if (std.mem.eql(u8, args[index], "--max-frames")) {
+            if (options.max_frames != null) return error.InvalidArguments;
+            options.max_frames = try parseNesRunFrameCount(args[index + 1]);
         } else {
             return error.InvalidArguments;
         }
@@ -398,6 +409,7 @@ fn runNesWithOptions(init: std.process.Init, rom_path: []const u8, options: NesR
     var next_frame_deadline = std.Io.Clock.Timestamp.now(init.io, .awake).addDuration(nesFrameDuration());
     while (true) {
         const next_frame = nes.ppu.frame_number + 1;
+        if (options.max_frames) |limit| if (next_frame > limit) break;
         const actions = if (replay) |*source|
             source.actionForFrame(next_frame) orelse break
         else
@@ -831,7 +843,7 @@ fn printUsage(io: std.Io) !void {
             "  zigarcade --demo-neogeo <ansi|kitty|auto>\n" ++
             "  zigarcade inspect <path/to/rom.nes>\n" ++
             "  zigarcade framehash <path/to/rom.nes> --frames <1-10000>\n" ++
-            "  zigarcade nes <path/to/rom.nes> [--renderer ansi|kitty|auto] [--audio [--audio-backend unit|queue]] [--log <path>] [--replay <log>]\n",
+            "  zigarcade nes <path/to/rom.nes> [--renderer ansi|kitty|auto] [--audio [--audio-backend unit|queue]] [--log <path>] [--replay <log>] [--max-frames <1-100000>]\n",
     );
     try stderr_writer.interface.flush();
 }
@@ -875,15 +887,17 @@ test "NES run options accept an opt-in audio switch" {
     const defaults = try parseNesRunOptions(&.{});
     try std.testing.expect(!defaults.audio);
 
-    const options = try parseNesRunOptions(&.{ "--renderer", "kitty", "--audio", "--audio-backend", "queue", "--log", "run.log", "--replay", "input.log" });
+    const options = try parseNesRunOptions(&.{ "--renderer", "kitty", "--audio", "--audio-backend", "queue", "--log", "run.log", "--replay", "input.log", "--max-frames", "1800" });
     try std.testing.expectEqual(Renderer.kitty, options.renderer);
     try std.testing.expect(options.audio);
     try std.testing.expectEqual(AudioBackend.queue, options.audio_backend);
     try std.testing.expectEqualStrings("run.log", options.log_path.?);
     try std.testing.expectEqualStrings("input.log", options.replay_path.?);
+    try std.testing.expectEqual(@as(u32, 1800), options.max_frames.?);
     try std.testing.expectError(error.InvalidArguments, parseNesRunOptions(&.{ "--renderer", "auto", "--renderer", "ansi" }));
     try std.testing.expectError(error.InvalidArguments, parseNesRunOptions(&.{ "--audio", "--audio" }));
     try std.testing.expectError(error.InvalidArguments, parseNesRunOptions(&.{ "--audio-backend", "queue" }));
+    try std.testing.expectError(error.InvalidArguments, parseNesRunOptions(&.{ "--max-frames", "0" }));
 }
 
 test "input replay restores frame-indexed controller actions" {

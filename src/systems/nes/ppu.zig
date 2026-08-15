@@ -9,6 +9,36 @@ pub const frame_rgb_bytes = frame_width * frame_height * 3;
 
 pub const RenderError = error{InvalidFrameBuffer};
 
+/// CPU register writes can alter the visible picture during a scanline. Keep
+/// a bounded log for one frame so the presentation renderer can replay the
+/// same state transitions after VBlank without participating in PPU timing.
+const raster_event_capacity = 128;
+
+const RasterState = struct {
+    scroll_x: u8,
+    scroll_y: u8,
+    nametable: u2,
+    ctrl: u8,
+    mask: u8,
+};
+
+const RasterEvent = struct {
+    scanline: u16,
+    dot: u16,
+    state: RasterState,
+};
+
+const empty_raster_event = RasterEvent{
+    .scanline = 0,
+    .dot = 0,
+    .state = .{ .scroll_x = 0, .scroll_y = 0, .nametable = 0, .ctrl = 0, .mask = 0 },
+};
+
+fn rasterEventReached(event: RasterEvent, x: usize, y: usize) bool {
+    return event.scanline < y or
+        (event.scanline == y and event.dot <= @as(u16, @intCast(x + 1)));
+}
+
 /// A fixed NTSC-oriented palette for the first framebuffer path. Palette RAM
 /// supplies the 6-bit index; this table supplies its host RGB representation.
 const rgb_palette = [_][3]u8{
@@ -58,6 +88,19 @@ pub const Ppu = struct {
     presentation_ctrl: u8 = 0,
     presentation_mask: u8 = 0,
     presentation_oam: [256]u8 = [_]u8{0} ** 256,
+    active_raster_state: RasterState = .{
+        .scroll_x = 0,
+        .scroll_y = 0,
+        .nametable = 0,
+        .ctrl = 0,
+        .mask = 0,
+    },
+    active_oam: [256]u8 = [_]u8{0} ** 256,
+    active_raster_events: [raster_event_capacity]RasterEvent = [_]RasterEvent{empty_raster_event} ** raster_event_capacity,
+    active_raster_event_count: usize = 0,
+    active_raster_started: bool = false,
+    presentation_raster_events: [raster_event_capacity]RasterEvent = [_]RasterEvent{empty_raster_event} ** raster_event_capacity,
+    presentation_raster_event_count: usize = 0,
     // The simplified renderer samples a whole frame at VBlank, but games
     // commonly split the next frame after Sprite 0. Keep the initial display
     // state for hit detection separate from later gameplay scroll writes.
@@ -93,6 +136,7 @@ pub const Ppu = struct {
     /// Advances exactly one NTSC PPU dot and latches an NMI edge at the
     /// start of VBlank when PPUCTRL enables it.
     pub fn tickDot(self: *Ppu) void {
+        if (self.scanline == 0 and self.dot == 0) self.latchActiveRasterState();
         if (self.scanline == 241 and self.dot == 1) {
             self.latchPresentationState();
             self.latchSpriteZeroState();
@@ -241,12 +285,66 @@ pub const Ppu = struct {
     /// frame. It deliberately runs before the VBlank NMI handler can reset
     /// $2005/$2006 while uploading data for the following frame.
     fn latchPresentationState(self: *Ppu) void {
-        self.presentation_scroll_x = self.pending_scroll_x;
-        self.presentation_scroll_y = self.pending_scroll_y;
-        self.presentation_nametable = self.pending_nametable;
-        self.presentation_ctrl = self.ctrl;
-        self.presentation_mask = self.mask;
-        self.presentation_oam = self.oam;
+        // Unit-level callers may request a presentation before the first dot
+        // of emulation. Treat their configured registers as that frame's
+        // initial raster state while normal execution always enters here with
+        // a dot-0 snapshot already available.
+        if (!self.active_raster_started) self.latchActiveRasterState();
+        self.presentation_scroll_x = self.active_raster_state.scroll_x;
+        self.presentation_scroll_y = self.active_raster_state.scroll_y;
+        self.presentation_nametable = self.active_raster_state.nametable;
+        self.presentation_ctrl = self.active_raster_state.ctrl;
+        self.presentation_mask = self.active_raster_state.mask;
+        self.presentation_oam = self.active_oam;
+        self.presentation_raster_events = self.active_raster_events;
+        self.presentation_raster_event_count = self.active_raster_event_count;
+    }
+
+    /// The state at dot 0 is the display setup prepared during VBlank for the
+    /// frame that is about to become visible. Subsequent visible writes are
+    /// recorded separately by `recordRasterState`.
+    fn latchActiveRasterState(self: *Ppu) void {
+        self.active_raster_state = self.currentRasterState();
+        self.active_oam = self.oam;
+        self.active_raster_event_count = 0;
+        self.active_raster_started = true;
+    }
+
+    fn currentRasterState(self: *const Ppu) RasterState {
+        return .{
+            .scroll_x = self.pending_scroll_x,
+            .scroll_y = self.pending_scroll_y,
+            .nametable = self.pending_nametable,
+            .ctrl = self.ctrl,
+            .mask = self.mask,
+        };
+    }
+
+    /// Register writes made during the visible region become observable from
+    /// the current dot onward. Fixed storage keeps this timing aid fully
+    /// deterministic and allocation-free; a pathological write storm still
+    /// retains the latest state rather than corrupting the frame.
+    fn recordRasterState(self: *Ppu) void {
+        if (self.scanline >= frame_height) return;
+        const event = RasterEvent{
+            .scanline = self.scanline,
+            .dot = self.dot,
+            .state = self.currentRasterState(),
+        };
+        if (self.active_raster_event_count > 0) {
+            const last_index = self.active_raster_event_count - 1;
+            const last = &self.active_raster_events[last_index];
+            if (last.scanline == event.scanline and last.dot == event.dot) {
+                last.* = event;
+                return;
+            }
+        }
+        if (self.active_raster_event_count < raster_event_capacity) {
+            self.active_raster_events[self.active_raster_event_count] = event;
+            self.active_raster_event_count += 1;
+        } else {
+            self.active_raster_events[raster_event_capacity - 1] = event;
+        }
     }
 
     fn latchSpriteZeroState(self: *Ppu) void {
@@ -286,30 +384,33 @@ pub const Ppu = struct {
     pub fn renderBackgroundWithOpacity(self: *const Ppu, rgb: []u8, opacity: ?[]u8) RenderError!void {
         if (rgb.len != frame_rgb_bytes) return error.InvalidFrameBuffer;
         if (opacity) |buffer| if (buffer.len != frame_width * frame_height) return error.InvalidFrameBuffer;
-        if (self.presentation_mask & 0x08 == 0) {
-            const backdrop = rgbForPaletteIndex(self.palette[0]);
-            for (0..frame_width * frame_height) |pixel| {
-                rgb[pixel * 3 ..][0..3].* = backdrop;
-                if (opacity) |buffer| buffer[pixel] = 0;
-            }
-            return;
-        }
-        const pattern_base: u16 = if (self.presentation_ctrl & 0x10 != 0) 0x1000 else 0;
-        const scroll_x = self.presentation_scroll_x;
-        const scroll_y = self.presentation_scroll_y;
-        const base_nametable = self.presentation_nametable;
+        var raster_state = RasterState{
+            .scroll_x = self.presentation_scroll_x,
+            .scroll_y = self.presentation_scroll_y,
+            .nametable = self.presentation_nametable,
+            .ctrl = self.presentation_ctrl,
+            .mask = self.presentation_mask,
+        };
+        var event_index: usize = 0;
         for (0..frame_height) |y| {
             for (0..frame_width) |x| {
-                if (x < 8 and self.presentation_mask & 0x02 == 0) {
+                while (event_index < self.presentation_raster_event_count and
+                    rasterEventReached(self.presentation_raster_events[event_index], x, y))
+                {
+                    raster_state = self.presentation_raster_events[event_index].state;
+                    event_index += 1;
+                }
+                if (raster_state.mask & 0x08 == 0 or (x < 8 and raster_state.mask & 0x02 == 0)) {
                     const offset = (y * frame_width + x) * 3;
                     rgb[offset..][0..3].* = rgbForPaletteIndex(self.palette[0]);
                     if (opacity) |buffer| buffer[y * frame_width + x] = 0;
                     continue;
                 }
-                const world_x = (x + scroll_x) % 512;
-                const world_y = (y + scroll_y) % 480;
-                const base_x: u16 = base_nametable & 1;
-                const base_y: u16 = base_nametable >> 1;
+                const pattern_base: u16 = if (raster_state.ctrl & 0x10 != 0) 0x1000 else 0;
+                const world_x = (x + raster_state.scroll_x) % 512;
+                const world_y = (y + raster_state.scroll_y) % 480;
+                const base_x: u16 = raster_state.nametable & 1;
+                const base_y: u16 = raster_state.nametable >> 1;
                 const nametable_x = (base_x + @as(u16, @intCast(world_x / 256))) & 1;
                 const nametable_y = (base_y + @as(u16, @intCast(world_y / 240))) & 1;
                 const nametable_base = 0x2000 + ((nametable_y << 1 | nametable_x) << 10);
@@ -356,8 +457,6 @@ pub const Ppu = struct {
     pub fn renderSpritesWithBackground(self: *Ppu, rgb: []u8, background: ?[]const u8) RenderError!void {
         if (rgb.len != frame_rgb_bytes) return error.InvalidFrameBuffer;
         if (background) |buffer| if (buffer.len != frame_width * frame_height) return error.InvalidFrameBuffer;
-        if (self.presentation_mask & 0x10 == 0) return;
-        const sprite_height: usize = if (self.presentation_ctrl & 0x20 != 0) 16 else 8;
         var sprite_index: usize = 64;
         while (sprite_index > 0) {
             sprite_index -= 1;
@@ -366,18 +465,25 @@ pub const Ppu = struct {
             const tile = self.presentation_oam[offset + 1];
             const attributes = self.presentation_oam[offset + 2];
             const sprite_x = self.presentation_oam[offset + 3];
-            for (0..sprite_height) |local_y| {
+            // Iterate the physical maximum. The raster state selects 8x8 or
+            // 8x16 at each pixel, so a mid-frame PPUCTRL change is replayed
+            // without forcing an inaccurate whole-frame sprite mode.
+            for (0..16) |local_y| {
                 const screen_y = @as(usize, sprite_y) + 1 + local_y;
                 if (screen_y >= frame_height) continue;
-                if (spritesThroughIndexOnScanline(&self.presentation_oam, sprite_index, screen_y, sprite_height) > 8) continue;
-                const source_y = if (attributes & 0x80 != 0) sprite_height - 1 - local_y else local_y;
-                const tile_address = self.spriteTileAddress(tile, source_y);
-                const low_plane = self.readMemory(tile_address);
-                const high_plane = self.readMemory(tile_address + 8);
                 for (0..8) |local_x| {
                     const screen_x = @as(usize, sprite_x) + local_x;
                     if (screen_x >= frame_width) continue;
-                    if (screen_x < 8 and self.presentation_mask & 0x04 == 0) continue;
+                    const raster_state = self.presentationRasterStateAt(screen_x, screen_y);
+                    if (raster_state.mask & 0x10 == 0) continue;
+                    const sprite_height: usize = if (raster_state.ctrl & 0x20 != 0) 16 else 8;
+                    if (local_y >= sprite_height) continue;
+                    if (spritesThroughIndexOnScanline(&self.presentation_oam, sprite_index, screen_y, sprite_height) > 8) continue;
+                    if (screen_x < 8 and raster_state.mask & 0x04 == 0) continue;
+                    const source_y = if (attributes & 0x80 != 0) sprite_height - 1 - local_y else local_y;
+                    const tile_address = spriteTileAddressForControl(raster_state.ctrl, tile, source_y);
+                    const low_plane = self.readMemory(tile_address);
+                    const high_plane = self.readMemory(tile_address + 8);
                     const source_x = if (attributes & 0x40 != 0) local_x else 7 - local_x;
                     const bit: u3 = @intCast(source_x);
                     const color: u8 = ((low_plane >> bit) & 1) | (((high_plane >> bit) & 1) << 1);
@@ -393,14 +499,19 @@ pub const Ppu = struct {
         }
     }
 
-    fn spriteTileAddress(self: *const Ppu, tile: u8, source_y: usize) u16 {
-        if (self.presentation_ctrl & 0x20 == 0) {
-            const pattern_base: u16 = if (self.presentation_ctrl & 0x08 != 0) 0x1000 else 0;
-            return pattern_base + @as(u16, tile) * 16 + @as(u16, @intCast(source_y));
+    fn presentationRasterStateAt(self: *const Ppu, x: usize, y: usize) RasterState {
+        var state = RasterState{
+            .scroll_x = self.presentation_scroll_x,
+            .scroll_y = self.presentation_scroll_y,
+            .nametable = self.presentation_nametable,
+            .ctrl = self.presentation_ctrl,
+            .mask = self.presentation_mask,
+        };
+        for (self.presentation_raster_events[0..self.presentation_raster_event_count]) |event| {
+            if (!rasterEventReached(event, x, y)) break;
+            state = event.state;
         }
-        const pattern_base: u16 = if (tile & 1 != 0) 0x1000 else 0;
-        const tile_number = (tile & 0xfe) + @as(u8, @intCast(source_y / 8));
-        return pattern_base + @as(u16, tile_number) * 16 + @as(u16, @intCast(source_y & 7));
+        return state;
     }
 
     /// Evaluation is ordered by OAM index. The first eight in-range sprites
@@ -462,8 +573,12 @@ pub const Ppu = struct {
                 if (!had_nmi_enabled and value & 0x80 != 0 and self.status & 0x80 != 0) {
                     self.nmi_pending = true;
                 }
+                self.recordRasterState();
             },
-            1 => self.mask = value,
+            1 => {
+                self.mask = value;
+                self.recordRasterState();
+            },
             3 => self.oam_addr = value,
             4 => {
                 self.dmaWrite(value);
@@ -509,6 +624,11 @@ pub const Ppu = struct {
             self.sprite_zero_scroll_writes += 1;
             if (self.sprite_zero_scroll_writes == 2) self.sprite_zero_setup_pending = false;
         }
+        // Each PPUSCROLL write changes an independently usable part of the
+        // scroll state. In particular, a lone first write changes X while Y
+        // retains its previous value, so it must be visible to the replay
+        // even when no second write follows on this scanline.
+        self.recordRasterState();
     }
 
     fn writeAddress(self: *Ppu, value: u8) void {
@@ -865,6 +985,147 @@ test "background renderer scrolls across nametable edges using PPU scroll state"
     try ppu.renderBackground(&rgb);
     try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, rgb[0..3]);
     try std.testing.expectEqualSlices(u8, &.{ 152, 34, 32 }, rgb[24..27]);
+}
+
+test "visible PPUCTRL write changes only the trailing background dots" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x0a;
+    for (0..8) |row| {
+        mapper.chr_ram[16 + row] = 0xff; // $0000 tile 1, color 1
+        mapper.chr_ram[0x1000 + 16 + 8 + row] = 0xff; // $1000 tile 1, color 2
+    }
+    ppu.writeMemory(0x200e, 1);
+    ppu.palette[0] = 0x0f;
+    ppu.palette[1] = 0x21;
+    ppu.palette[2] = 0x16;
+    ppu.latchActiveRasterState();
+
+    ppu.scanline = 4;
+    ppu.dot = 120;
+    ppu.cpuWrite(0, 0x10); // switch background pattern table at dot 120
+    ppu.scanline = 241;
+    ppu.dot = 1;
+    ppu.tickDot();
+    try std.testing.expectEqual(@as(usize, 1), ppu.presentation_raster_event_count);
+
+    var rgb: [frame_rgb_bytes]u8 = undefined;
+    try ppu.renderBackground(&rgb);
+    const before = (4 * frame_width + 118) * 3;
+    const after = (4 * frame_width + 119) * 3;
+    try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, rgb[before..][0..3]);
+    try std.testing.expectEqualSlices(u8, &.{ 152, 34, 32 }, rgb[after..][0..3]);
+}
+
+test "visible PPUSCROLL X write changes only subsequent background dots" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x0a;
+    for (0..8) |row| {
+        mapper.chr_ram[row] = 0xff; // tile 0, color 1
+        mapper.chr_ram[16 + 8 + row] = 0xff; // tile 1, color 2
+    }
+    ppu.writeMemory(0x2021, 1);
+    ppu.palette[0] = 0x0f;
+    ppu.palette[1] = 0x21;
+    ppu.palette[2] = 0x16;
+    ppu.latchActiveRasterState();
+
+    ppu.scanline = 8;
+    ppu.dot = 6;
+    ppu.cpuWrite(5, 8);
+    ppu.scanline = 241;
+    ppu.dot = 1;
+    ppu.tickDot();
+    try std.testing.expectEqual(@as(usize, 1), ppu.presentation_raster_event_count);
+
+    var rgb: [frame_rgb_bytes]u8 = undefined;
+    try ppu.renderBackground(&rgb);
+    const before = (8 * frame_width + 4) * 3;
+    const after = (8 * frame_width + 5) * 3;
+    try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, rgb[before..][0..3]);
+    try std.testing.expectEqualSlices(u8, &.{ 152, 34, 32 }, rgb[after..][0..3]);
+}
+
+test "PPUSCROLL writes at separate dots preserve the intermediate state" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x0a;
+    for (0..8) |row| {
+        mapper.chr_ram[row] = 0xff; // tile 0, color 1
+        mapper.chr_ram[16 + 8 + row] = 0xff; // tile 1, color 2
+    }
+    ppu.writeMemory(0x2021, 1); // second nametable row, second tile
+    ppu.palette[0] = 0x0f;
+    ppu.palette[1] = 0x21;
+    ppu.palette[2] = 0x16;
+    ppu.latchActiveRasterState();
+
+    ppu.scanline = 0;
+    ppu.dot = 6;
+    ppu.cpuWrite(5, 0); // first write: X remains zero
+    ppu.dot = 14;
+    ppu.cpuWrite(5, 8); // second write: Y changes at a later dot
+    ppu.scanline = 241;
+    ppu.dot = 1;
+    ppu.tickDot();
+    try std.testing.expectEqual(@as(usize, 2), ppu.presentation_raster_event_count);
+
+    var rgb: [frame_rgb_bytes]u8 = undefined;
+    try ppu.renderBackground(&rgb);
+    const intermediate = 12 * 3;
+    const after = 13 * 3;
+    try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, rgb[intermediate..][0..3]);
+    try std.testing.expectEqualSlices(u8, &.{ 152, 34, 32 }, rgb[after..][0..3]);
+}
+
+test "visible PPUMASK write leaves earlier background pixels intact" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x0a;
+    for (0..8) |row| mapper.chr_ram[16 + row] = 0xff;
+    ppu.writeMemory(0x2001, 1);
+    ppu.palette[0] = 0x0f;
+    ppu.palette[1] = 0x21;
+    ppu.latchActiveRasterState();
+
+    ppu.scanline = 4;
+    ppu.dot = 16;
+    ppu.cpuWrite(1, 0); // disable background at dot 16
+    ppu.scanline = 241;
+    ppu.dot = 1;
+    ppu.tickDot();
+
+    var rgb: [frame_rgb_bytes]u8 = undefined;
+    try ppu.renderBackground(&rgb);
+    const before = (4 * frame_width + 14) * 3;
+    const after = (4 * frame_width + 15) * 3;
+    try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, rgb[before..][0..3]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, rgb[after..][0..3]);
 }
 
 test "sprite overlay handles palette flips transparency and background priority" {
