@@ -30,6 +30,8 @@ zig build run -- nes path/to/game.nes --renderer ansi
 
 `framehash` 不需要 TTY：它固定推进 1–10000 帧并输出原始 ROM SHA-256 与最终 RGB framebuffer 的 Wyhash，适合为你合法持有的 ROM 或自制 ROM 记录回归基线；仓库不会收集或提交这些 ROM。
 
+对合法持有的 SMB ROM，可将一次交互日志作为输入回放，执行 `scripts/smb-regression.zsh <rom.nes> <输入日志>`。它在伪终端中重放输入，并校验音频非静音、输出设备运行及无 render error；生成的运行日志保存在 `/tmp/zigarcade-smb-regression.*`。
+
 当前核心包含全部 151 个官方 2A03 opcode 的分派、Mapper 0/1/2/3/7、PPU 寄存器/VRAM 镜像/VBlank NMI/奇帧 dot skip、背景滚动 framebuffer、8×8/8×16 精灵（翻转、优先级、8 精灵限制的基础模型）、双手柄串行读取、逐总线周期 OAM DMA，以及 APU 帧计数器 IRQ、Pulse 1 定时器/长度计数和简化 PCM 采样链。模拟循环按约 60 Hz 推进，Kitty 每帧展示、ANSI 回退路径约 30 FPS；默认使用 `NullAudioSink` 静音，macOS 可通过 `--audio` 显式启用 CoreAudio AudioUnit PCM 输出。可用 `--audio-backend queue` 试验 AudioQueue（默认仍为 `unit`）以便比较稳定性。仍缺逐 dot 背景/精灵取数、sprite overflow 的硬件 bug、完整 APU 包络/扫频/其他通道/混音、其他 mapper，以及锁定的公开 ROM 回归；因此此阶段只适合自制/测试 ROM，不承诺商业 ROM 兼容性。
 
 ## 当前 P0 演示
