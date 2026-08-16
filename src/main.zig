@@ -333,7 +333,7 @@ fn cartridgeErrorDescription(err: @import("systems/nes/cartridge.zig").Error) []
     return switch (err) {
         error.CorruptRom => "文件长度不足或 ROM 数据损坏",
         error.UnsupportedRomFormat => "仅支持 iNES 1.0；NES 2.0 或无效头部尚不支持",
-        error.UnsupportedMapper => "仅支持 Mapper 0 (NROM)、1 (MMC1)、2 (UNROM)、3 (CNROM)、7 (AOROM)",
+        error.UnsupportedMapper => "仅支持 Mapper 0 (NROM)、1 (MMC1)、2 (UNROM)、3 (CNROM)、4 (MMC3)、7 (AOROM)",
         error.UnsupportedTrainer => "带 trainer 的 iNES ROM 尚不支持",
         error.UnsupportedFourScreenMirroring => "four-screen 镜像尚不支持",
         error.UnsupportedBatteryBackedRam => "电池存档 ROM 尚不支持",
@@ -348,6 +348,7 @@ fn mapperName(mapper: @import("systems/nes/cartridge.zig").MapperId) []const u8 
         .mmc1 => "MMC1",
         .unrom => "UNROM",
         .cnrom => "CNROM",
+        .mmc3 => "MMC3",
         .aorom => "AOROM",
     };
 }
@@ -1002,7 +1003,7 @@ test "cartridge inspection reports validated iNES metadata" {
 test "cartridge errors explain current compatibility boundary" {
     const CartridgeError = @import("systems/nes/cartridge.zig").Error;
     try std.testing.expectEqualStrings(
-        "仅支持 Mapper 0 (NROM)、1 (MMC1)、2 (UNROM)、3 (CNROM)、7 (AOROM)",
+        "仅支持 Mapper 0 (NROM)、1 (MMC1)、2 (UNROM)、3 (CNROM)、4 (MMC3)、7 (AOROM)",
         cartridgeErrorDescription(CartridgeError.UnsupportedMapper),
     );
     try std.testing.expectEqualStrings("电池存档 ROM 尚不支持", cartridgeErrorDescription(CartridgeError.UnsupportedBatteryBackedRam));

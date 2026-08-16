@@ -2,6 +2,7 @@ const Mapper0 = @import("mapper0.zig").Mapper0;
 const Mapper1 = @import("mapper1.zig").Mapper1;
 const Mapper2 = @import("mapper2.zig").Mapper2;
 const Mapper3 = @import("mapper3.zig").Mapper3;
+const Mapper4 = @import("mapper4.zig").Mapper4;
 const Mapper7 = @import("mapper7.zig").Mapper7;
 const Mirroring = @import("cartridge.zig").Mirroring;
 
@@ -35,6 +36,9 @@ pub const Mapper = struct {
     pub fn fromMapper3(mapper: *Mapper3) Mapper {
         return .{ .context = mapper, .vtable = &mapper3_vtable };
     }
+    pub fn fromMapper4(mapper: *Mapper4) Mapper {
+        return .{ .context = mapper, .vtable = &mapper4_vtable };
+    }
 
     pub fn fromMapper7(mapper: *Mapper7) Mapper {
         return .{ .context = mapper, .vtable = &mapper7_vtable };
@@ -60,6 +64,28 @@ pub const Mapper = struct {
         return self.vtable.mirroring(self.context);
     }
 };
+
+const mapper4_vtable = Mapper.VTable{ .cpu_read = struct {
+    fn call(c: *const anyopaque, a: u16) ?u8 {
+        return (@as(*const Mapper4, @ptrCast(@alignCast(c)))).cpuRead(a);
+    }
+}.call, .cpu_write = struct {
+    fn call(c: *anyopaque, a: u16, v: u8) bool {
+        return (@as(*Mapper4, @ptrCast(@alignCast(c)))).cpuWrite(a, v);
+    }
+}.call, .ppu_read = struct {
+    fn call(c: *const anyopaque, a: u16) ?u8 {
+        return (@as(*const Mapper4, @ptrCast(@alignCast(c)))).ppuRead(a);
+    }
+}.call, .ppu_write = struct {
+    fn call(c: *anyopaque, a: u16, v: u8) bool {
+        return (@as(*Mapper4, @ptrCast(@alignCast(c)))).ppuWrite(a, v);
+    }
+}.call, .mirroring = struct {
+    fn call(c: *const anyopaque) Mirroring {
+        return (@as(*const Mapper4, @ptrCast(@alignCast(c)))).mirroring();
+    }
+}.call };
 
 const mapper1_vtable = Mapper.VTable{
     .cpu_read = struct {

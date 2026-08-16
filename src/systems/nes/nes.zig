@@ -13,6 +13,7 @@ const Mapper0 = @import("mapper0.zig").Mapper0;
 const Mapper1 = @import("mapper1.zig").Mapper1;
 const Mapper2 = @import("mapper2.zig").Mapper2;
 const Mapper3 = @import("mapper3.zig").Mapper3;
+const Mapper4 = @import("mapper4.zig").Mapper4;
 const Mapper7 = @import("mapper7.zig").Mapper7;
 const Ppu = @import("ppu.zig").Ppu;
 const ppu_frame_rgb_bytes = @import("ppu.zig").frame_rgb_bytes;
@@ -23,7 +24,7 @@ const ppu_frame_width = @import("ppu.zig").frame_width;
 /// state while borrowing immutable cartridge ROM slices from the loader.
 pub const Nes = struct {
     cpu: Cpu = .{},
-    mapper: union(enum) { nrom: Mapper0, mmc1: Mapper1, unrom: Mapper2, cnrom: Mapper3, aorom: Mapper7 } = undefined,
+    mapper: union(enum) { nrom: Mapper0, mmc1: Mapper1, unrom: Mapper2, cnrom: Mapper3, mmc3: Mapper4, aorom: Mapper7 } = undefined,
     ppu: Ppu = undefined,
     apu: Apu = undefined,
     null_audio_sink: NullAudioSink = .{},
@@ -45,6 +46,7 @@ pub const Nes = struct {
             .mmc1 => .{ .mmc1 = Mapper1.init(cartridge) },
             .unrom => .{ .unrom = Mapper2.init(cartridge) },
             .cnrom => .{ .cnrom = Mapper3.init(cartridge) },
+            .mmc3 => .{ .mmc3 = Mapper4.init(cartridge) },
             .aorom => .{ .aorom = Mapper7.init(cartridge) },
         };
         const mapper = self.mapperRef();
@@ -66,6 +68,7 @@ pub const Nes = struct {
             .mmc1 => |*mapper| Mapper.fromMapper1(mapper),
             .unrom => |*mapper| Mapper.fromMapper2(mapper),
             .cnrom => |*mapper| Mapper.fromMapper3(mapper),
+            .mmc3 => |*mapper| Mapper.fromMapper4(mapper),
             .aorom => |*mapper| Mapper.fromMapper7(mapper),
         };
     }

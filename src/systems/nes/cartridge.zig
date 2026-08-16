@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const Mirroring = enum { horizontal, vertical, single_screen_lower, single_screen_upper };
-pub const MapperId = enum(u8) { nrom = 0, mmc1 = 1, unrom = 2, cnrom = 3, aorom = 7 };
+pub const MapperId = enum(u8) { nrom = 0, mmc1 = 1, unrom = 2, cnrom = 3, mmc3 = 4, aorom = 7 };
 
 pub const Error = error{
     CorruptRom,
@@ -41,6 +41,7 @@ pub const Cartridge = struct {
             1 => .mmc1,
             2 => .unrom,
             3 => .cnrom,
+            4 => .mmc3,
             7 => .aorom,
             else => return error.UnsupportedMapper,
         };
@@ -67,6 +68,9 @@ pub const Cartridge = struct {
                 if ((prg_size != 16 * 1024 and prg_size != 32 * 1024) or chr_size < 2 * 8 * 1024) {
                     return error.UnsupportedMapperLayout;
                 }
+            },
+            .mmc3 => {
+                if (prg_size < 2 * 16 * 1024 or prg_size > 32 * 16 * 1024 or chr_size > 32 * 8 * 1024) return error.UnsupportedMapperLayout;
             },
             .aorom => {
                 if (prg_size < 32 * 1024 or prg_size > 8 * 32 * 1024 or prg_size % (32 * 1024) != 0 or chr_size != 0) {
@@ -129,7 +133,7 @@ test "iNES NROM parser recognizes CHR RAM and rejects unsupported header feature
     image[7] = 0;
     image[6] = 0x04;
     try std.testing.expectError(error.UnsupportedTrainer, Cartridge.parse(&image));
-    image[6] = 0x40;
+    image[6] = 0x50;
     try std.testing.expectError(error.UnsupportedMapper, Cartridge.parse(&image));
 }
 

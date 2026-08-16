@@ -24,7 +24,7 @@ zig build run -- nes path/to/game.nes --renderer ansi
 
 仓库不包含商业 ROM、BIOS 或密钥；仅接受自制、公开许可或用户合法备份的资产。
 
-`nes` 当前接受 iNES 1.0 的 Mapper 0/NROM（16/32 KiB PRG、8 KiB CHR-ROM 或 CHR-RAM）、Mapper 1/MMC1（至少 32 KiB PRG、CHR-ROM 或 CHR-RAM）、Mapper 2/UNROM（CHR-RAM、至少两个 16 KiB PRG bank）、Mapper 3/CNROM（16/32 KiB 固定 PRG、至少两个 8 KiB CHR-ROM bank）和 Mapper 7/AOROM（32–256 KiB PRG、CHR-RAM）。MMC1 支持串行 PRG/CHR bank 切换及单屏、水平、垂直镜像，CNROM 的 `$8000-$FFFF` 写入选择 CHR bank，AOROM 的 `$8000-$FFFF` 写入选择 32 KiB PRG bank 与单屏名称表；Mapper 0/1/2/3 提供 8 KiB 易失 PRG-RAM，AOROM 标准版型不提供 PRG-RAM。默认 `--renderer auto` 会在 TTY 中优先探测 Ghostty 的 Kitty 图像协议，失败时回退 ANSI；强制 `--renderer kitty` 在探测失败时返回错误。电池存档仍明确不支持。`WASD` 或方向键映射方向、`Z/X` 映射 A/B、Enter=Start、Tab=Select、Esc 退出；Ghostty 等支持 Kitty Keyboard Protocol 的终端会按下持续生效、松开即停止，并支持多键组合。其他终端回退为短按保持 8 个模拟帧（约 133 ms），按住时依赖系统自动重复续期。
+`nes` 当前接受 iNES 1.0 的 Mapper 0/NROM（16/32 KiB PRG、8 KiB CHR-ROM 或 CHR-RAM）、Mapper 1/MMC1（至少 32 KiB PRG、CHR-ROM 或 CHR-RAM）、Mapper 2/UNROM（CHR-RAM、至少两个 16 KiB PRG bank）、Mapper 3/CNROM（16/32 KiB 固定 PRG、至少两个 8 KiB CHR-ROM bank）、Mapper 4/MMC3（32–512 KiB PRG、CHR-ROM 或 CHR-RAM）和 Mapper 7/AOROM（32–256 KiB PRG、CHR-RAM）。MMC1 支持串行 PRG/CHR bank 切换及单屏、水平、垂直镜像，CNROM 的 `$8000-$FFFF` 写入选择 CHR bank，MMC3 支持 8 KiB PRG、1/2 KiB CHR bank、水平/垂直镜像和易失 PRG-RAM（A12 IRQ 尚未接入），AOROM 的 `$8000-$FFFF` 写入选择 32 KiB PRG bank 与单屏名称表；Mapper 0/1/2/3 提供 8 KiB 易失 PRG-RAM，AOROM 标准版型不提供 PRG-RAM。默认 `--renderer auto` 会在 TTY 中优先探测 Ghostty 的 Kitty 图像协议，失败时回退 ANSI；强制 `--renderer kitty` 在探测失败时返回错误。电池存档仍明确不支持。`WASD` 或方向键映射方向、`Z/X` 映射 A/B、Enter=Start、Tab=Select、Esc 退出；Ghostty 等支持 Kitty Keyboard Protocol 的终端会按下持续生效、松开即停止，并支持多键组合。其他终端回退为短按保持 8 个模拟帧（约 133 ms），按住时依赖系统自动重复续期。
 
 可先使用 `zig build run -- inspect path/to/game.nes` 验证 ROM；不受支持的 iNES 特性会在切换终端 raw mode 前给出中文原因。
 

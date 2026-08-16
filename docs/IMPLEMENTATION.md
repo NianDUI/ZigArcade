@@ -18,7 +18,7 @@ MVP（FC）包含 iNES 1.0、Mapper 0/NROM、2A03 CPU、dot 时钟驱动的 PPU 
 | P1 | 2A03、逐总线周期 CPU 总线、trace runner | `nestest` 在约定入口逐行匹配 PC、寄存器、周期；中断、RMW、dummy-read bus trace 通过 |
 | P2 | iNES、NROM、dot 时钟 PPU、寄存器/NMI、背景 | 锁定版本的公开 CPU/PPU 测试 ROM 通过，含 VBlank/NMI 边界测试；现已具备 dot clock、`v/t` 推进、光栅寄存器回放及背景 fetch/shift-register 像素输出 |
 | P3 | DMA、控制器、精灵、滚动 | NROM 自制 ROM 可操作，固定帧 RGB 哈希匹配 |
-| P4 | Mapper 1/2/3/4、APU、可选宿主音频 | 每个 mapper 有 bank/mirroring 单测和公开 ROM 回归；现已覆盖 Mapper 1/2/3/7 与多通道 APU 基础链，仍待 Mapper 4 和公开音频精度基线 |
+| P4 | Mapper 1/2/3/4、APU、可选宿主音频 | 每个 mapper 有 bank/mirroring 单测和公开 ROM 回归；现已覆盖 Mapper 1/2/3/4/7 与多通道 APU 基础链，MMC3 A12 IRQ 和公开音频精度基线仍待完成 |
 | P5a | Neo Geo 68000、BIOS/地址图、输入、IRQ 诊断 | 锁定的 68000 指令测试和 BIOS memory-map 诊断通过 |
 | P5b | Neo Geo Z80、sound latch、VRAM/palette/fixed layer | Z80 map 与 CPU 间命令/应答测试通过；`320×224` 固定层诊断画面匹配 |
 | P6 | Neo Geo 精灵视频、YM2610 | 用户合法 ROM/BIOS 的兼容性矩阵达标 |
