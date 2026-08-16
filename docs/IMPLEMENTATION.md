@@ -6,7 +6,7 @@ ZigArcade 是在 macOS/Linux 终端运行的 Zig 多主机模拟器。首发使�
 
 **唯一支持的 Zig 工具链是 0.16.0。** 所有 `std`、构建脚本、I/O 和错误处理都以 Zig 0.16 API 为准；不为 0.13/0.14/0.15 维护兼容代码。每次升级 Zig 必须先更新本节版本、跑完整测试并记录破坏性变更。
 
-MVP（FC）包含 iNES 1.0、Mapper 0/NROM、2A03 CPU、dot 时钟驱动的 PPU 寄存器/NMI/滚动地址时序、逐总线周期 OAM DMA、两个手柄端口和 `256×240` RGB 输出。当前实现还覆盖 MMC1、UNROM、CNROM 和 AOROM 的基础 bank 行为；PPU 已实现 `v/t/x/w`、奇帧 dot skip、渲染期 `v/t` 推进、可见区寄存器写入回放，以及背景名称表/属性/pattern 的逐 dot 取数、16 位 shift-register 装载和直接像素输出。sprite overflow 已按 dot 扫描并覆盖八精灵后的错误对角字节搜索，但完整 secondary OAM 与逐 dot 精灵取数仍待实现。APU 已有 Pulse 1/2、Triangle、Noise 与 DMC 的基础时钟和 PCM 链，macOS 在显式 `--audio` 下可输出到 CoreAudio AudioUnit（AudioQueue 为试验后端）。仍不含持久存档、录像或联网。
+MVP（FC）包含 iNES 1.0、Mapper 0/NROM、2A03 CPU、dot 时钟驱动的 PPU 寄存器/NMI/滚动地址时序、逐总线周期 OAM DMA、两个手柄端口和 `256×240` RGB 输出。当前实现还覆盖 MMC1、UNROM、CNROM 和 AOROM 的基础 bank 行为；PPU 已实现 `v/t/x/w`、奇帧 dot skip、渲染期 `v/t` 推进、可见区寄存器写入回放，以及背景逐 dot 取数/16 位 shift-register 与精灵 secondary OAM/257–320 dot pattern 取数的直接像素输出。sprite overflow 已按 dot 扫描并覆盖八精灵后的错误对角字节搜索；精确 clear/copy micro-op 边界仍待公开测试 ROM 验证。APU 已有 Pulse 1/2、Triangle、Noise 与 DMC 的基础时钟和 PCM 链，macOS 在显式 `--audio` 下可输出到 CoreAudio AudioUnit（AudioQueue 为试验后端）。仍不含持久存档、录像或联网。
 
 仓库不分发商业 ROM、Neo Geo BIOS、密钥或其派生数据。测试资产必须有来源、许可证和 SHA-256 记录。P0 前必须确定本仓库的发布许可证，并创建 `THIRD_PARTY_NOTICES.md`、`REFERENCES.md` 与 `tests/fixtures/MANIFEST.md`；没有明确再分发许可的资产不得提交。
 
@@ -18,7 +18,7 @@ MVP（FC）包含 iNES 1.0、Mapper 0/NROM、2A03 CPU、dot 时钟驱动的 PPU 
 | P1 | 2A03、逐总线周期 CPU 总线、trace runner | `nestest` 在约定入口逐行匹配 PC、寄存器、周期；中断、RMW、dummy-read bus trace 通过 |
 | P2 | iNES、NROM、dot 时钟 PPU、寄存器/NMI、背景 | 锁定版本的公开 CPU/PPU 测试 ROM 通过，含 VBlank/NMI 边界测试；现已具备 dot clock、`v/t` 推进、光栅寄存器回放及背景 fetch/shift-register 像素输出 |
 | P3 | DMA、控制器、精灵、滚动 | NROM 自制 ROM 可操作，固定帧 RGB 哈希匹配 |
-| P4 | Mapper 1/2/3/4、APU、可选宿主音频 | 每个 mapper 有 bank/mirroring 单测和公开 ROM 回归；现已覆盖 Mapper 1/2/3/4/7 与多通道 APU 基础链，MMC3 的背景取数 A12 IRQ 已接入，完整精灵光栅时序与公开音频精度基线仍待完成 |
+| P4 | Mapper 1/2/3/4、APU、可选宿主音频 | 每个 mapper 有 bank/mirroring 单测和公开 ROM 回归；现已覆盖 Mapper 1/2/3/4/7 与多通道 APU 基础链，MMC3 的背景/精灵 pattern A12 IRQ 已接入，公开 PPU/Mapper 与音频精度基线仍待完成 |
 | P5a | Neo Geo 68000、BIOS/地址图、输入、IRQ 诊断 | 锁定的 68000 指令测试和 BIOS memory-map 诊断通过 |
 | P5b | Neo Geo Z80、sound latch、VRAM/palette/fixed layer | Z80 map 与 CPU 间命令/应答测试通过；`320×224` 固定层诊断画面匹配 |
 | P6 | Neo Geo 精灵视频、YM2610 | 用户合法 ROM/BIOS 的兼容性矩阵达标 |
@@ -122,9 +122,9 @@ CPU `read/write` 和无副作用 `peek` 必须分开；CPU 绝不使用 `peek`�
 
 ### 6.2 PPU、卡带与控制器
 
-PPU 为 341 dot × 262 scanline，约 60.0988 FPS。`tickDot()` 是唯一驱动寄存器、NMI、滚动地址、背景像素、sprite overflow 和取数/IRQ 可观察状态的规范实现；精灵叠加器仍消费在 VBlank 锁存的状态及可见区寄存器写入回放，不能替代 dot 时钟。CPU bus 访问须有绝对 CPU/PPU tick；已实现 pre-render odd-frame dot skip、PPU open bus、渲染期 coarse X/fine Y 推进、dot 257 水平拷贝、pre-render 280–304 垂直拷贝，以及背景名称表/属性/pattern 在 1/3/5/7 dot 的取数、每 8 dot 的 16 位 pattern/attribute shift-register 装载和直接像素输出（含 321–336 dot prefetch）。背景取数地址也会逐 dot 送入 MMC3，A12 低电平持续至少 8 dot 后的上升沿可重载/递减 IRQ 计数器并在下一 CPU 指令边界交付 IRQ；CPU `$2007` 访问和展示快照不会参与该时钟。sprite overflow 自 dot 65 起为下一扫描线扫描（pre-render 对应第 0 行），首八个命中后按 2/3/4/1 字节循环的错误路径检测，且 Y=`$FF` 保持 off-screen；但尚不产生完整 secondary OAM。仍待完整 VBlank/NMI 抑制边界与逐 dot 精灵取数/评估；在此之前 MMC3 IRQ 仅覆盖背景取数，不能视为完整精灵光栅 IRQ 时序。
+PPU 为 341 dot × 262 scanline，约 60.0988 FPS。`tickDot()` 是唯一驱动寄存器、NMI、滚动地址、背景/精灵像素、sprite overflow 和取数/IRQ 可观察状态的规范实现。CPU bus 访问须有绝对 CPU/PPU tick；已实现 pre-render odd-frame dot skip、PPU open bus、渲染期 coarse X/fine Y 推进、dot 257 水平拷贝、pre-render 280–304 垂直拷贝，以及背景名称表/属性/pattern 在 1/3/5/7 dot 的取数、每 8 dot 的 16 位 pattern/attribute shift-register 装载和直接像素输出（含 321–336 dot prefetch）。精灵在 dot 1–64 清 secondary OAM、dot 65–256 为下一行选择至多 8 项并维护溢出错误路径、dot 257–320 进行 dummy/低 plane/高 plane 取数，将锁存 pattern/属性/X 坐标用于下一行像素合成；背景和精灵 pattern 地址均会逐 dot 送入 MMC3，A12 低电平持续至少 8 dot 后的上升沿可重载/递减 IRQ 计数器并在下一 CPU 指令边界交付 IRQ。CPU `$2007` 访问和展示快照不会参与该时钟。Y=`$FF` 保持 off-screen。完整 VBlank/NMI 抑制边界和 PPU clear/copy micro-op 的公开 ROM 验证仍待完成。
 
-已实现：`$2000-$2007` 的 `v/t/x/w` 锁存、`$2002` 清 VBlank/重置写锁存、pattern/nametable/palette 镜像、VBlank NMI、背景 tile/attribute、背景逐 dot fetch/shift-register/像素输出、精灵透明/优先级/基础 8 精灵限制、sprite-0 hit，以及八精灵后的错误字节循环 sprite overflow 搜索。明确 `$3000-$3EFF` nametable mirror 与 `$3F10/$14/$18/$1C` palette mirror。内部先输出调色板索引，再映射 64 色 RGB。待完成：完整 secondary OAM、逐 dot 精灵取数/评估，以及上述边界的公开 ROM 验证。
+已实现：`$2000-$2007` 的 `v/t/x/w` 锁存、`$2002` 清 VBlank/重置写锁存、pattern/nametable/palette 镜像、VBlank NMI、背景 tile/attribute、背景逐 dot fetch/shift-register/像素输出、secondary OAM、逐 dot 精灵 pattern 取数、精灵透明/优先级/基础 8 精灵限制、sprite-0 hit，以及八精灵后的错误字节循环 sprite overflow 搜索。明确 `$3000-$3EFF` nametable mirror 与 `$3F10/$14/$18/$1C` palette mirror。内部先输出调色板索引，再映射 64 色 RGB。待完成：上述边界的公开 ROM 验证和精确 PPU micro-op 时序校正。
 
 `Cartridge` 仅解析校验 iNES；Mapper 提供 `cpuRead/cpuWrite/ppuRead/ppuWrite/mirroring`。当前支持 Mapper 0：16 KiB PRG-ROM `$8000-$FFFF` 镜像或 32 KiB 直映射、CHR-ROM 写忽略或 CHR size=0 时的 8 KiB CHR-RAM；Mapper 1/MMC1：5-bit 串行寄存器、16/32 KiB PRG 与 4/8 KiB CHR bank、单屏/垂直/水平 mirroring，支持 CHR-ROM 或 8 KiB CHR-RAM；标准 iNES MMC1 范围限定为 32–256 KiB PRG 和至多 128 KiB CHR，外部 bank 的板型变种暂不接受；Mapper 2/UNROM：可切换 `$8000-$BFFF` 的 16 KiB PRG bank、固定 `$C000-$FFFF` 的末 bank 和 8 KiB CHR-RAM；Mapper 3/CNROM：16/32 KiB 固定 PRG 映射、CPU 写 `$8000-$FFFF` 选择一个 8 KiB CHR-ROM bank（至少两个 bank），CHR-ROM 不可写；Mapper 7/AOROM：32–256 KiB PRG，CPU 写 `$8000-$FFFF` 选择一个 32 KiB PRG bank（低三位）及单屏名称表（bit 4），仅支持 8 KiB CHR-RAM。Mapper 0/1/2/3 有易失 8 KiB PRG-RAM `$6000-$7FFF`，MMC1 以 PRG bank bit 4 控制这段 RAM 的读写；标准 AOROM 不暴露 PRG-RAM。battery 标志仍拒绝，不创建持久存档。初版拒绝 NES 2.0、trainer、four-screen 和其他未知 mapper。
 

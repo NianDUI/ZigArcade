@@ -155,6 +155,16 @@ pub const Ppu = struct {
     sprite_eval_byte: u2 = 0,
     sprite_eval_count: u4 = 0,
     sprite_eval_delay: u4 = 0,
+    /// Secondary OAM is cleared and populated on scanline N, then its eight
+    /// slots drive the sprite pattern fetches for scanline N+1.
+    secondary_oam: [32]u8 = [_]u8{0xff} ** 32,
+    secondary_oam_indices: [8]u6 = [_]u6{0} ** 8,
+    sprite_fetch_count: u4 = 0,
+    sprite_fetch_low: [8]u8 = [_]u8{0} ** 8,
+    sprite_fetch_high: [8]u8 = [_]u8{0} ** 8,
+    sprite_fetch_x: [8]u8 = [_]u8{0} ** 8,
+    sprite_fetch_attributes: [8]u8 = [_]u8{0} ** 8,
+    sprite_fetch_indices: [8]u6 = [_]u6{0} ** 8,
 
     pub fn init(mapper: anytype) Ppu {
         return switch (@TypeOf(mapper)) {
@@ -181,9 +191,11 @@ pub const Ppu = struct {
         self.clockBackgroundPixelOutput();
         if (self.scanline < frame_height or self.scanline == 261) self.clockSpriteOverflow();
         if (self.scanline < frame_height) {
-            if (self.dot > 0 and self.dot <= frame_width) self.clockSpriteZeroHit(@intCast(self.dot - 1));
+            if (self.dot > 0 and self.dot <= frame_width and self.sprite_fetch_count == 0) self.clockSpriteZeroHit(@intCast(self.dot - 1));
         }
-        if (!self.clockBackgroundFetchPipeline()) self.mapper.clockPpuAddress(self.idlePpuAddress());
+        const background_fetch = self.clockBackgroundFetchPipeline();
+        const sprite_fetch = if (!background_fetch) self.clockSpriteFetchPipeline() else false;
+        if (!background_fetch and !sprite_fetch) self.mapper.clockPpuAddress(self.idlePpuAddress());
         self.clockScrollAddress();
 
         // NTSC odd frames omit the final pre-render dot while either layer
@@ -300,10 +312,87 @@ pub const Ppu = struct {
             palette_select = @truncate(((self.bg_attribute_shift_low >> shift) & 1) |
                 (((self.bg_attribute_shift_high >> shift) & 1) << 1));
         }
-        const palette_entry = if (color == 0) self.palette[0] else self.palette[palette_select * 4 + color];
+        const background_opaque = color != 0;
+        var palette_entry = if (color == 0) self.palette[0] else self.palette[palette_select * 4 + color];
+        if (self.spritePaletteAt(x, background_opaque)) |sprite_palette| palette_entry = sprite_palette;
         const offset = pixel_index * 3;
         self.clocked_background_rgb[offset..][0..3].* = rgbForPaletteIndex(palette_entry);
-        self.clocked_background_opaque[pixel_index] = @intFromBool(color != 0);
+        self.clocked_background_opaque[pixel_index] = @intFromBool(background_opaque);
+    }
+
+    /// The dot-257–320 sprite-fetch period fetches the eight entries prepared
+    /// by secondary OAM for the following scanline. Name/attribute phases are
+    /// modelled as A12-low dummy fetches; pattern phases retain their address
+    /// for two dots and supply both the output shifters and mapper IRQ input.
+    fn clockSpriteFetchPipeline(self: *Ppu) bool {
+        if (!self.renderingEnabled()) return false;
+        if (self.scanline >= frame_height and self.scanline != 261) return false;
+        if (self.dot < 257 or self.dot > 320) return false;
+
+        const relative = self.dot - 257;
+        const slot: usize = @intCast(relative / 8);
+        const phase = relative & 7;
+        const offset = slot * 4;
+        const tile = self.secondary_oam[offset + 1];
+        const attributes = self.secondary_oam[offset + 2];
+        const sprite_y = self.secondary_oam[offset];
+        const target_scanline: u16 = if (self.scanline == 261) 0 else self.scanline + 1;
+        const sprite_height: u16 = if (self.ctrl & 0x20 != 0) 16 else 8;
+        const sprite_top = @as(u16, sprite_y) + 1;
+        const in_range = target_scanline >= sprite_top and target_scanline < sprite_top + sprite_height;
+        const local_y: usize = if (in_range) @intCast(target_scanline - sprite_top) else 0;
+        const source_y = if (attributes & 0x80 != 0) @as(usize, sprite_height - 1) - local_y else local_y;
+        const pattern_address = spriteTileAddressForControl(self.ctrl, tile, source_y);
+        const address: u16 = switch (phase) {
+            0, 1 => 0x2000 | (self.v & 0x0fff),
+            2, 3 => 0x23c0 | (self.v & 0x0c00),
+            4, 5 => pattern_address,
+            6, 7 => pattern_address + 8,
+            else => unreachable,
+        };
+        self.mapper.clockPpuAddress(address);
+        switch (phase) {
+            4 => self.sprite_fetch_low[slot] = self.readMemory(address),
+            6 => self.sprite_fetch_high[slot] = self.readMemory(address),
+            7 => {
+                self.sprite_fetch_x[slot] = self.secondary_oam[offset + 3];
+                self.sprite_fetch_attributes[slot] = attributes;
+                self.sprite_fetch_indices[slot] = self.secondary_oam_indices[slot];
+                if (slot == 7) self.sprite_fetch_count = self.sprite_eval_count;
+            },
+            else => {},
+        }
+        return true;
+    }
+
+    /// Resolves the first opaque sprite among the eight fetched entries and
+    /// returns its palette entry. Sprite-zero hit is established here from
+    /// the same fetched pixels that drive the visible framebuffer.
+    fn spritePaletteAt(self: *Ppu, x: usize, background_opaque: bool) ?u8 {
+        if (self.mask & 0x10 == 0 or (x < 8 and self.mask & 0x04 == 0)) return null;
+        for (0..self.sprite_fetch_count) |slot| {
+            const sprite_x: usize = self.sprite_fetch_x[slot];
+            if (x < sprite_x or x >= sprite_x + 8) continue;
+            const attributes = self.sprite_fetch_attributes[slot];
+            const local_x = x - sprite_x;
+            const source_x = if (attributes & 0x40 != 0) local_x else 7 - local_x;
+            const bit: u3 = @intCast(source_x);
+            const color: u8 = ((self.sprite_fetch_low[slot] >> bit) & 1) |
+                (((self.sprite_fetch_high[slot] >> bit) & 1) << 1);
+            if (color == 0) continue;
+            if (self.status & 0x40 == 0 and self.sprite_fetch_indices[slot] == 0 and background_opaque and x != 255 and
+                self.mask & 0x18 == 0x18 and (x >= 8 or self.mask & 0x06 == 0x06))
+            {
+                self.status |= 0x40;
+                self.sprite_zero_hit_count += 1;
+                self.last_sprite_zero_hit_frame = self.frame_number;
+                self.last_sprite_zero_hit_scanline = self.scanline;
+                self.last_sprite_zero_hit_dot = self.dot;
+            }
+            if (attributes & 0x20 != 0 and background_opaque) return null;
+            return self.palette[0x10 + (attributes & 0x03) * 4 + color];
+        }
+        return null;
     }
 
     /// Copies the completed frame emitted by `tickDot`. This is the primary
@@ -441,10 +530,15 @@ pub const Ppu = struct {
     /// sprite N advances to byte 1 of sprite N+1, then byte 2, byte 3, and
     /// byte 0 again. This is the source of the well-known false positives.
     ///
-    /// Secondary-OAM contents and sprite pattern fetch remain separate work;
-    /// this state machine only owns the status-bit timing and faulty search.
     fn clockSpriteOverflow(self: *Ppu) void {
         if (self.mask & 0x18 == 0) return;
+        if (self.dot == 1) {
+            self.sprite_eval_count = 0;
+        }
+        if (self.dot >= 1 and self.dot <= 64) {
+            if (self.dot & 1 == 0) self.secondary_oam[@as(usize, self.dot / 2 - 1)] = 0xff;
+            return;
+        }
         if (self.dot == 65) {
             self.sprite_eval_index = 0;
             self.sprite_eval_byte = 0;
@@ -470,6 +564,10 @@ pub const Ppu = struct {
             self.sprite_eval_index += 1;
             self.sprite_eval_byte = 0;
             if (in_range) {
+                const slot: usize = self.sprite_eval_count;
+                const source = @as(usize, self.sprite_eval_index - 1) * 4;
+                self.secondary_oam[slot * 4 ..][0..4].* = self.oam[source..][0..4].*;
+                self.secondary_oam_indices[slot] = @intCast(self.sprite_eval_index - 1);
                 self.sprite_eval_count += 1;
                 self.sprite_eval_delay = 7;
             } else {
@@ -1194,6 +1292,95 @@ test "MMC3 background A12 stream has one qualified rise per visible scanline" {
     for (0..2 * 341) |_| ppu.tickDot();
     try std.testing.expectEqual(@as(u8, 2), mapper.irq_counter);
     try std.testing.expect(!mapper.irqPending());
+}
+
+test "sprite evaluation copies the first eight in-range entries into secondary OAM" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x18;
+    ppu.oam[0..4].* = .{ 39, 0x23, 0xc1, 0x45 };
+    ppu.scanline = 39; // evaluates sprites for visible scanline 40
+    ppu.dot = 65;
+
+    ppu.tickDot();
+    try std.testing.expectEqual(@as(u4, 1), ppu.sprite_eval_count);
+    try std.testing.expectEqualSlices(u8, &.{ 39, 0x23, 0xc1, 0x45 }, ppu.secondary_oam[0..4]);
+    try std.testing.expectEqual(@as(u6, 0), ppu.secondary_oam_indices[0]);
+}
+
+test "sprite pattern fetch clocks MMC3 A12" {
+    var prg: [4 * 0x2000]u8 = [_]u8{0} ** (4 * 0x2000);
+    var chr: [8 * 0x400]u8 = [_]u8{0} ** (8 * 0x400);
+    var mapper = Mapper4{ .prg_rom = &prg, .chr_rom = &chr, .chr_is_ram = false, .mirroring_mode = .vertical };
+    var ppu = Ppu.init(Mapper.fromMapper4(&mapper));
+    ppu.mask = 0x18;
+    ppu.ctrl = 0x08; // sprites use $1000; background remains at $0000
+    ppu.secondary_oam[0..4].* = .{ 0, 1, 0, 0 };
+    ppu.secondary_oam_indices[0] = 0;
+    ppu.sprite_eval_count = 1;
+    ppu.scanline = 0;
+    ppu.dot = 257;
+    try std.testing.expect(mapper.cpuWrite(0xc000, 0));
+    try std.testing.expect(mapper.cpuWrite(0xe001, 0));
+    for (0..8) |_| mapper.clockPpuAddress(0);
+
+    for (0..5) |_| ppu.tickDot(); // dots 257-261, first sprite pattern phase begins at 261
+    try std.testing.expect(mapper.irqPending());
+}
+
+test "clocked sprite fetch data composites a visible sprite pixel" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x10;
+    ppu.sprite_fetch_count = 1;
+    ppu.sprite_fetch_x[0] = 10;
+    ppu.sprite_fetch_low[0] = 0x80;
+    ppu.sprite_fetch_high[0] = 0;
+    ppu.sprite_fetch_attributes[0] = 0;
+    ppu.sprite_fetch_indices[0] = 1;
+    ppu.palette[0x11] = 0x21;
+    ppu.scanline = 20;
+    ppu.dot = 11; // x=10
+
+    ppu.tickDot();
+    const offset = (20 * frame_width + 10) * 3;
+    try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, ppu.clocked_background_rgb[offset..][0..3]);
+}
+
+test "clocked sprite zero hit latches once from fetched sprite data" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.mask = 0x1e;
+    ppu.sprite_fetch_count = 1;
+    ppu.sprite_fetch_x[0] = 10;
+    ppu.sprite_fetch_low[0] = 0xff;
+    ppu.sprite_fetch_indices[0] = 0;
+    ppu.bg_pattern_shift_low = 0xffff;
+    ppu.scanline = 20;
+    ppu.dot = 11;
+
+    ppu.tickDot();
+    ppu.tickDot();
+    try std.testing.expect(ppu.status & 0x40 != 0);
+    try std.testing.expectEqual(@as(u64, 1), ppu.sprite_zero_hit_count);
 }
 
 test "background fetch pipeline primes the pre-render scanline" {

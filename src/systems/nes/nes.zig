@@ -116,14 +116,13 @@ pub const Nes = struct {
         return 4;
     }
 
-    /// Runs until the next PPU frame boundary. Background pixels are emitted
-    /// by the PPU dot clock itself; only the still-staged sprite overlay runs
-    /// after the completed frame is copied out.
+    /// Runs until the next PPU frame boundary. Both background and fetched
+    /// sprites are composed by the PPU dot clock; the host only copies the
+    /// completed frame after the boundary.
     pub fn runFrame(self: *Nes) !Frame {
         const target_frame = self.ppu.frame_number + 1;
         while (self.ppu.frame_number != target_frame) _ = try self.step();
         try self.ppu.copyClockedBackground(&self.framebuffer, &self.background_opaque);
-        try self.ppu.renderSpritesWithBackground(&self.framebuffer, &self.background_opaque);
         return .{
             .pixels = &self.framebuffer,
             .width = ppu_frame_width,
