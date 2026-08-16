@@ -13,6 +13,8 @@ pub const Access = struct {
     value: u8,
 };
 
+pub const CpuCycleHook = *const fn (context: *anyopaque) void;
+
 /// Deterministic CPU bus used by instruction tests. Without a mapper it is a
 /// flat 64 KiB test fixture. Attaching Mapper 0 enables the first real NES
 /// address routes: internal 2 KiB RAM mirrors, PPU register mirrors, and
@@ -27,6 +29,11 @@ pub const TestBus = struct {
     apu: ?*Apu = null,
     controllers: ?*Controllers = null,
     dma_request: ?u8 = null,
+    /// The integrated NES clocks devices between CPU bus cycles. Unit tests
+    /// leave this disabled and retain the simple deterministic fixture bus.
+    cpu_cycle_hook: ?CpuCycleHook = null,
+    cpu_cycle_context: ?*anyopaque = null,
+    cpu_cycle_accesses: u8 = 0,
 
     pub fn attachMapper0(self: *TestBus, mapper: *Mapper0) void {
         self.mapper = Mapper.fromMapper0(mapper);
@@ -54,6 +61,24 @@ pub const TestBus = struct {
         return request;
     }
 
+    /// Arms a hook for one CPU instruction. The first bus operation belongs
+    /// to the current CPU cycle; every later one starts after one completed
+    /// cycle, so the hook is called before it. `endCpuCycleHook` returns the
+    /// number of observable bus cycles for the caller to clock the tail.
+    pub fn beginCpuCycleHook(self: *TestBus, context: *anyopaque, hook: CpuCycleHook) void {
+        self.cpu_cycle_context = context;
+        self.cpu_cycle_hook = hook;
+        self.cpu_cycle_accesses = 0;
+    }
+
+    pub fn endCpuCycleHook(self: *TestBus) u8 {
+        const access_count = self.cpu_cycle_accesses;
+        self.cpu_cycle_context = null;
+        self.cpu_cycle_hook = null;
+        self.cpu_cycle_accesses = 0;
+        return access_count;
+    }
+
     /// Per-access tracing is for bounded instruction tests. Full frame runs
     /// turn it off rather than silently discarding a partial trace.
     pub fn setTraceEnabled(self: *TestBus, enabled: bool) void {
@@ -62,6 +87,7 @@ pub const TestBus = struct {
     }
 
     pub fn read(self: *TestBus, address: u16) u8 {
+        self.clockBeforeCpuBusAccess();
         const value = if (self.mapper) |*mapper|
             self.readMapped(mapper, address)
         else
@@ -71,6 +97,7 @@ pub const TestBus = struct {
     }
 
     pub fn write(self: *TestBus, address: u16, value: u8) void {
+        self.clockBeforeCpuBusAccess();
         if (self.mapper) |*mapper| {
             if (address < 0x2000) {
                 self.memory[address & 0x07ff] = value;
@@ -105,6 +132,13 @@ pub const TestBus = struct {
         std.debug.assert(self.trace_len < self.trace.len);
         self.trace[self.trace_len] = access;
         self.trace_len += 1;
+    }
+
+    fn clockBeforeCpuBusAccess(self: *TestBus) void {
+        if (self.cpu_cycle_hook) |hook| {
+            if (self.cpu_cycle_accesses != 0) hook(self.cpu_cycle_context orelse unreachable);
+            self.cpu_cycle_accesses += 1;
+        }
     }
 
     fn readMapped(self: *const TestBus, mapper: *const Mapper, address: u16) u8 {

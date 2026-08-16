@@ -79,8 +79,17 @@ pub const Nes = struct {
     pub fn step(self: *Nes) !u16 {
         if (self.ppu.takeNmi()) self.cpu.requestNmi();
         self.cpu.setIrqLine(self.apu.frameIrqPending() or self.mapperRef().irqPending());
-        const cycles = try self.cpu.step(&self.bus);
-        self.advanceDevices(cycles);
+        self.bus.beginCpuCycleHook(@ptrCast(self), clockCpuBusCycle);
+        const cycles = self.cpu.step(&self.bus) catch |err| {
+            _ = self.bus.endCpuCycleHook();
+            return err;
+        };
+        const bus_cycles = self.bus.endCpuCycleHook();
+        std.debug.assert(bus_cycles <= cycles);
+        // The hook advances one cycle before every bus access after the
+        // first. Complete the current bus cycle and any internal cycles that
+        // did not touch the bus (for example an accumulator operation).
+        self.advanceDevices(cycles - bus_cycles + 1);
         var dmc_cycles = self.serviceDmcDma();
         if (self.bus.takeDmaRequest()) |page| {
             var dma = OamDma.init(page, self.cpu.pc, self.cpu.cycles);
@@ -103,6 +112,11 @@ pub const Nes = struct {
     fn advanceDevices(self: *Nes, cpu_cycles: u8) void {
         self.apu.tick(cpu_cycles);
         for (0..@as(usize, cpu_cycles) * 3) |_| self.ppu.tickDot();
+    }
+
+    fn clockCpuBusCycle(context: *anyopaque) void {
+        const self: *Nes = @ptrCast(@alignCast(context));
+        self.advanceDevices(1);
     }
 
     /// A DMC sample fetch occupies the CPU bus for four cycles. Service it
@@ -187,6 +201,28 @@ test "Nes delivers PPU NMI at the next CPU instruction boundary" {
 
     _ = try nes.step(); // NOP advances dots and latches VBlank NMI.
     try std.testing.expectEqual(@as(u16, 0x8001), nes.cpu.pc);
+    try std.testing.expectEqual(@as(u16, 7), try nes.step());
+    try std.testing.expectEqual(@as(u16, 0x9000), nes.cpu.pc);
+}
+
+test "Nes PPUSTATUS read after VBlank starts cannot suppress the NMI edge" {
+    var image: [16 + 16 * 1024]u8 = [_]u8{0} ** (16 + 16 * 1024);
+    image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    image[16..][0..3].* = .{ 0xad, 0x02, 0x20 }; // LDA $2002
+    image[16 + 0x3ffa] = 0x00;
+    image[16 + 0x3ffb] = 0x90;
+    image[16 + 0x3ffc] = 0x00;
+    image[16 + 0x3ffd] = 0x80;
+    const cartridge = try Cartridge.parse(&image);
+    var nes: Nes = undefined;
+    nes.init(cartridge);
+    nes.ppu.ctrl = 0x80;
+    nes.ppu.scanline = 241;
+    nes.ppu.dot = 0;
+
+    try std.testing.expectEqual(@as(u16, 4), try nes.step());
+    try std.testing.expect(nes.cpu.a & 0x80 != 0);
+    try std.testing.expect(nes.ppu.status & 0x80 == 0);
     try std.testing.expectEqual(@as(u16, 7), try nes.step());
     try std.testing.expectEqual(@as(u16, 0x9000), nes.cpu.pc);
 }
@@ -428,5 +464,5 @@ test "BSD-2-Clause nes15 fixture reaches a deterministic rendered title frame" {
     var frame: Frame = undefined;
     for (0..3) |_| frame = try nes.runFrame();
 
-    try std.testing.expectEqual(@as(u64, 8264638174104152342), std.hash.Wyhash.hash(0, frame.pixels));
+    try std.testing.expectEqual(@as(u64, 8933172950573502855), std.hash.Wyhash.hash(0, frame.pixels));
 }

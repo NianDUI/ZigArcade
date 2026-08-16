@@ -141,6 +141,11 @@ pub const Ppu = struct {
     dot: u16 = 0,
     frame_number: u64 = 0,
     nmi_pending: bool = false,
+    /// A PPUSTATUS read on the VBlank start boundary prevents the status bit
+    /// and its NMI edge from being produced for that frame. This has to be
+    /// remembered until dot 1 because CPU register accesses occur between
+    /// calls to `tickDot` in this model.
+    suppress_vblank: bool = false,
     /// Observable timing telemetry for diagnosing games that synchronize on
     /// PPUSTATUS bit 6. It does not influence emulation state or rendering.
     sprite_zero_hit_count: u64 = 0,
@@ -181,12 +186,16 @@ pub const Ppu = struct {
         if (self.scanline == 241 and self.dot == 1) {
             self.latchPresentationState();
             self.latchSpriteZeroState();
-            self.status |= 0x80;
-            if (self.ctrl & 0x80 != 0) self.nmi_pending = true;
+            if (!self.suppress_vblank) {
+                self.status |= 0x80;
+                if (self.ctrl & 0x80 != 0) self.nmi_pending = true;
+            }
+            self.suppress_vblank = false;
         } else if (self.scanline == 261 and self.dot == 1) {
             self.status &= ~@as(u8, 0x80);
             self.status &= ~@as(u8, 0x40); // sprite-0 hit
             self.status &= ~@as(u8, 0x20); // sprite overflow
+            self.suppress_vblank = false;
         }
         self.clockBackgroundPixelOutput();
         if (self.scanline < frame_height or self.scanline == 261) self.clockSpriteOverflow();
@@ -877,10 +886,16 @@ pub const Ppu = struct {
         const value: u8 = switch (register_address) {
             2 => blk: {
                 const status = (self.status & 0xe0) | (self.open_bus & 0x1f);
+                // The RP2C02 has a narrow race at the start of VBlank: a
+                // status read at dot 0 or before dot 1's state transition
+                // suppresses the flag itself, not merely a pending NMI.
+                if (self.scanline == 241 and self.dot <= 1) self.suppress_vblank = true;
                 self.status &= ~@as(u8, 0x80);
-                // A status read that clears VBlank before the CPU observes
-                // the edge suppresses this still-pending PPU NMI request.
-                self.nmi_pending = false;
+                // `nmi_pending` is an already-latched edge for the CPU, not
+                // the PPU's live output level. Only the start-boundary race
+                // above can prevent it; a later status read cannot retract
+                // an edge that occurred during this instruction.
+                if (self.suppress_vblank) self.nmi_pending = false;
                 self.write_toggle = false;
                 break :blk status;
             },
@@ -1137,7 +1152,7 @@ test "VBlank and enabling NMI during VBlank produce one pending NMI" {
     try std.testing.expect(!ppu.takeNmi());
 }
 
-test "PPUSTATUS read suppresses an undelivered VBlank NMI edge" {
+test "PPUSTATUS read after the VBlank transition preserves its latched NMI edge" {
     var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
     var mapper = Mapper0{
         .prg_rom = &prg,
@@ -1152,8 +1167,30 @@ test "PPUSTATUS read suppresses an undelivered VBlank NMI edge" {
     ppu.tickDot();
     try std.testing.expect(ppu.nmi_pending);
     _ = ppu.cpuRead(2);
-    try std.testing.expect(!ppu.nmi_pending);
+    try std.testing.expect(ppu.nmi_pending);
+    try std.testing.expect(ppu.takeNmi());
+}
+
+test "PPUSTATUS read before VBlank dot 1 suppresses that frame's flag and NMI" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.ctrl = 0x80;
+    ppu.scanline = 241;
+    ppu.dot = 0;
+
+    _ = ppu.cpuRead(2);
+    ppu.tickDot(); // dot 0 -> dot 1
+    ppu.tickDot(); // suppressed VBlank transition at dot 1
+
+    try std.testing.expect(ppu.status & 0x80 == 0);
     try std.testing.expect(!ppu.takeNmi());
+    try std.testing.expect(!ppu.suppress_vblank);
 }
 
 test "rendering odd frame skips the final pre-render dot" {
