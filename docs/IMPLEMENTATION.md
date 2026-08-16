@@ -107,7 +107,7 @@ ROM 标题和错误文本输出前过滤 ESC/C0，防止 ROM 元数据注入控�
 
 ### 6.1 CPU、时钟和总线
 
-2A03 是无十进制模式的 6502 变体，NTSC 约 1.789773 MHz。CPU 以 micro-op / bus-cycle 状态机实现，寻址模式只报告页面跨越，读指令决定是否加罚时。每 CPU 周期推进 PPU 3 dot，APU 节拍从 CPU 周期派生。P1 要明确 RESET/IRQ/NMI 的 instruction-boundary 采样与优先级、BRK/RTI/stack、dummy read、RMW read-write-write 序列；每一条被支持指令要有周期与 bus trace。
+2A03 是无十进制模式的 6502 变体，NTSC 约 1.789773 MHz。CPU 以 micro-op / bus-cycle 状态机实现，寻址模式只报告页面跨越，读指令决定是否加罚时。CPU 总线访问与 PPU/APU 在每个 CPU 周期间交错，每 CPU 周期推进 PPU 3 dot；因此 `$2002/$2000` 访问会在指令内对应的 PPU dot 生效。P1 要明确 RESET/IRQ/NMI 的 instruction-boundary 采样与优先级、BRK/RTI/stack、dummy read、RMW read-write-write 序列；每一条被支持指令要有周期与 bus trace。
 
 | 地址 | 设备 |
 |---|---|

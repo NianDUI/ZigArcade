@@ -227,6 +227,31 @@ test "Nes PPUSTATUS read after VBlank starts cannot suppress the NMI edge" {
     try std.testing.expectEqual(@as(u16, 0x9000), nes.cpu.pc);
 }
 
+test "Nes PPUSTATUS read on VBlank's start dot suppresses that frame" {
+    var image: [16 + 16 * 1024]u8 = [_]u8{0} ** (16 + 16 * 1024);
+    image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    image[16..][0..4].* = .{ 0xad, 0x02, 0x20, 0xea }; // LDA $2002; NOP
+    image[16 + 0x3ffa] = 0x00;
+    image[16 + 0x3ffb] = 0x90;
+    image[16 + 0x3ffc] = 0x00;
+    image[16 + 0x3ffd] = 0x80;
+    const cartridge = try Cartridge.parse(&image);
+    var nes: Nes = undefined;
+    nes.init(cartridge);
+    nes.ppu.ctrl = 0x80;
+    // The fourth bus access of LDA absolute is its data read. Starting nine
+    // PPU dots before scanline 241 dot 1 puts that read on the suppression
+    // boundary, then the instruction tail clocks the suppressed transition.
+    nes.ppu.scanline = 240;
+    nes.ppu.dot = 333;
+
+    try std.testing.expectEqual(@as(u16, 4), try nes.step());
+    try std.testing.expect(nes.cpu.a & 0x80 == 0);
+    try std.testing.expect(nes.ppu.status & 0x80 == 0);
+    try std.testing.expectEqual(@as(u16, 2), try nes.step());
+    try std.testing.expectEqual(@as(u16, 0x8004), nes.cpu.pc);
+}
+
 test "Nes stalls CPU for OAM DMA and advances PPU through every DMA cycle" {
     var image: [16 + 16 * 1024]u8 = [_]u8{0} ** (16 + 16 * 1024);
     image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
