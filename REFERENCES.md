@@ -11,6 +11,7 @@ ZigArcade 的源码采用 [MIT License](LICENSE)。本项目只独立实现代�
 | FinalBurn Neo | https://github.com/finalburnneo/FBNeo | Neo Geo ROM/video/audio 的架构研究 | 禁止复制代码；逐版本核对许可证与非商业条款 |
 | GnGeo | https://github.com/MatChung/gngeo | Neo Geo 系统边界研究 | 禁止复制代码，实施前核对许可证 |
 | Ghostty | https://github.com/ghostty-org/ghostty | Kitty 图形协议行为与资源管理参照 | 仅独立生成 APC 协议序列，不复制实现 |
+| nes-test-roms / nes15 | https://github.com/christopherpow/nes-test-roms，`95d8f621ae55cee0d09b91519a8989ae0e64753b` | NROM 运行与固定帧 hash 回归 | `nes15-NTSC.nes` 已按 BSD-2-Clause 纳入 `tests/fixtures/`，完整 notice 见 `THIRD_PARTY_NOTICES.md` |
 
 ## 已锁定的 Neo Geo 地址图资料
 

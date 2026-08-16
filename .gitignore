@@ -2,6 +2,7 @@
 zig-out/
 .DS_Store
 *.nes
+!tests/fixtures/nes15-NTSC.nes
 *.neo
 *.zip
 roms/

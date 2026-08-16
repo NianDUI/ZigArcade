@@ -413,3 +413,20 @@ test "NROM CPU program configures PPU palette and produces an RGB frame" {
     try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, frame.pixels[last_pixel..][0..3]);
     try std.testing.expectEqual(@as(u64, 1082226717624806288), std.hash.Wyhash.hash(0, frame.pixels));
 }
+
+test "BSD-2-Clause nes15 fixture reaches a deterministic rendered title frame" {
+    const image = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tests/fixtures/nes15-NTSC.nes",
+        std.testing.allocator,
+        .limited(64 * 1024),
+    );
+    defer std.testing.allocator.free(image);
+    const cartridge = try Cartridge.parse(image);
+    var nes: Nes = undefined;
+    nes.init(cartridge);
+    var frame: Frame = undefined;
+    for (0..3) |_| frame = try nes.runFrame();
+
+    try std.testing.expectEqual(@as(u64, 8264638174104152342), std.hash.Wyhash.hash(0, frame.pixels));
+}
