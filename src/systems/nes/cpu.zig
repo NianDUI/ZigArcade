@@ -42,6 +42,13 @@ pub const Cpu = struct {
         self.irq_pending = true;
     }
 
+    /// Updates the level of the shared maskable-IRQ line. Cartridge and APU
+    /// sources are level-triggered: once every source acknowledges, a masked
+    /// IRQ must not remain latched and fire later after RTI.
+    pub fn setIrqLine(self: *Cpu, asserted: bool) void {
+        self.irq_pending = asserted;
+    }
+
     pub fn requestNmi(self: *Cpu) void {
         self.nmi_pending = true;
     }

@@ -19,6 +19,10 @@ pub const Mapper = struct {
         ppu_read: *const fn (context: *const anyopaque, address: u16) ?u8,
         ppu_write: *const fn (context: *anyopaque, address: u16, value: u8) bool,
         mirroring: *const fn (context: *const anyopaque) Mirroring,
+        /// Optional PPU address-line clock for mappers such as MMC3 whose IRQ
+        /// counter observes qualified A12 rises rather than PPU data reads.
+        clock_ppu_address: ?*const fn (context: *anyopaque, address: u16) void = null,
+        irq_pending: ?*const fn (context: *const anyopaque) bool = null,
     };
 
     pub fn fromMapper0(mapper: *Mapper0) Mapper {
@@ -63,6 +67,14 @@ pub const Mapper = struct {
     pub fn mirroring(self: *const Mapper) Mirroring {
         return self.vtable.mirroring(self.context);
     }
+
+    pub fn clockPpuAddress(self: *Mapper, address: u16) void {
+        if (self.vtable.clock_ppu_address) |clock| clock(self.context, address);
+    }
+
+    pub fn irqPending(self: *const Mapper) bool {
+        return if (self.vtable.irq_pending) |pending| pending(self.context) else false;
+    }
 };
 
 const mapper4_vtable = Mapper.VTable{ .cpu_read = struct {
@@ -84,6 +96,14 @@ const mapper4_vtable = Mapper.VTable{ .cpu_read = struct {
 }.call, .mirroring = struct {
     fn call(c: *const anyopaque) Mirroring {
         return (@as(*const Mapper4, @ptrCast(@alignCast(c)))).mirroring();
+    }
+}.call, .clock_ppu_address = struct {
+    fn call(c: *anyopaque, a: u16) void {
+        (@as(*Mapper4, @ptrCast(@alignCast(c)))).clockPpuAddress(a);
+    }
+}.call, .irq_pending = struct {
+    fn call(c: *const anyopaque) bool {
+        return (@as(*const Mapper4, @ptrCast(@alignCast(c)))).irqPending();
     }
 }.call };
 

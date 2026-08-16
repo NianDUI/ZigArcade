@@ -78,7 +78,7 @@ pub const Nes = struct {
     /// requested immediately before the following CPU instruction boundary.
     pub fn step(self: *Nes) !u16 {
         if (self.ppu.takeNmi()) self.cpu.requestNmi();
-        if (self.apu.frameIrqPending()) self.cpu.requestIrq();
+        self.cpu.setIrqLine(self.apu.frameIrqPending() or self.mapperRef().irqPending());
         const cycles = try self.cpu.step(&self.bus);
         self.advanceDevices(cycles);
         var dmc_cycles = self.serviceDmcDma();
@@ -245,6 +245,51 @@ test "Nes delivers APU frame IRQ at the next CPU instruction boundary" {
 
     try std.testing.expectEqual(@as(u16, 7), try nes.step());
     try std.testing.expectEqual(@as(u16, 0x9000), nes.cpu.pc);
+}
+
+test "Nes delivers a pending MMC3 IRQ at the next CPU instruction boundary" {
+    var image: [16 + 2 * 16 * 1024]u8 = [_]u8{0} ** (16 + 2 * 16 * 1024);
+    image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 2, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    image[16] = 0xea;
+    image[16 + 0x1000] = 0xea;
+    image[16 + 0x7ffc] = 0x00;
+    image[16 + 0x7ffd] = 0x80;
+    image[16 + 0x7ffe] = 0x00;
+    image[16 + 0x7fff] = 0x90;
+    const cartridge = try Cartridge.parse(&image);
+    var nes: Nes = undefined;
+    nes.init(cartridge);
+    nes.cpu.status.interrupt_disable = false;
+    nes.bus.write(0xc000, 0);
+    nes.bus.write(0xe001, 0);
+    var mapper = nes.mapperRef();
+    for (0..8) |_| mapper.clockPpuAddress(0);
+    mapper.clockPpuAddress(0x1000);
+
+    try std.testing.expectEqual(@as(u16, 7), try nes.step());
+    try std.testing.expectEqual(@as(u16, 0x9000), nes.cpu.pc);
+}
+
+test "MMC3 IRQ acknowledgement clears a masked CPU IRQ line" {
+    var image: [16 + 2 * 16 * 1024]u8 = [_]u8{0} ** (16 + 2 * 16 * 1024);
+    image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 2, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    image[16..][0..2].* = .{ 0xea, 0xea };
+    image[16 + 0x7ffc] = 0x00;
+    image[16 + 0x7ffd] = 0x80;
+    const cartridge = try Cartridge.parse(&image);
+    var nes: Nes = undefined;
+    nes.init(cartridge);
+    nes.bus.write(0xc000, 0);
+    nes.bus.write(0xe001, 0);
+    var mapper = nes.mapperRef();
+    for (0..8) |_| mapper.clockPpuAddress(0);
+    mapper.clockPpuAddress(0x1000);
+
+    try std.testing.expectEqual(@as(u16, 2), try nes.step()); // I flag masks the asserted line.
+    nes.bus.write(0xe000, 0);
+    nes.cpu.status.interrupt_disable = false;
+    try std.testing.expectEqual(@as(u16, 2), try nes.step());
+    try std.testing.expectEqual(@as(u16, 0x8002), nes.cpu.pc);
 }
 
 test "UNROM boots from fixed bank and switches the lower PRG window" {

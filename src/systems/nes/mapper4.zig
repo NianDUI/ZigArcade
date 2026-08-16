@@ -2,9 +2,7 @@ const std = @import("std");
 const Cartridge = @import("cartridge.zig").Cartridge;
 const Mirroring = @import("cartridge.zig").Mirroring;
 
-/// MMC3 (Mapper 4) bank and mirroring registers. IRQ counter clocking is
-/// deliberately kept out of this slice until PPU A12 edges are observable at
-/// the mapper boundary.
+/// MMC3 (Mapper 4) bank, mirroring, and A12-qualified IRQ registers.
 pub const Mapper4 = struct {
     prg_rom: []const u8,
     chr_rom: []const u8,
@@ -16,6 +14,12 @@ pub const Mapper4 = struct {
     mirroring_mode: Mirroring,
     prg_ram_enabled: bool = true,
     prg_ram_write_protected: bool = false,
+    irq_latch: u8 = 0,
+    irq_counter: u8 = 0,
+    irq_reload: bool = false,
+    irq_enabled: bool = false,
+    irq_pending: bool = false,
+    a12_low_dots: u4 = 0,
 
     pub fn init(cartridge: Cartridge) Mapper4 {
         return .{
@@ -58,8 +62,13 @@ pub const Mapper4 = struct {
                 self.prg_ram_enabled = value & 0x80 != 0;
                 self.prg_ram_write_protected = value & 0x40 != 0;
             },
-            // $C000-$FFFF are reserved for the later A12-driven IRQ counter.
-            0xc000, 0xc001, 0xe000, 0xe001 => {},
+            0xc000 => self.irq_latch = value,
+            0xc001 => self.irq_reload = true,
+            0xe000 => {
+                self.irq_enabled = false;
+                self.irq_pending = false;
+            },
+            0xe001 => self.irq_enabled = true,
             else => unreachable,
         }
         return true;
@@ -80,6 +89,30 @@ pub const Mapper4 = struct {
 
     pub fn mirroring(self: *const Mapper4) Mirroring {
         return self.mirroring_mode;
+    }
+
+    /// Samples the PPU address bus once per dot. MMC3 clocks its counter on
+    /// an A12 rise only after the line has remained low for at least eight
+    /// dots, filtering the short low gaps between pattern fetches.
+    pub fn clockPpuAddress(self: *Mapper4, address: u16) void {
+        if (address & 0x1000 == 0) {
+            self.a12_low_dots = @min(self.a12_low_dots +| 1, 8);
+            return;
+        }
+        const qualified_rise = self.a12_low_dots >= 8;
+        self.a12_low_dots = 0;
+        if (!qualified_rise) return;
+        if (self.irq_counter == 0 or self.irq_reload) {
+            self.irq_counter = self.irq_latch;
+            self.irq_reload = false;
+        } else {
+            self.irq_counter -= 1;
+        }
+        if (self.irq_counter == 0 and self.irq_enabled) self.irq_pending = true;
+    }
+
+    pub fn irqPending(self: *const Mapper4) bool {
+        return self.irq_pending;
     }
 
     fn chrOffset(self: *const Mapper4, address: u16) usize {
@@ -130,4 +163,36 @@ test "MMC3 switches PRG and CHR banks and controls mirroring" {
     try std.testing.expectEqual(@as(?u8, 0x25), mapper.ppuRead(0x400));
     try std.testing.expect(mapper.cpuWrite(0xa000, 1));
     try std.testing.expectEqual(Mirroring.horizontal, mapper.mirroring());
+}
+
+test "MMC3 IRQ clocks only on A12 rises after an eight-dot low period" {
+    var prg: [4 * 0x2000]u8 = [_]u8{0} ** (4 * 0x2000);
+    var chr: [8 * 0x400]u8 = [_]u8{0} ** (8 * 0x400);
+    var mapper = Mapper4{ .prg_rom = &prg, .chr_rom = &chr, .chr_is_ram = false, .mirroring_mode = .vertical };
+    try std.testing.expect(mapper.cpuWrite(0xc000, 2));
+    try std.testing.expect(mapper.cpuWrite(0xe001, 0));
+
+    for (0..8) |_| mapper.clockPpuAddress(0);
+    mapper.clockPpuAddress(0x1000);
+    try std.testing.expectEqual(@as(u8, 2), mapper.irq_counter);
+    try std.testing.expect(!mapper.irqPending());
+
+    for (0..7) |_| mapper.clockPpuAddress(0);
+    mapper.clockPpuAddress(0x1000);
+    try std.testing.expectEqual(@as(u8, 2), mapper.irq_counter);
+
+    for (0..8) |_| mapper.clockPpuAddress(0);
+    mapper.clockPpuAddress(0x1000);
+    try std.testing.expectEqual(@as(u8, 1), mapper.irq_counter);
+    for (0..8) |_| mapper.clockPpuAddress(0);
+    mapper.clockPpuAddress(0x1000);
+    try std.testing.expect(mapper.irqPending());
+
+    try std.testing.expect(mapper.cpuWrite(0xe000, 0));
+    try std.testing.expect(!mapper.irqPending());
+    try std.testing.expect(!mapper.irq_enabled);
+    try std.testing.expect(mapper.cpuWrite(0xc001, 0));
+    for (0..8) |_| mapper.clockPpuAddress(0);
+    mapper.clockPpuAddress(0x1000);
+    try std.testing.expectEqual(@as(u8, 2), mapper.irq_counter);
 }

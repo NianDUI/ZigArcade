@@ -1,6 +1,7 @@
 const std = @import("std");
 const Mapper = @import("mapper.zig").Mapper;
 const Mapper0 = @import("mapper0.zig").Mapper0;
+const Mapper4 = @import("mapper4.zig").Mapper4;
 const Mirroring = @import("cartridge.zig").Mirroring;
 
 pub const frame_width = 256;
@@ -182,7 +183,7 @@ pub const Ppu = struct {
         if (self.scanline < frame_height) {
             if (self.dot > 0 and self.dot <= frame_width) self.clockSpriteZeroHit(@intCast(self.dot - 1));
         }
-        self.clockBackgroundFetchPipeline();
+        if (!self.clockBackgroundFetchPipeline()) self.mapper.clockPpuAddress(self.idlePpuAddress());
         self.clockScrollAddress();
 
         // NTSC odd frames omit the final pre-render dot while either layer
@@ -219,36 +220,44 @@ pub const Ppu = struct {
     /// This is intentionally independent of `renderBackgroundWithOpacity`:
     /// the latter remains a presentation readout while this state provides
     /// the timing-accurate background data path required by sprite evaluation
-    /// and future PPU A12-driven mapper IRQs.
-    fn clockBackgroundFetchPipeline(self: *Ppu) void {
-        if (!self.renderingEnabled()) return;
-        if (self.scanline >= frame_height and self.scanline != 261) return;
+    /// and PPU A12-driven mapper IRQs. Each PPU memory phase holds its
+    /// address for two dots; the mapper therefore observes the live address
+    /// line on both dots even though this model reads data on the first one.
+    fn clockBackgroundFetchPipeline(self: *Ppu) bool {
+        if (!self.renderingEnabled()) return false;
+        if (self.scanline >= frame_height and self.scanline != 261) return false;
         const fetch_slot = (self.dot >= 1 and self.dot <= 256) or
             (self.dot >= 321 and self.dot <= 336);
-        if (!fetch_slot) return;
+        if (!fetch_slot) return false;
 
         self.bg_pattern_shift_low <<= 1;
         self.bg_pattern_shift_high <<= 1;
         self.bg_attribute_shift_low <<= 1;
         self.bg_attribute_shift_high <<= 1;
 
-        switch (self.dot & 7) {
-            1 => self.bg_next_tile = self.readMemory(0x2000 | (self.v & 0x0fff)),
+        const phase = self.dot & 7;
+        const name_table_address = 0x2000 | (self.v & 0x0fff);
+        const attribute_address = 0x23c0 | (self.v & 0x0c00) | ((self.v >> 4) & 0x38) | ((self.v >> 2) & 0x07);
+        const fine_y = (self.v >> 12) & 7;
+        const pattern_base: u16 = if (self.ctrl & 0x10 != 0) 0x1000 else 0;
+        const pattern_address = pattern_base + @as(u16, self.bg_next_tile) * 16 + fine_y;
+        const address = switch (phase) {
+            1, 2 => name_table_address,
+            3, 4 => attribute_address,
+            5, 6 => pattern_address,
+            7, 0 => pattern_address + 8,
+            else => unreachable,
+        };
+        self.mapper.clockPpuAddress(address);
+
+        switch (phase) {
+            1 => self.bg_next_tile = self.readMemory(address),
             3 => {
-                const address = 0x23c0 | (self.v & 0x0c00) | ((self.v >> 4) & 0x38) | ((self.v >> 2) & 0x07);
                 const shift: u3 = @truncate(((self.v >> 4) & 4) | (self.v & 2));
                 self.bg_next_attribute = @truncate((self.readMemory(address) >> shift) & 3);
             },
-            5 => {
-                const fine_y = (self.v >> 12) & 7;
-                const pattern_base: u16 = if (self.ctrl & 0x10 != 0) 0x1000 else 0;
-                self.bg_next_pattern_low = self.readMemory(pattern_base + @as(u16, self.bg_next_tile) * 16 + fine_y);
-            },
-            7 => {
-                const fine_y = (self.v >> 12) & 7;
-                const pattern_base: u16 = if (self.ctrl & 0x10 != 0) 0x1000 else 0;
-                self.bg_next_pattern_high = self.readMemory(pattern_base + @as(u16, self.bg_next_tile) * 16 + fine_y + 8);
-            },
+            5 => self.bg_next_pattern_low = self.readMemory(address),
+            7 => self.bg_next_pattern_high = self.readMemory(address),
             0 => {
                 self.bg_pattern_shift_low = (self.bg_pattern_shift_low & 0xff00) | self.bg_next_pattern_low;
                 self.bg_pattern_shift_high = (self.bg_pattern_shift_high & 0xff00) | self.bg_next_pattern_high;
@@ -259,6 +268,18 @@ pub const Ppu = struct {
             },
             else => {},
         }
+        return true;
+    }
+
+    /// At dot zero the PPU retains the pattern-table address calculated by
+    /// the two unused name-table fetches at the end of the prior scanline.
+    /// Modelling it as low creates a false qualified A12 rise at dot five of
+    /// the next line; only its A12 state is needed before full fetch timing.
+    fn idlePpuAddress(self: *const Ppu) u16 {
+        if (self.renderingEnabled() and (self.scanline < frame_height or self.scanline == 261) and self.dot == 0) {
+            return if (self.ctrl & 0x10 != 0) 0x1000 else 0;
+        }
+        return 0;
     }
 
     /// Emits one visible background pixel before advancing the fetch shift
@@ -1140,6 +1161,39 @@ test "background fetch pipeline reads tile data and loads shift registers every 
     try std.testing.expectEqual(@as(u16, 0x00ff), ppu.bg_attribute_shift_high);
     // Dot 8 completed the tile slot and then advanced coarse X.
     try std.testing.expectEqual(@as(u16, 1), ppu.v & 0x001f);
+}
+
+test "background pattern fetch holds MMC3 A12 for both dots of each phase" {
+    var prg: [4 * 0x2000]u8 = [_]u8{0} ** (4 * 0x2000);
+    var chr: [8 * 0x400]u8 = [_]u8{0} ** (8 * 0x400);
+    var mapper = Mapper4{ .prg_rom = &prg, .chr_rom = &chr, .chr_is_ram = false, .mirroring_mode = .vertical };
+    var ppu = Ppu.init(Mapper.fromMapper4(&mapper));
+    ppu.mask = 0x08;
+    ppu.ctrl = 0x10;
+    ppu.scanline = 0;
+    ppu.dot = 5;
+
+    ppu.tickDot(); // pattern low, A12 high
+    try std.testing.expectEqual(@as(u4, 0), mapper.a12_low_dots);
+    ppu.tickDot(); // the same pattern phase still holds A12 high
+    try std.testing.expectEqual(@as(u4, 0), mapper.a12_low_dots);
+    ppu.tickDot(); // pattern high, A12 remains high
+    try std.testing.expectEqual(@as(u4, 0), mapper.a12_low_dots);
+}
+
+test "MMC3 background A12 stream has one qualified rise per visible scanline" {
+    var prg: [4 * 0x2000]u8 = [_]u8{0} ** (4 * 0x2000);
+    var chr: [8 * 0x400]u8 = [_]u8{0} ** (8 * 0x400);
+    var mapper = Mapper4{ .prg_rom = &prg, .chr_rom = &chr, .chr_is_ram = false, .mirroring_mode = .vertical };
+    var ppu = Ppu.init(Mapper.fromMapper4(&mapper));
+    ppu.mask = 0x08;
+    ppu.ctrl = 0x10;
+    try std.testing.expect(mapper.cpuWrite(0xc000, 3));
+    try std.testing.expect(mapper.cpuWrite(0xe001, 0));
+
+    for (0..2 * 341) |_| ppu.tickDot();
+    try std.testing.expectEqual(@as(u8, 2), mapper.irq_counter);
+    try std.testing.expect(!mapper.irqPending());
 }
 
 test "background fetch pipeline primes the pre-render scanline" {

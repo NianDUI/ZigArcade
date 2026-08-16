@@ -18,7 +18,7 @@ MVP（FC）包含 iNES 1.0、Mapper 0/NROM、2A03 CPU、dot 时钟驱动的 PPU 
 | P1 | 2A03、逐总线周期 CPU 总线、trace runner | `nestest` 在约定入口逐行匹配 PC、寄存器、周期；中断、RMW、dummy-read bus trace 通过 |
 | P2 | iNES、NROM、dot 时钟 PPU、寄存器/NMI、背景 | 锁定版本的公开 CPU/PPU 测试 ROM 通过，含 VBlank/NMI 边界测试；现已具备 dot clock、`v/t` 推进、光栅寄存器回放及背景 fetch/shift-register 像素输出 |
 | P3 | DMA、控制器、精灵、滚动 | NROM 自制 ROM 可操作，固定帧 RGB 哈希匹配 |
-| P4 | Mapper 1/2/3/4、APU、可选宿主音频 | 每个 mapper 有 bank/mirroring 单测和公开 ROM 回归；现已覆盖 Mapper 1/2/3/4/7 与多通道 APU 基础链，MMC3 A12 IRQ 和公开音频精度基线仍待完成 |
+| P4 | Mapper 1/2/3/4、APU、可选宿主音频 | 每个 mapper 有 bank/mirroring 单测和公开 ROM 回归；现已覆盖 Mapper 1/2/3/4/7 与多通道 APU 基础链，MMC3 的背景取数 A12 IRQ 已接入，完整精灵光栅时序与公开音频精度基线仍待完成 |
 | P5a | Neo Geo 68000、BIOS/地址图、输入、IRQ 诊断 | 锁定的 68000 指令测试和 BIOS memory-map 诊断通过 |
 | P5b | Neo Geo Z80、sound latch、VRAM/palette/fixed layer | Z80 map 与 CPU 间命令/应答测试通过；`320×224` 固定层诊断画面匹配 |
 | P6 | Neo Geo 精灵视频、YM2610 | 用户合法 ROM/BIOS 的兼容性矩阵达标 |
@@ -122,7 +122,7 @@ CPU `read/write` 和无副作用 `peek` 必须分开；CPU 绝不使用 `peek`�
 
 ### 6.2 PPU、卡带与控制器
 
-PPU 为 341 dot × 262 scanline，约 60.0988 FPS。`tickDot()` 是唯一驱动寄存器、NMI、滚动地址、背景像素、sprite overflow 和取数/IRQ 可观察状态的规范实现；精灵叠加器仍消费在 VBlank 锁存的状态及可见区寄存器写入回放，不能替代 dot 时钟。CPU bus 访问须有绝对 CPU/PPU tick；已实现 pre-render odd-frame dot skip、PPU open bus、渲染期 coarse X/fine Y 推进、dot 257 水平拷贝、pre-render 280–304 垂直拷贝，以及背景名称表/属性/pattern 在 1/3/5/7 dot 的取数、每 8 dot 的 16 位 pattern/attribute shift-register 装载和直接像素输出（含 321–336 dot prefetch）。sprite overflow 自 dot 65 起为下一扫描线扫描（pre-render 对应第 0 行），首八个命中后按 2/3/4/1 字节循环的错误路径检测，且 Y=`$FF` 保持 off-screen；但尚不产生完整 secondary OAM。仍待完整 VBlank/NMI 抑制边界与逐 dot 精灵取数/评估；后续 MMC3 以 PPU A12 上升沿驱动 IRQ。
+PPU 为 341 dot × 262 scanline，约 60.0988 FPS。`tickDot()` 是唯一驱动寄存器、NMI、滚动地址、背景像素、sprite overflow 和取数/IRQ 可观察状态的规范实现；精灵叠加器仍消费在 VBlank 锁存的状态及可见区寄存器写入回放，不能替代 dot 时钟。CPU bus 访问须有绝对 CPU/PPU tick；已实现 pre-render odd-frame dot skip、PPU open bus、渲染期 coarse X/fine Y 推进、dot 257 水平拷贝、pre-render 280–304 垂直拷贝，以及背景名称表/属性/pattern 在 1/3/5/7 dot 的取数、每 8 dot 的 16 位 pattern/attribute shift-register 装载和直接像素输出（含 321–336 dot prefetch）。背景取数地址也会逐 dot 送入 MMC3，A12 低电平持续至少 8 dot 后的上升沿可重载/递减 IRQ 计数器并在下一 CPU 指令边界交付 IRQ；CPU `$2007` 访问和展示快照不会参与该时钟。sprite overflow 自 dot 65 起为下一扫描线扫描（pre-render 对应第 0 行），首八个命中后按 2/3/4/1 字节循环的错误路径检测，且 Y=`$FF` 保持 off-screen；但尚不产生完整 secondary OAM。仍待完整 VBlank/NMI 抑制边界与逐 dot 精灵取数/评估；在此之前 MMC3 IRQ 仅覆盖背景取数，不能视为完整精灵光栅 IRQ 时序。
 
 已实现：`$2000-$2007` 的 `v/t/x/w` 锁存、`$2002` 清 VBlank/重置写锁存、pattern/nametable/palette 镜像、VBlank NMI、背景 tile/attribute、背景逐 dot fetch/shift-register/像素输出、精灵透明/优先级/基础 8 精灵限制、sprite-0 hit，以及八精灵后的错误字节循环 sprite overflow 搜索。明确 `$3000-$3EFF` nametable mirror 与 `$3F10/$14/$18/$1C` palette mirror。内部先输出调色板索引，再映射 64 色 RGB。待完成：完整 secondary OAM、逐 dot 精灵取数/评估，以及上述边界的公开 ROM 验证。
 
