@@ -136,7 +136,7 @@ pub const Nes = struct {
             // The 2A03 samples IRQ near the start of an instruction's
             // penultimate cycle. An edge after the first PPU dot of that CPU
             // cycle misses the poll and must wait through one more opcode.
-            const poll_cycle = cycles - 1;
+            const poll_cycle = cycles - (if (self.cpu.irq_poll_one_cycle_early) @as(u8, 2) else 1);
             if (edge_cycle > poll_cycle or (edge_cycle == poll_cycle and self.irq_edge_subdot > 0)) {
                 self.irq_deferred = true;
             }

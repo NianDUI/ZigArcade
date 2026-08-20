@@ -30,6 +30,7 @@ pub const Cpu = struct {
     nmi_vector_hijack: bool = false,
     nmi_hijack_consumed: bool = false,
     nmi_after_vector_select: bool = false,
+    irq_poll_one_cycle_early: bool = false,
     /// CLI, SEI, and PLP expose their new I flag immediately to software but
     /// IRQ polling at the following instruction boundary still uses the old
     /// value. RTI is intentionally excluded because its restored I flag takes
@@ -81,6 +82,7 @@ pub const Cpu = struct {
     /// initial P1 slice records all architecturally visible bus reads/writes;
     /// undocumented opcodes and interrupt micro-sequences are added later.
     pub fn step(self: *Cpu, bus: *TestBus) !u8 {
+        self.irq_poll_one_cycle_early = false;
         const irq_disabled = self.irq_i_override orelse self.status.interrupt_disable;
         self.irq_i_override = null;
         if (self.nmi_pending) {
@@ -898,6 +900,9 @@ pub const Cpu = struct {
             _ = bus.read((previous_pc & 0xff00) | (self.pc & 0x00ff));
             return 4;
         }
+        // A taken branch that remains on-page polls IRQ before its final
+        // dummy cycle, so an edge on that cycle waits through one opcode.
+        self.irq_poll_one_cycle_early = true;
         return 3;
     }
 
@@ -1061,6 +1066,21 @@ test "taken BNE across page emits both dummy reads" {
         .{ .kind = .read, .address = 0x80ff, .value = 0x00 },
         .{ .kind = .read, .address = 0x8000, .value = 0x00 },
     }, bus.accesses());
+}
+
+test "taken on-page branch marks its early IRQ poll" {
+    var bus: TestBus = .{};
+    bus.memory[0x8000..][0..4].* = .{ 0xd0, 0x01, 0xea, 0xea };
+    var cpu: Cpu = .{ .pc = 0x8000 };
+
+    try std.testing.expectEqual(@as(u8, 3), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u16, 0x8003), cpu.pc);
+    try std.testing.expect(cpu.irq_poll_one_cycle_early);
+
+    cpu.pc = 0x8000;
+    cpu.status.zero = true;
+    try std.testing.expectEqual(@as(u8, 2), try cpu.step(&bus));
+    try std.testing.expect(!cpu.irq_poll_one_cycle_early);
 }
 
 test "BRK pushes PC plus two and vectors through IRQ" {
