@@ -24,9 +24,9 @@ pub const Apu = struct {
     frame_mode_5_step: bool = false,
     frame_irq_inhibit: bool = false,
     frame_irq: bool = false,
+    frame_irq_tail: u2 = 0,
     frame_counter_write_value: ?u8 = null,
     frame_counter_write_delay: u3 = 0,
-    frame_counter_write_extra_hold: bool = false,
     pulse1_divider: u16 = 0,
     pulse1_step: u3 = 0,
     pulse_clock_phase: bool = false,
@@ -124,10 +124,9 @@ pub const Apu = struct {
             },
             0x4017 => {
                 self.frame_irq_inhibit = value & 0x40 != 0;
-                if (self.frame_irq_inhibit) self.frame_irq = false;
+                if (self.frame_irq_inhibit) self.clearFrameIrq();
                 self.frame_counter_write_value = value;
                 self.frame_counter_write_delay = if (self.cpu_cycles & 1 == 0) 3 else 4;
-                self.frame_counter_write_extra_hold = self.frame_counter_write_delay == 3;
                 return true;
             },
             else => return false,
@@ -144,7 +143,7 @@ pub const Apu = struct {
             (@as(u8, @intFromBool(self.dmc_bytes_remaining != 0)) << 4) |
             (@as(u8, @intFromBool(self.frame_irq)) << 6);
         const with_dmc_irq = value | (@as(u8, @intFromBool(self.dmc_irq)) << 7);
-        self.frame_irq = false;
+        self.clearFrameIrq();
         return with_dmc_irq;
     }
 
@@ -154,11 +153,9 @@ pub const Apu = struct {
     pub fn tick(self: *Apu, cycles: u16) void {
         for (0..cycles) |_| {
             self.cpu_cycles += 1;
-            const skip_frame_counter_clock = self.clockPendingFrameCounterWrite();
-            if (skip_frame_counter_clock == null or !skip_frame_counter_clock.?) {
-                self.frame_counter_cycles += 1;
-                self.clockFrameSequencer();
-            }
+            self.clockPendingFrameCounterWrite();
+            self.frame_counter_cycles +%= 1;
+            self.clockFrameSequencer();
             self.tickPulses();
             self.tickTriangle();
             self.tickNoise();
@@ -195,19 +192,29 @@ pub const Apu = struct {
 
     fn clockFrameSequencer(self: *Apu) void {
         const cycle = self.frame_counter_cycles;
-        if (cycle == 3729 or cycle == 11186) self.clockQuarterFrame();
-        if (cycle == 7457) {
+        // NTSC frame events are expressed in CPU cycles. Mode 0 raises the
+        // frame flag on three consecutive clocks around its terminal step;
+        // wrapping through maxInt preserves the following 29,830-cycle period.
+        if (!self.frame_mode_5_step and self.frame_irq_tail != 0) {
+            if (self.frame_irq_tail == 2) {
+                self.clockQuarterFrame();
+                self.clockLengthCounters();
+                self.clockPulseSweeps();
+            }
+            self.setFrameIrq();
+            self.frame_irq_tail -= 1;
+        }
+        if (cycle == 7458 or cycle == 22372) self.clockQuarterFrame();
+        if (cycle == 14914) {
             self.clockQuarterFrame();
             self.clockLengthCounters();
             self.clockPulseSweeps();
         }
-        if (!self.frame_mode_5_step and cycle == 14915) {
-            self.clockQuarterFrame();
-            self.clockLengthCounters();
-            self.clockPulseSweeps();
-            if (!self.frame_irq_inhibit) self.frame_irq = true;
-            self.frame_counter_cycles = 0;
-        } else if (self.frame_mode_5_step and cycle == 18641) {
+        if (!self.frame_mode_5_step and cycle == 29829) {
+            self.setFrameIrq();
+            self.frame_irq_tail = 2;
+            self.frame_counter_cycles = std.math.maxInt(u16);
+        } else if (self.frame_mode_5_step and cycle == 37282) {
             self.clockQuarterFrame();
             self.clockLengthCounters();
             self.clockPulseSweeps();
@@ -215,22 +222,29 @@ pub const Apu = struct {
         }
     }
 
-    fn clockPendingFrameCounterWrite(self: *Apu) ?bool {
-        if (self.frame_counter_write_value == null) return null;
+    fn clockPendingFrameCounterWrite(self: *Apu) void {
+        if (self.frame_counter_write_value == null) return;
         self.frame_counter_write_delay -= 1;
-        if (self.frame_counter_write_delay != 0) return null;
+        if (self.frame_counter_write_delay != 0) return;
         const value = self.frame_counter_write_value.?;
         self.frame_counter_write_value = null;
         self.frame_mode_5_step = value & 0x80 != 0;
         self.frame_counter_cycles = 0;
-        const skip_frame_counter_clock = self.frame_counter_write_extra_hold;
-        self.frame_counter_write_extra_hold = false;
+        self.frame_irq_tail = 0;
         if (self.frame_mode_5_step) {
             self.clockQuarterFrame();
             self.clockLengthCounters();
             self.clockPulseSweeps();
         }
-        return skip_frame_counter_clock;
+    }
+
+    fn setFrameIrq(self: *Apu) void {
+        if (self.frame_irq_inhibit) return;
+        self.frame_irq = true;
+    }
+
+    fn clearFrameIrq(self: *Apu) void {
+        self.frame_irq = false;
     }
 
     fn clockQuarterFrame(self: *Apu) void {
@@ -483,7 +497,7 @@ test "APU stores CPU-visible registers and reports frame IRQ through $4015" {
     try std.testing.expectEqual(@as(u8, 0x1f), apu.channel_enable);
     try std.testing.expect(!apu.cpuWrite(0x4014, 0));
 
-    apu.tick(14915);
+    apu.tick(29829);
     try std.testing.expect(apu.frameIrqPending());
     try std.testing.expectEqual(@as(?u8, 0x50), apu.cpuRead(0x4015));
     try std.testing.expect(!apu.frameIrqPending());
@@ -497,8 +511,7 @@ test "APU five-step mode and IRQ inhibit suppress frame IRQ" {
     try std.testing.expect(!apu.frameIrqPending());
 
     _ = apu.cpuWrite(0x4017, 0x00);
-    apu.tick(4);
-    apu.tick(14914);
+    apu.tick(29832);
     try std.testing.expect(apu.frameIrqPending());
     _ = apu.cpuWrite(0x4017, 0x40);
     try std.testing.expect(!apu.frameIrqPending());
@@ -528,17 +541,17 @@ test "APU frame sequencer clocks terminal half-frames in four and five step mode
     _ = apu.cpuWrite(0x4000, 0x00);
     _ = apu.cpuWrite(0x4015, 1);
     _ = apu.cpuWrite(0x4003, 0x18); // length index 3 -> 2
-    apu.tick(7457);
+    apu.tick(14914);
     try std.testing.expectEqual(@as(u8, 1), apu.pulse1_length);
-    apu.tick(7458);
+    apu.tick(14916);
     try std.testing.expectEqual(@as(u8, 0), apu.pulse1_length);
 
     _ = apu.cpuWrite(0x4003, 0x18);
     _ = apu.cpuWrite(0x4017, 0x80);
     try std.testing.expectEqual(@as(u8, 2), apu.pulse1_length);
-    apu.tick(4); // delayed five-step reset clocks a half-frame once
+    apu.tick(3); // delayed five-step reset clocks a half-frame once
     try std.testing.expectEqual(@as(u8, 1), apu.pulse1_length);
-    apu.tick(18640);
+    apu.tick(14913);
     try std.testing.expectEqual(@as(u8, 0), apu.pulse1_length);
 }
 
@@ -550,7 +563,7 @@ test "APU pulse-1 length reloads on $4003 and appears in $4015 status" {
     try std.testing.expectEqual(@as(u8, 30), apu.pulse1_length);
     try std.testing.expectEqual(@as(?u8, 0x01), apu.cpuRead(0x4015));
 
-    apu.frame_counter_cycles = 7456;
+    apu.frame_counter_cycles = 14913;
     apu.tick(1);
     try std.testing.expectEqual(@as(u8, 29), apu.pulse1_length);
     _ = apu.cpuWrite(0x4015, 0);
@@ -581,17 +594,17 @@ test "APU pulse envelope decays and loops at quarter-frame timing" {
     _ = apu.cpuWrite(0x4000, 0x00); // envelope period 0, no loop
     _ = apu.cpuWrite(0x4015, 1);
     _ = apu.cpuWrite(0x4003, 0xf8);
-    apu.tick(3729);
+    apu.tick(7458);
     try std.testing.expectEqual(@as(u4, 15), apu.pulse1_envelope_decay);
-    apu.tick(3729);
+    apu.tick(7456);
     try std.testing.expectEqual(@as(u4, 14), apu.pulse1_envelope_decay);
 
     _ = apu.cpuWrite(0x4004, 0x20); // looping pulse 2 envelope
     _ = apu.cpuWrite(0x4015, 2);
     _ = apu.cpuWrite(0x4007, 0xf8);
-    apu.tick(3729);
+    apu.tick(7458);
     apu.pulse2_envelope_decay = 0;
-    apu.tick(3729);
+    apu.tick(7458);
     try std.testing.expectEqual(@as(u4, 15), apu.pulse2_envelope_decay);
 }
 
@@ -652,7 +665,7 @@ test "APU triangle clocks its linear counter and timer independently" {
     try std.testing.expectEqual(@as(u8, 30), apu.triangle_length);
     try std.testing.expectEqual(@as(?u8, 0x04), apu.cpuRead(0x4015));
 
-    apu.tick(3729);
+    apu.tick(7458);
     try std.testing.expectEqual(@as(u8, 127), apu.triangle_linear_counter);
     const before = apu.triangle_step;
     apu.tick(3);

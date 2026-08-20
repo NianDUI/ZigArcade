@@ -39,6 +39,9 @@ pub const Nes = struct {
     irq_edge_cycle: ?u8 = null,
     irq_edge_subdot: u2 = 0,
     irq_deferred: bool = false,
+    // A 513-cycle OAM DMA releases the CPU one APU phase earlier than the
+    // aligned 514-cycle form, affecting the first resumed IRQ poll only.
+    post_dma_apu_irq_early: bool = false,
 
     pub fn init(self: *Nes, cartridge: Cartridge) void {
         self.null_audio_sink = .{};
@@ -68,6 +71,7 @@ pub const Nes = struct {
         self.irq_edge_cycle = null;
         self.irq_edge_subdot = 0;
         self.irq_deferred = false;
+        self.post_dma_apu_irq_early = false;
         self.bus.setTraceEnabled(false);
         self.bus.attachMapper(mapper);
         self.bus.attachPpu(&self.ppu);
@@ -141,14 +145,21 @@ pub const Nes = struct {
         if (self.bus.takeDmaRequest()) |page| {
             var dma = OamDma.init(page, self.cpu.pc, self.cpu.cycles);
             var dma_cycles: u16 = 0;
+            var irq_during_dma = false;
             while (true) {
                 dma_cycles += 1;
+                const irq_before_dma_cycle = self.irqLinePending();
                 const active = dma.tick(&self.bus, &self.ppu);
                 self.apu.tick(1);
                 dmc_cycles += self.serviceDmcDma();
                 for (0..3) |_| self.ppu.tickDot();
+                if (!irq_before_dma_cycle and self.irqLinePending()) irq_during_dma = true;
                 if (!active) break;
             }
+            // IRQ cannot interrupt the CPU while OAM DMA owns the bus. A line
+            // raised during the halt is first eligible after one resumed opcode.
+            if (irq_during_dma) self.irq_deferred = true;
+            self.post_dma_apu_irq_early = !dma.needs_alignment;
             self.cpu.cycles += dma_cycles + dmc_cycles;
             return @as(u16, cycles) + dma_cycles + dmc_cycles;
         }
@@ -158,7 +169,12 @@ pub const Nes = struct {
 
     fn advanceDevices(self: *Nes, cpu_cycles: u8, sample_nmi_after_cycle: bool) void {
         for (0..cpu_cycles) |_| {
+            const irq_before_apu = self.irqLinePending();
             self.apu.tick(1);
+            if (self.tracking_cpu_instruction and !irq_before_apu and self.irqLinePending() and self.irq_edge_cycle == null) {
+                self.irq_edge_cycle = self.instruction_cycle_progress + 1;
+                self.irq_edge_subdot = if (self.post_dma_apu_irq_early) 0 else 1;
+            }
             for (0..3) |subdot| {
                 const irq_before = self.irqLinePending();
                 self.ppu.tickDot();
@@ -171,6 +187,7 @@ pub const Nes = struct {
                 self.instruction_cycle_progress += 1;
                 if (sample_nmi_after_cycle) self.sampleNmiLine();
             }
+            self.post_dma_apu_irq_early = false;
         }
     }
 
@@ -379,7 +396,7 @@ test "Nes delivers APU frame IRQ at the next CPU instruction boundary" {
     var nes: Nes = undefined;
     nes.init(cartridge);
     nes.cpu.status.interrupt_disable = false;
-    nes.apu.tick(14915);
+    nes.apu.tick(29829);
 
     try std.testing.expectEqual(@as(u16, 7), try nes.step());
     try std.testing.expectEqual(@as(u16, 0x9000), nes.cpu.pc);
