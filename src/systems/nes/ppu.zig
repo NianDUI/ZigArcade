@@ -14,6 +14,7 @@ pub const RenderError = error{InvalidFrameBuffer};
 /// a bounded log for one frame so the presentation renderer can replay the
 /// same state transitions after VBlank without participating in PPU timing.
 const raster_event_capacity = 128;
+const open_bus_decay_dots: u64 = 3_221_591; // approximately 600 ms at NTSC PPU speed
 
 const RasterState = struct {
     scroll_x: u8,
@@ -137,6 +138,8 @@ pub const Ppu = struct {
     write_toggle: bool = false,
     read_buffer: u8 = 0,
     open_bus: u8 = 0,
+    open_bus_expiry: [8]u64 = [_]u64{0} ** 8,
+    total_dots: u64 = 0,
     scanline: u16 = 0,
     dot: u16 = 0,
     frame_number: u64 = 0,
@@ -188,6 +191,7 @@ pub const Ppu = struct {
     /// Advances exactly one NTSC PPU dot and latches an NMI edge at the
     /// start of VBlank when PPUCTRL enables it.
     pub fn tickDot(self: *Ppu) void {
+        self.total_dots += 1;
         if (self.scanline == 0 and self.dot == 0) self.latchActiveRasterState();
         if (self.scanline == 240 and self.dot == 340) {
             self.nmi_output_active = true;
@@ -925,6 +929,7 @@ pub const Ppu = struct {
 
     /// `register_address` is already mirrored to $2000-$2007 by the CPU bus.
     pub fn cpuRead(self: *Ppu, register_address: u3) u8 {
+        self.decayOpenBus();
         const value: u8 = switch (register_address) {
             2 => blk: {
                 const status = (self.status & 0xe0) | (self.open_bus & 0x1f);
@@ -938,18 +943,33 @@ pub const Ppu = struct {
                 // lowers that output and can retract the just-produced edge.
                 self.clearNmi();
                 self.write_toggle = false;
+                self.refreshOpenBus(status, 0xe0);
                 break :blk status;
             },
-            4 => self.oam[self.oam_addr],
-            7 => self.readData(),
+            4 => blk: {
+                const oam_value = if (self.oam_addr & 3 == 2) self.oam[self.oam_addr] & 0xe3 else self.oam[self.oam_addr];
+                self.refreshOpenBus(oam_value, 0xff);
+                break :blk oam_value;
+            },
+            7 => blk: {
+                const palette_read = self.v & 0x3fff >= 0x3f00;
+                const data = self.readData();
+                if (palette_read) {
+                    const palette_value = (data & 0x3f) | (self.open_bus & 0xc0);
+                    self.refreshOpenBus(palette_value, 0x3f);
+                    break :blk palette_value;
+                }
+                self.refreshOpenBus(data, 0xff);
+                break :blk data;
+            },
             else => self.open_bus,
         };
-        self.open_bus = value;
         return value;
     }
 
     pub fn cpuWrite(self: *Ppu, register_address: u3, value: u8) void {
-        self.open_bus = value;
+        self.decayOpenBus();
+        self.refreshOpenBus(value, 0xff);
         switch (register_address) {
             0 => {
                 const had_nmi_enabled = self.ctrl & 0x80 != 0;
@@ -986,6 +1006,25 @@ pub const Ppu = struct {
                 self.mapper.clockPpuAddress(self.v & 0x3fff);
             },
             else => {},
+        }
+    }
+
+    fn decayOpenBus(self: *Ppu) void {
+        for (0..8) |bit| {
+            const mask = @as(u8, 1) << @intCast(bit);
+            if (self.open_bus & mask != 0 and self.total_dots >= self.open_bus_expiry[bit]) {
+                self.open_bus &= ~mask;
+                self.open_bus_expiry[bit] = 0;
+            }
+        }
+    }
+
+    fn refreshOpenBus(self: *Ppu, value: u8, mask: u8) void {
+        self.open_bus = (self.open_bus & ~mask) | (value & mask);
+        for (0..8) |bit| {
+            const bit_mask = @as(u8, 1) << @intCast(bit);
+            if (mask & bit_mask == 0) continue;
+            self.open_bus_expiry[bit] = if (value & bit_mask != 0) self.total_dots + open_bus_decay_dots else 0;
         }
     }
 
@@ -1162,6 +1201,31 @@ test "PPUSTATUS clears VBlank and PPUADDR latch" {
     ppu.cpuWrite(6, 0x45);
     try std.testing.expectEqual(@as(u16, 0x2345), ppu.v);
     try std.testing.expectEqual(@as(u8, 0), ppu.status & 0x80);
+}
+
+test "PPU open-bus bits decay without write-only reads refreshing them" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.cpuWrite(0, 0xff);
+    ppu.total_dots += open_bus_decay_dots - 1;
+    try std.testing.expectEqual(@as(u8, 0xff), ppu.cpuRead(0));
+    ppu.total_dots += 2;
+    try std.testing.expectEqual(@as(u8, 0), ppu.cpuRead(0));
+
+    ppu.cpuWrite(2, 0xc0);
+    ppu.writeMemory(0x3f00, 0x0f);
+    ppu.v = 0x3f00;
+    try std.testing.expectEqual(@as(u8, 0xcf), ppu.cpuRead(7));
+
+    ppu.oam_addr = 2;
+    ppu.oam[2] = 0xff;
+    try std.testing.expectEqual(@as(u8, 0xe3), ppu.cpuRead(4));
 }
 
 test "PPUDATA is buffered outside palette and honors 32-byte increment" {

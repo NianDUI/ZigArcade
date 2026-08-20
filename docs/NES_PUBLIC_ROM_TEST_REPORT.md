@@ -19,7 +19,7 @@
 | 2A03 官方指令行为 | 1 | 0 | 0 |
 | PPU VBlank/NMI 单项 | 10 | 0 | 0 |
 | PPU read-buffer/DMA | 1 | 0 | 0 |
-| PPU open bus | 0 | 1 | 0 |
+| PPU open bus | 1 | 0 | 0 |
 | MMC3 IRQ 单项 | 5 | 0 | 0 |
 | APU 基础单项 | 6 | 0 | 0 |
 | APU reset 单项 | 6 | 0 | 0 |
@@ -42,7 +42,8 @@
 | `ppu_vbl_nmi/rom_singles/08-nmi_off_timing.nes` | 223 | Passed |
 | `ppu_vbl_nmi/rom_singles/09-even_odd_frames.nes` | 80 | Passed，输出 `00 01 01 02` |
 | `ppu_vbl_nmi/rom_singles/10-even_odd_timing.nes` | 144 | Passed，输出 `08 08 09 07` |
-| `ppu_read_buffer/test_ppu_read_buffer.nes` | 1310 | Passed |
+| `ppu_read_buffer/test_ppu_read_buffer.nes` | 1267 | Passed |
+| `ppu_open_bus/ppu_open_bus.nes` | 250 | Passed |
 | `cpu_interrupts_v2/rom_singles/1-cli_latency.nes` | 18 | Passed |
 | `cpu_interrupts_v2/rom_singles/2-nmi_and_brk.nes` | 114 | Passed |
 | `cpu_interrupts_v2/rom_singles/3-nmi_and_irq.nes` | 134 | Passed |
@@ -73,10 +74,6 @@
 
 VBlank 状态切换、NMI 输出窗口、`$2002`/`$2000` 撤销尚未采样边沿的行为，以及奇帧跳点启停边界均已对齐；十个单项现全部通过。
 
-### PPU open bus
-
-`ppu_open_bus/ppu_open_bus.nes` 在 74 帧以 `Failed #3` 结束：open-bus 值应在一秒内衰减为零。当前实现保留值但没有衰减模型。
-
 ### MMC3 IRQ
 
 CPU `$2006/$2007` 地址变化已经接入 MMC3 A12 观察路径。PPU 跨扫描线 A12 状态、首次背景 pattern fetch，以及 CPU 指令倒数第二周期的 IRQ 采样相位均已对齐；五个 MMC3 rev B 单项现全部通过。
@@ -97,6 +94,6 @@ CPU `$2006/$2007` 地址变化已经接入 MMC3 A12 观察路径。PPU 跨扫描
 
 当前 CPU 官方指令行为、PPU VBlank/NMI、PPU 基础内存/DMA 和 MMC3 IRQ 路径均已有公开 ROM 通过证据。建议后续修复顺序：
 
-1. PPU open-bus 衰减模型。
-2. 修复剩余 `instr_timing` APU length period 边界。
-3. 继续扩展 DMC DMA 与非官方 opcode 兼容边界。
+1. 修复剩余 `instr_timing` APU length period 边界。
+2. 继续扩展 DMC DMA 与非官方 opcode 兼容边界。
+3. 扩充 PPU sprite overflow 与非渲染期总线细节测试。
