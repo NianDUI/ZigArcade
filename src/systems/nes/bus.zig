@@ -32,6 +32,7 @@ pub const TestBus = struct {
     /// The integrated NES clocks devices between CPU bus cycles. Unit tests
     /// leave this disabled and retain the simple deterministic fixture bus.
     cpu_cycle_hook: ?CpuCycleHook = null,
+    cpu_cycle_after_access_hook: ?CpuCycleHook = null,
     cpu_cycle_context: ?*anyopaque = null,
     cpu_cycle_accesses: u8 = 0,
 
@@ -65,9 +66,10 @@ pub const TestBus = struct {
     /// to the current CPU cycle; every later one starts after one completed
     /// cycle, so the hook is called before it. `endCpuCycleHook` returns the
     /// number of observable bus cycles for the caller to clock the tail.
-    pub fn beginCpuCycleHook(self: *TestBus, context: *anyopaque, hook: CpuCycleHook) void {
+    pub fn beginCpuCycleHook(self: *TestBus, context: *anyopaque, hook: CpuCycleHook, after_access_hook: CpuCycleHook) void {
         self.cpu_cycle_context = context;
         self.cpu_cycle_hook = hook;
+        self.cpu_cycle_after_access_hook = after_access_hook;
         self.cpu_cycle_accesses = 0;
     }
 
@@ -75,6 +77,7 @@ pub const TestBus = struct {
         const access_count = self.cpu_cycle_accesses;
         self.cpu_cycle_context = null;
         self.cpu_cycle_hook = null;
+        self.cpu_cycle_after_access_hook = null;
         self.cpu_cycle_accesses = 0;
         return access_count;
     }
@@ -93,6 +96,7 @@ pub const TestBus = struct {
         else
             self.memory[address];
         self.record(.{ .kind = .read, .address = address, .value = value });
+        self.clockAfterCpuBusAccess();
         return value;
     }
 
@@ -125,6 +129,7 @@ pub const TestBus = struct {
             self.memory[address] = value;
         }
         self.record(.{ .kind = .write, .address = address, .value = value });
+        self.clockAfterCpuBusAccess();
     }
 
     pub fn clearTrace(self: *TestBus) void {
@@ -147,6 +152,10 @@ pub const TestBus = struct {
             if (self.cpu_cycle_accesses != 0) hook(self.cpu_cycle_context orelse unreachable);
             self.cpu_cycle_accesses += 1;
         }
+    }
+
+    fn clockAfterCpuBusAccess(self: *TestBus) void {
+        if (self.cpu_cycle_after_access_hook) |hook| hook(self.cpu_cycle_context orelse unreachable);
     }
 
     fn readMapped(self: *const TestBus, mapper: *const Mapper, address: u16) u8 {

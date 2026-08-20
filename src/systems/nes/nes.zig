@@ -101,7 +101,7 @@ pub const Nes = struct {
         self.nmi_edge_cycle = null;
         self.irq_edge_cycle = null;
         self.cpu.setIrqLine(!suppress_late_irq and self.irqLinePending());
-        self.bus.beginCpuCycleHook(@ptrCast(self), clockCpuBusCycle);
+        self.bus.beginCpuCycleHook(@ptrCast(self), clockCpuBusCycle, sampleCpuBusCycle);
         const cycles = self.cpu.step(&self.bus) catch |err| {
             _ = self.bus.endCpuCycleHook();
             self.tracking_cpu_instruction = false;
@@ -112,7 +112,7 @@ pub const Nes = struct {
         // The hook advances one cycle before every bus access after the
         // first. Complete the current bus cycle and any internal cycles that
         // did not touch the bus (for example an accumulator operation).
-        self.advanceDevices(cycles - bus_cycles + 1);
+        self.advanceDevices(cycles - bus_cycles + 1, true);
         self.tracking_cpu_instruction = false;
         if (release_deferred_nmi) self.cpu.requestNmi();
         if (self.nmi_edge_cycle) |edge_cycle| {
@@ -150,7 +150,7 @@ pub const Nes = struct {
         return @as(u16, cycles) + dmc_cycles;
     }
 
-    fn advanceDevices(self: *Nes, cpu_cycles: u8) void {
+    fn advanceDevices(self: *Nes, cpu_cycles: u8, sample_nmi_after_cycle: bool) void {
         for (0..cpu_cycles) |_| {
             self.apu.tick(1);
             for (0..3) |subdot| {
@@ -163,16 +163,25 @@ pub const Nes = struct {
             }
             if (self.tracking_cpu_instruction) {
                 self.instruction_cycle_progress += 1;
-                if (self.ppu.takeNmi() and self.nmi_edge_cycle == null) {
-                    self.nmi_edge_cycle = self.instruction_cycle_progress;
-                }
+                if (sample_nmi_after_cycle) self.sampleNmiLine();
             }
         }
     }
 
     fn clockCpuBusCycle(context: *anyopaque) void {
         const self: *Nes = @ptrCast(@alignCast(context));
-        self.advanceDevices(1);
+        self.advanceDevices(1, false);
+    }
+
+    fn sampleCpuBusCycle(context: *anyopaque) void {
+        const self: *Nes = @ptrCast(@alignCast(context));
+        self.sampleNmiLine();
+    }
+
+    fn sampleNmiLine(self: *Nes) void {
+        if (self.ppu.takeNmi() and self.nmi_edge_cycle == null) {
+            self.nmi_edge_cycle = self.instruction_cycle_progress + 1;
+        }
     }
 
     fn irqLinePending(self: *Nes) bool {
@@ -256,8 +265,8 @@ test "Nes defers a PPU NMI edge raised after a two-cycle instruction poll" {
     var nes: Nes = undefined;
     nes.init(cartridge);
     nes.ppu.ctrl = 0x80;
-    nes.ppu.scanline = 241;
-    nes.ppu.dot = 1;
+    nes.ppu.scanline = 240;
+    nes.ppu.dot = 340;
 
     _ = try nes.step(); // NOP advances dots and latches VBlank NMI after its poll.
     try std.testing.expectEqual(@as(u16, 0x8001), nes.cpu.pc);
@@ -267,10 +276,10 @@ test "Nes defers a PPU NMI edge raised after a two-cycle instruction poll" {
     try std.testing.expectEqual(@as(u16, 0x9000), nes.cpu.pc);
 }
 
-test "Nes PPUSTATUS read after VBlank starts cannot suppress the NMI edge" {
+test "Nes PPUSTATUS read after VBlank starts retracts an unsampled NMI edge" {
     var image: [16 + 16 * 1024]u8 = [_]u8{0} ** (16 + 16 * 1024);
     image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-    image[16..][0..3].* = .{ 0xad, 0x02, 0x20 }; // LDA $2002
+    image[16..][0..4].* = .{ 0xad, 0x02, 0x20, 0xea }; // LDA $2002; NOP
     image[16 + 0x3ffa] = 0x00;
     image[16 + 0x3ffb] = 0x90;
     image[16 + 0x3ffc] = 0x00;
@@ -285,8 +294,8 @@ test "Nes PPUSTATUS read after VBlank starts cannot suppress the NMI edge" {
     try std.testing.expectEqual(@as(u16, 4), try nes.step());
     try std.testing.expect(nes.cpu.a & 0x80 != 0);
     try std.testing.expect(nes.ppu.status & 0x80 == 0);
-    try std.testing.expectEqual(@as(u16, 7), try nes.step());
-    try std.testing.expectEqual(@as(u16, 0x9000), nes.cpu.pc);
+    try std.testing.expectEqual(@as(u16, 2), try nes.step());
+    try std.testing.expectEqual(@as(u16, 0x8004), nes.cpu.pc);
 }
 
 test "Nes PPUSTATUS read on VBlank's start dot suppresses that frame" {
@@ -301,11 +310,11 @@ test "Nes PPUSTATUS read on VBlank's start dot suppresses that frame" {
     var nes: Nes = undefined;
     nes.init(cartridge);
     nes.ppu.ctrl = 0x80;
-    // The fourth bus access of LDA absolute is its data read. Starting nine
-    // PPU dots before scanline 241 dot 1 puts that read on the suppression
+    // The fourth bus access of LDA absolute is its data read. Starting ten
+    // PPU dots before scanline 241 dot 0 puts that read on the suppression
     // boundary, then the instruction tail clocks the suppressed transition.
     nes.ppu.scanline = 240;
-    nes.ppu.dot = 333;
+    nes.ppu.dot = 332;
 
     try std.testing.expectEqual(@as(u16, 4), try nes.step());
     try std.testing.expect(nes.cpu.a & 0x80 == 0);
@@ -407,7 +416,7 @@ test "Nes accepts an MMC3 IRQ edge before the penultimate-cycle poll" {
     nes.ppu.mask = 0x18;
     nes.ppu.ctrl = 0x08;
     nes.ppu.scanline = 261;
-    nes.ppu.dot = 261;
+    nes.ppu.dot = 260;
     nes.bus.write(0xc000, 0);
     nes.bus.write(0xe001, 0);
     var mapper = nes.mapperRef();
@@ -434,7 +443,7 @@ test "Nes defers an MMC3 IRQ edge after the penultimate-cycle poll" {
     nes.ppu.mask = 0x18;
     nes.ppu.ctrl = 0x08;
     nes.ppu.scanline = 261;
-    nes.ppu.dot = 260;
+    nes.ppu.dot = 259;
     nes.bus.write(0xc000, 0);
     nes.bus.write(0xe001, 0);
     var mapper = nes.mapperRef();

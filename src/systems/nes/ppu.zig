@@ -141,6 +141,7 @@ pub const Ppu = struct {
     dot: u16 = 0,
     frame_number: u64 = 0,
     nmi_pending: bool = false,
+    nmi_output_active: bool = false,
     /// The final background prefetch can leave A12 high across the scanline
     /// boundary. Keeping that state suppresses a second qualified MMC3 rise
     /// at dot 5 while still allowing the first rise after rendering starts.
@@ -188,15 +189,21 @@ pub const Ppu = struct {
     /// start of VBlank when PPUCTRL enables it.
     pub fn tickDot(self: *Ppu) void {
         if (self.scanline == 0 and self.dot == 0) self.latchActiveRasterState();
-        if (self.scanline == 241 and self.dot == 1) {
+        if (self.scanline == 240 and self.dot == 340) {
+            self.nmi_output_active = true;
+            if (self.ctrl & 0x80 != 0) self.raiseNmi();
+        } else if (self.scanline == 260 and self.dot == 340) {
+            self.nmi_output_active = false;
+            self.clearNmi();
+        }
+        if (self.scanline == 241 and self.dot == 0) {
             self.latchPresentationState();
             self.latchSpriteZeroState();
             if (!self.suppress_vblank) {
                 self.status |= 0x80;
-                if (self.ctrl & 0x80 != 0) self.nmi_pending = true;
             }
             self.suppress_vblank = false;
-        } else if (self.scanline == 261 and self.dot == 1) {
+        } else if (self.scanline == 261 and self.dot == 0) {
             self.status &= ~@as(u8, 0x80);
             self.status &= ~@as(u8, 0x40); // sprite-0 hit
             self.status &= ~@as(u8, 0x20); // sprite overflow
@@ -212,9 +219,10 @@ pub const Ppu = struct {
         if (!background_fetch and !sprite_fetch) self.mapper.clockPpuAddress(self.idlePpuAddress());
         self.clockScrollAddress();
 
-        // The decision to omit the final pre-render clock is sampled one dot
-        // before the skip itself. PPUMASK changes on dot 339 are too late.
-        if (self.scanline == 261 and self.dot == 338) {
+        // The rendering-enable signal passes through the PPU's internal
+        // pipeline before the odd-frame omission at dot 339. Sampling it at
+        // dot 337 matches the two-dot enable/disable boundary.
+        if (self.scanline == 261 and self.dot == 337) {
             self.odd_frame_skip_armed = self.frame_number & 1 != 0 and self.renderingEnabled();
         }
 
@@ -281,7 +289,15 @@ pub const Ppu = struct {
             7, 0 => pattern_address + 8,
             else => unreachable,
         };
-        self.mapper.clockPpuAddress(address);
+        const mapper_phase = (phase + 1) & 7;
+        const mapper_address = switch (mapper_phase) {
+            1, 2 => name_table_address,
+            3, 4 => attribute_address,
+            5, 6 => pattern_address,
+            7, 0 => pattern_address + 8,
+            else => unreachable,
+        };
+        self.mapper.clockPpuAddress(mapper_address);
         if (self.dot == 336) self.carry_a12_high_at_dot_zero = address & 0x1000 != 0;
 
         switch (phase) {
@@ -369,7 +385,15 @@ pub const Ppu = struct {
             6, 7 => pattern_address + 8,
             else => unreachable,
         };
-        self.mapper.clockPpuAddress(address);
+        const mapper_phase = (phase + 1) & 7;
+        const mapper_address: u16 = switch (mapper_phase) {
+            0, 1 => 0x2000 | (self.v & 0x0fff),
+            2, 3 => 0x23c0 | (self.v & 0x0c00),
+            4, 5 => pattern_address,
+            6, 7 => pattern_address + 8,
+            else => unreachable,
+        };
+        self.mapper.clockPpuAddress(mapper_address);
         switch (phase) {
             4 => self.sprite_fetch_low[slot] = self.readMemory(address),
             6 => self.sprite_fetch_high[slot] = self.readMemory(address),
@@ -717,6 +741,14 @@ pub const Ppu = struct {
         return pending;
     }
 
+    fn raiseNmi(self: *Ppu) void {
+        self.nmi_pending = true;
+    }
+
+    fn clearNmi(self: *Ppu) void {
+        self.nmi_pending = false;
+    }
+
     /// OAM DMA uses the same auto-increment behavior as a CPU write to
     /// $2004, but bypasses CPU register routing because it is a PPU-side bus.
     pub fn dmaWrite(self: *Ppu, value: u8) void {
@@ -899,13 +931,12 @@ pub const Ppu = struct {
                 // The RP2C02 has a narrow race at the start of VBlank: a
                 // status read at dot 0 or before dot 1's state transition
                 // suppresses the flag itself, not merely a pending NMI.
-                if (self.scanline == 241 and self.dot <= 1) self.suppress_vblank = true;
+                if (self.scanline == 241 and self.dot == 0) self.suppress_vblank = true;
                 self.status &= ~@as(u8, 0x80);
-                // `nmi_pending` is an already-latched edge for the CPU, not
-                // the PPU's live output level. Only the start-boundary race
-                // above can prevent it; a later status read cannot retract
-                // an edge that occurred during this instruction.
-                if (self.suppress_vblank) self.nmi_pending = false;
+                self.nmi_output_active = false;
+                // Until the CPU samples the PPU's NMI output, reading status
+                // lowers that output and can retract the just-produced edge.
+                self.clearNmi();
                 self.write_toggle = false;
                 break :blk status;
             },
@@ -930,9 +961,10 @@ pub const Ppu = struct {
                     self.sprite_zero_ctrl = value;
                     self.sprite_zero_ctrl_captured = true;
                 }
-                if (!had_nmi_enabled and value & 0x80 != 0 and self.status & 0x80 != 0) {
-                    self.nmi_pending = true;
+                if (!had_nmi_enabled and value & 0x80 != 0 and self.nmi_output_active) {
+                    self.raiseNmi();
                 }
+                if (had_nmi_enabled and value & 0x80 == 0) self.clearNmi();
                 self.recordRasterState();
             },
             1 => {
@@ -1161,9 +1193,10 @@ test "VBlank and enabling NMI during VBlank produce one pending NMI" {
         .mirroring = .horizontal,
     };
     var ppu = Ppu.init(&mapper);
-    ppu.scanline = 241;
-    ppu.dot = 1;
-    ppu.tickDot();
+    ppu.scanline = 240;
+    ppu.dot = 340;
+    ppu.tickDot(); // NMI output window opens before the status flag.
+    ppu.tickDot(); // VBlank status becomes visible at scanline 241 dot 0.
     try std.testing.expect(ppu.status & 0x80 != 0);
     try std.testing.expect(!ppu.takeNmi());
     ppu.cpuWrite(0, 0x80);
@@ -1171,7 +1204,7 @@ test "VBlank and enabling NMI during VBlank produce one pending NMI" {
     try std.testing.expect(!ppu.takeNmi());
 }
 
-test "PPUSTATUS read after the VBlank transition preserves its latched NMI edge" {
+test "PPUSTATUS read retracts an NMI edge not yet sampled by the CPU" {
     var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
     var mapper = Mapper0{
         .prg_rom = &prg,
@@ -1181,13 +1214,14 @@ test "PPUSTATUS read after the VBlank transition preserves its latched NMI edge"
     };
     var ppu = Ppu.init(&mapper);
     ppu.ctrl = 0x80;
-    ppu.scanline = 241;
-    ppu.dot = 1;
+    ppu.scanline = 240;
+    ppu.dot = 340;
+    ppu.tickDot();
     ppu.tickDot();
     try std.testing.expect(ppu.nmi_pending);
     _ = ppu.cpuRead(2);
-    try std.testing.expect(ppu.nmi_pending);
-    try std.testing.expect(ppu.takeNmi());
+    try std.testing.expect(!ppu.nmi_pending);
+    try std.testing.expect(!ppu.takeNmi());
 }
 
 test "PPUSTATUS read before VBlank dot 1 suppresses that frame's flag and NMI" {
@@ -1204,8 +1238,7 @@ test "PPUSTATUS read before VBlank dot 1 suppresses that frame's flag and NMI" {
     ppu.dot = 0;
 
     _ = ppu.cpuRead(2);
-    ppu.tickDot(); // dot 0 -> dot 1
-    ppu.tickDot(); // suppressed VBlank transition at dot 1
+    ppu.tickDot(); // suppressed VBlank transition at dot 0
 
     try std.testing.expect(ppu.status & 0x80 == 0);
     try std.testing.expect(!ppu.takeNmi());
@@ -1224,7 +1257,8 @@ test "rendering odd frame skips the final pre-render dot" {
     ppu.mask = 0x08;
     ppu.frame_number = 1;
     ppu.scanline = 261;
-    ppu.dot = 338;
+    ppu.dot = 337;
+    ppu.tickDot();
     ppu.tickDot();
     ppu.tickDot();
     try std.testing.expectEqual(@as(u16, 0), ppu.dot);
@@ -1234,7 +1268,8 @@ test "rendering odd frame skips the final pre-render dot" {
     ppu.mask = 0;
     ppu.frame_number = 1;
     ppu.scanline = 261;
-    ppu.dot = 338;
+    ppu.dot = 337;
+    ppu.tickDot();
     ppu.tickDot();
     ppu.tickDot();
     try std.testing.expectEqual(@as(u16, 340), ppu.dot);
@@ -1530,7 +1565,7 @@ test "sprite-0 state keeps the first VBlank display setup" {
     ppu.pending_nametable = 1;
     ppu.ctrl = 0x91;
     ppu.scanline = 241;
-    ppu.dot = 1;
+    ppu.dot = 0;
     ppu.tickDot();
 
     // Some games write scroll before PPUCTRL during their VBlank handler;
@@ -1649,7 +1684,7 @@ test "visible PPUCTRL write changes only the trailing background dots" {
     ppu.dot = 120;
     ppu.cpuWrite(0, 0x10); // switch background pattern table at dot 120
     ppu.scanline = 241;
-    ppu.dot = 1;
+    ppu.dot = 0;
     ppu.tickDot();
     try std.testing.expectEqual(@as(usize, 1), ppu.presentation_raster_event_count);
 
@@ -1685,7 +1720,7 @@ test "visible PPUSCROLL X write changes only subsequent background dots" {
     ppu.dot = 6;
     ppu.cpuWrite(5, 8);
     ppu.scanline = 241;
-    ppu.dot = 1;
+    ppu.dot = 0;
     ppu.tickDot();
     try std.testing.expectEqual(@as(usize, 1), ppu.presentation_raster_event_count);
 
@@ -1723,7 +1758,7 @@ test "PPUSCROLL writes at separate dots preserve the intermediate state" {
     ppu.dot = 14;
     ppu.cpuWrite(5, 8); // second write: Y changes at a later dot
     ppu.scanline = 241;
-    ppu.dot = 1;
+    ppu.dot = 0;
     ppu.tickDot();
     try std.testing.expectEqual(@as(usize, 2), ppu.presentation_raster_event_count);
 
@@ -1755,7 +1790,7 @@ test "visible PPUMASK write leaves earlier background pixels intact" {
     ppu.dot = 16;
     ppu.cpuWrite(1, 0); // disable background at dot 16
     ppu.scanline = 241;
-    ppu.dot = 1;
+    ppu.dot = 0;
     ppu.tickDot();
 
     var rgb: [frame_rgb_bytes]u8 = undefined;

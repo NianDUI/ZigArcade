@@ -17,7 +17,7 @@
 | 范围 | 通过 | 失败 | 阻塞/不适用 |
 |---|---:|---:|---:|
 | 2A03 官方指令行为 | 1 | 0 | 0 |
-| PPU VBlank/NMI 单项 | 5 | 5 | 0 |
+| PPU VBlank/NMI 单项 | 10 | 0 | 0 |
 | PPU read-buffer/DMA | 1 | 0 | 0 |
 | PPU open bus | 0 | 1 | 0 |
 | MMC3 IRQ 单项 | 5 | 0 | 0 |
@@ -32,29 +32,28 @@
 |---|---:|---|
 | `instr_test-v5/official_only.nes` | 1885 | `All 16 tests passed` |
 | `ppu_vbl_nmi/rom_singles/01-vbl_basics.nes` | 144 | Passed |
-| `ppu_vbl_nmi/rom_singles/03-vbl_clear_time.nes` | 187 | Passed |
-| `ppu_vbl_nmi/rom_singles/04-nmi_control.nes` | 35 | Passed |
-| `ppu_vbl_nmi/rom_singles/09-even_odd_frames.nes` | 81 | Passed，输出 `00 01 01 02` |
-| `ppu_vbl_nmi/rom_singles/10-even_odd_timing.nes` | 145 | Passed，输出 `08 08 09 07` |
+| `ppu_vbl_nmi/rom_singles/02-vbl_set_time.nes` | 171 | Passed |
+| `ppu_vbl_nmi/rom_singles/03-vbl_clear_time.nes` | 171 | Passed |
+| `ppu_vbl_nmi/rom_singles/04-nmi_control.nes` | 34 | Passed |
+| `ppu_vbl_nmi/rom_singles/05-nmi_timing.nes` | 221 | Passed |
+| `ppu_vbl_nmi/rom_singles/06-suppression.nes` | 224 | Passed |
+| `ppu_vbl_nmi/rom_singles/07-nmi_on_timing.nes` | 199 | Passed |
+| `ppu_vbl_nmi/rom_singles/08-nmi_off_timing.nes` | 223 | Passed |
+| `ppu_vbl_nmi/rom_singles/09-even_odd_frames.nes` | 80 | Passed，输出 `00 01 01 02` |
+| `ppu_vbl_nmi/rom_singles/10-even_odd_timing.nes` | 144 | Passed，输出 `08 08 09 07` |
 | `ppu_read_buffer/test_ppu_read_buffer.nes` | 1310 | Passed |
 | `cpu_interrupts_v2/rom_singles/1-cli_latency.nes` | 18 | Passed |
-| `mmc3_test/1-clocking.nes` | 26 | Passed |
-| `mmc3_test/2-details.nes` | 27 | Passed |
-| `mmc3_test/3-A12_clocking.nes` | 25 | Passed |
-| `mmc3_test/4-scanline_timing.nes` | 305 | Passed |
-| `mmc3_test/5-MMC3.nes` | 25 | Passed |
+| `mmc3_test/1-clocking.nes` | 24 | Passed |
+| `mmc3_test/2-details.nes` | 26 | Passed |
+| `mmc3_test/3-A12_clocking.nes` | 24 | Passed |
+| `mmc3_test/4-scanline_timing.nes` | 317 | Passed |
+| `mmc3_test/5-MMC3.nes` | 24 | Passed |
 
 ## 确认失败项
 
 ### PPU VBlank/NMI
 
-| ROM | 失败证据 |
-|---|---|
-| `02-vbl_set_time.nes` | 边界 `03` 得到 `- -`，最终 `Failed` |
-| `05-nmi_timing.nes` | 实际指令边界序列比期望提前 |
-| `06-suppression.nes` | VBlank/NMI 抑制窗口不匹配 |
-| `07-nmi_on_timing.nes` | NMI 开启边界多持续一个 PPU clock |
-| `08-nmi_off_timing.nes` | NMI 关闭边界过早出现 NMI |
+VBlank 状态切换、NMI 输出窗口、`$2002`/`$2000` 撤销尚未采样边沿的行为，以及奇帧跳点启停边界均已对齐；十个单项现全部通过。
 
 ### PPU open bus
 
@@ -84,9 +83,8 @@ CPU `$2006/$2007` 地址变化已经接入 MMC3 A12 观察路径。PPU 跨扫描
 
 ## 结论与建议顺序
 
-当前 CPU 官方指令行为和 PPU 基础内存/DMA 路径已有公开 ROM 通过证据，但 P2/P4 仍不能验收。建议修复顺序：
+当前 CPU 官方指令行为、PPU VBlank/NMI、PPU 基础内存/DMA 和 MMC3 IRQ 路径均已有公开 ROM 通过证据。建议后续修复顺序：
 
-1. 完成 PPU VBlank/NMI 的剩余 instruction-boundary 与单 PPU clock 窗口。
-2. 补全 NMI 打断 BRK/IRQ vectoring 的周期级仲裁。
-3. APU 上电状态、`$4017` 延迟和主机 RESET 生命周期。
-4. PPU open-bus 衰减模型。
+1. 补全 NMI 打断 BRK/IRQ vectoring 的周期级仲裁。
+2. APU 上电状态、`$4017` 延迟和主机 RESET 生命周期。
+3. PPU open-bus 衰减模型。
