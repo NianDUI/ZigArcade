@@ -312,9 +312,9 @@ fn hashNesFrames(init: std.process.Init, rom_path: []const u8, frame_count: u32)
     try output.flush();
 }
 
-/// Runs ROMs using blargg's conventional $6000 result protocol. The command
-/// only observes cartridge RAM at frame boundaries, so it cannot perturb CPU,
-/// PPU, APU, mapper, or controller timing.
+/// Runs ROMs using blargg's conventional $6000 result protocol. Ordinary
+/// status checks only observe cartridge RAM at frame boundaries; status $81
+/// additionally requests a delayed console reset while preserving PRG RAM.
 fn runNesTestRom(init: std.process.Init, rom_path: []const u8, frame_limit: u32) !void {
     const image = try std.Io.Dir.cwd().readFileAlloc(
         init.io,
@@ -329,14 +329,36 @@ fn runNesTestRom(init: std.process.Init, rom_path: []const u8, frame_limit: u32)
     var nes: Nes = undefined;
     nes.init(cartridge);
 
-    for (1..@as(usize, frame_limit) + 1) |frame_number| {
+    var frame_number: u32 = 0;
+    var reset_count: u8 = 0;
+    var waiting_for_reset_clear = false;
+    while (frame_number < frame_limit) {
         _ = try nes.runFrame();
+        frame_number += 1;
         if (!hasBlarggSignature(&nes)) continue;
         const status = nes.bus.peekCartridge(0x6000) orelse continue;
+        if (waiting_for_reset_clear and status != 0x81) waiting_for_reset_clear = false;
         if (status == 0x80) continue;
-        try printTestRomResult(init.io, &nes, @intCast(frame_number), status);
+        if (status == 0x81) {
+            if (waiting_for_reset_clear) continue;
+            if (reset_count == 8) {
+                try printTestRomResult(init.io, &nes, frame_number, status);
+                return error.TestRomResetRequired;
+            }
+            // Blargg reset tests require at least 100 ms between the request
+            // and the reset button. Seven NTSC frames safely exceed that.
+            for (0..7) |_| {
+                if (frame_number == frame_limit) break;
+                _ = try nes.runFrame();
+                frame_number += 1;
+            }
+            nes.reset();
+            reset_count += 1;
+            waiting_for_reset_clear = true;
+            continue;
+        }
+        try printTestRomResult(init.io, &nes, frame_number, status);
         if (status == 0) return;
-        if (status == 0x81) return error.TestRomResetRequired;
         return error.TestRomFailed;
     }
 

@@ -25,6 +25,7 @@ pub const Apu = struct {
     frame_irq_inhibit: bool = false,
     frame_irq: bool = false,
     frame_irq_tail: u2 = 0,
+    frame_counter_value: u8 = 0,
     frame_counter_write_value: ?u8 = null,
     frame_counter_write_delay: u3 = 0,
     pulse1_divider: u16 = 0,
@@ -68,6 +69,41 @@ pub const Apu = struct {
 
     pub fn init(sink: AudioSink) Apu {
         return .{ .sink = sink };
+    }
+
+    /// Power-on behaves as if mode 0 had already been selected roughly ten
+    /// CPU clocks before the reset vector begins executing.
+    pub fn powerOn(self: *Apu) void {
+        self.frame_counter_value = 0;
+        self.frame_mode_5_step = false;
+        self.frame_irq_inhibit = false;
+        self.clearFrameIrq();
+        self.frame_counter_cycles = 10;
+        self.frame_counter_write_value = null;
+        self.frame_counter_write_delay = 0;
+        self.frame_irq_tail = 0;
+    }
+
+    /// Reset clears channel enables and pending IRQs while retaining APU
+    /// register contents. The last `$4017` value is re-applied before the CPU
+    /// begins executing the reset vector.
+    pub fn reset(self: *Apu) void {
+        self.channel_enable = 0;
+        self.pulse1_length = 0;
+        self.pulse2_length = 0;
+        self.triangle_length = 0;
+        self.noise_length = 0;
+        self.dmc_bytes_remaining = 0;
+        self.dmc_sample_buffer = null;
+        self.dmc_request_pending = false;
+        self.dmc_irq = false;
+        self.clearFrameIrq();
+        self.frame_mode_5_step = self.frame_counter_value & 0x80 != 0;
+        self.frame_irq_inhibit = self.frame_counter_value & 0x40 != 0;
+        self.frame_counter_cycles = 10;
+        self.frame_counter_write_value = null;
+        self.frame_counter_write_delay = 0;
+        self.frame_irq_tail = 0;
     }
 
     /// Handles APU-owned CPU register writes. `$4014` DMA and `$4016`
@@ -123,6 +159,7 @@ pub const Apu = struct {
                 return true;
             },
             0x4017 => {
+                self.frame_counter_value = value;
                 self.frame_irq_inhibit = value & 0x40 != 0;
                 if (self.frame_irq_inhibit) self.clearFrameIrq();
                 self.frame_counter_write_value = value;
@@ -486,6 +523,28 @@ pub const Apu = struct {
 fn pulseHigh(duty: u8, step: u3) bool {
     const sequences = [_]u8{ 0b01000000, 0b01100000, 0b01111000, 0b10011111 };
     return sequences[duty] & (@as(u8, 0x80) >> step) != 0;
+}
+
+test "APU power-on and reset preserve frame mode but clear active channels" {
+    var null_sink = NullAudioSink{};
+    var apu = Apu.init(null_sink.asSink());
+    apu.powerOn();
+    try std.testing.expectEqual(@as(u16, 10), apu.frame_counter_cycles);
+    try std.testing.expect(!apu.frame_mode_5_step);
+
+    _ = apu.cpuWrite(0x4015, 0x0f);
+    _ = apu.cpuWrite(0x4008, 0xff);
+    _ = apu.cpuWrite(0x400b, 0x18);
+    _ = apu.cpuWrite(0x4017, 0x80);
+    apu.frame_irq = true;
+    apu.reset();
+
+    try std.testing.expectEqual(@as(u8, 0), apu.channel_enable);
+    try std.testing.expectEqual(@as(u8, 0), apu.triangle_length);
+    try std.testing.expectEqual(@as(u8, 0xff), apu.registers[8]);
+    try std.testing.expect(apu.frame_mode_5_step);
+    try std.testing.expectEqual(@as(u16, 10), apu.frame_counter_cycles);
+    try std.testing.expect(!apu.frameIrqPending());
 }
 
 test "APU stores CPU-visible registers and reports frame IRQ through $4015" {

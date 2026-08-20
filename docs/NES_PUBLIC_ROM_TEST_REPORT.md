@@ -22,10 +22,10 @@
 | PPU open bus | 0 | 1 | 0 |
 | MMC3 IRQ 单项 | 5 | 0 | 0 |
 | APU 基础单项 | 6 | 0 | 0 |
-| APU reset 单项 | 0 | 3 | 3 |
+| APU reset 单项 | 6 | 0 | 0 |
 | CPU/APU 指令时序与中断 | 5 | 1 | 0 |
 
-这里的“阻塞”表示 ROM 要求按 RESET 后继续，而当前自动入口没有模拟主机 RESET；不能据此判定测试通过或失败。没有 `$6000` 协议的旧测试 ROM 也不纳入统计。
+`romtest` 现会识别 `$6000=$81`，等待至少 100 ms 后模拟主机 RESET，并保留测试用于计数的 PRG RAM。没有 `$6000` 协议的旧测试 ROM 仍不纳入统计。
 
 ## 通过项
 
@@ -55,6 +55,12 @@
 | `apu_test/rom_singles/4-jitter.nes` | 21 | Passed |
 | `apu_test/rom_singles/5-len_timing.nes` | 115 | Passed |
 | `apu_test/rom_singles/6-irq_flag_timing.nes` | 24 | Passed |
+| `apu_reset/4015_cleared.nes` | 31 | Passed |
+| `apu_reset/4017_timing.nes` | 42 | Passed，输出有效写入延迟 12 clocks |
+| `apu_reset/4017_written.nes` | 59 | Passed |
+| `apu_reset/irq_flag_cleared.nes` | 33 | Passed |
+| `apu_reset/len_ctrs_enabled.nes` | 36 | Passed |
+| `apu_reset/works_immediately.nes` | 37 | Passed |
 | `mmc3_test/1-clocking.nes` | 24 | Passed |
 | `mmc3_test/2-details.nes` | 26 | Passed |
 | `mmc3_test/3-A12_clocking.nes` | 24 | Passed |
@@ -79,23 +85,18 @@ CPU `$2006/$2007` 地址变化已经接入 MMC3 A12 观察路径。PPU 跨扫描
 
 | ROM | 失败证据 |
 |---|---|
-| `apu_reset/4017_timing.nes` | `Failed #2`：上电/复位后的 frame IRQ 应更晚设置 |
-| `apu_reset/4017_written.nes` | `Failed #2`：上电时应等效写入 `$4017=$00` |
-| `apu_reset/works_immediately.nes` | `Failed #2`：上电后寄存器写应立即生效 |
 | `instr_timing/instr_timing.nes` | `Failed #5`：APU length period 与指令组合时序不匹配 |
-
-`4015_cleared.nes`、`irq_flag_cleared.nes`、`len_ctrs_enabled.nes` 请求 RESET 后继续，当前标为阻塞。
 
 ## 未纳入结论
 
 - 需要非官方 opcode 的 ROM：当前按既定兼容边界返回 `UnsupportedOpcode`。
 - 没有 `$6000-$6003` 状态协议的旧 ROM：当前入口返回 `TestRomProtocolNotFound`，不能据此判模拟失败。
-- 需要真实按键、人工观察、PAL、商业 ROM 或主机 RESET 的测试未执行。
+- 需要真实按键、人工观察、PAL 或商业 ROM 的测试未执行。
 
 ## 结论与建议顺序
 
 当前 CPU 官方指令行为、PPU VBlank/NMI、PPU 基础内存/DMA 和 MMC3 IRQ 路径均已有公开 ROM 通过证据。建议后续修复顺序：
 
-1. APU 上电状态和主机 RESET 生命周期。
-2. PPU open-bus 衰减模型。
+1. PPU open-bus 衰减模型。
+2. 修复剩余 `instr_timing` APU length period 边界。
 3. 继续扩展 DMC DMA 与非官方 opcode 兼容边界。

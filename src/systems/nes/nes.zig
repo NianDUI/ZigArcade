@@ -62,6 +62,7 @@ pub const Nes = struct {
         const mapper = self.mapperRef();
         self.ppu = Ppu.init(mapper);
         self.apu = Apu.init(sink);
+        self.apu.powerOn();
         self.controllers = .{};
         self.bus = .{};
         self.tracking_cpu_instruction = false;
@@ -89,6 +90,22 @@ pub const Nes = struct {
             .mmc3 => |*mapper| Mapper.fromMapper4(mapper),
             .aorom => |*mapper| Mapper.fromMapper7(mapper),
         };
+    }
+
+    /// Applies the console reset button without clearing cartridge RAM.
+    pub fn reset(self: *Nes) void {
+        self.apu.reset();
+        _ = self.ppu.takeNmi();
+        _ = self.bus.takeDmaRequest();
+        self.tracking_cpu_instruction = false;
+        self.instruction_cycle_progress = 0;
+        self.nmi_edge_cycle = null;
+        self.nmi_deferred = false;
+        self.irq_edge_cycle = null;
+        self.irq_edge_subdot = 0;
+        self.irq_deferred = false;
+        self.post_dma_apu_irq_early = false;
+        self.cpu.reset(&self.bus);
     }
 
     /// Executes one CPU instruction boundary and advances the PPU exactly
@@ -382,6 +399,26 @@ test "Nes runFrame advances to a PPU frame boundary and exposes RGB frame" {
     try std.testing.expectEqual(@as(u16, ppu_frame_width), frame.width);
     try std.testing.expectEqual(@as(u16, ppu_frame_height), frame.height);
     try std.testing.expectEqual(@as(usize, ppu_frame_rgb_bytes), frame.pixels.len);
+}
+
+test "Nes reset preserves cartridge RAM and reapplies CPU and APU reset state" {
+    var image: [16 + 16 * 1024]u8 = [_]u8{0} ** (16 + 16 * 1024);
+    image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    image[16 + 0x3ffc] = 0x34;
+    image[16 + 0x3ffd] = 0x12;
+    const cartridge = try Cartridge.parse(&image);
+    var nes: Nes = undefined;
+    nes.init(cartridge);
+    nes.bus.write(0x6000, 0x5a);
+    _ = nes.apu.cpuWrite(0x4015, 0x0f);
+    _ = nes.apu.cpuWrite(0x4017, 0x80);
+
+    nes.reset();
+
+    try std.testing.expectEqual(@as(?u8, 0x5a), nes.bus.peekCartridge(0x6000));
+    try std.testing.expectEqual(@as(u16, 0x1234), nes.cpu.pc);
+    try std.testing.expectEqual(@as(u8, 0), nes.apu.channel_enable);
+    try std.testing.expect(nes.apu.frame_mode_5_step);
 }
 
 test "Nes delivers APU frame IRQ at the next CPU instruction boundary" {
