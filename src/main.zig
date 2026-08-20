@@ -40,6 +40,7 @@ const raw_input_hold_frames: u8 = 8;
 const ansi_presentation_divisor: u64 = 2;
 const max_framehash_frames: u32 = 10_000;
 const max_nes_run_frames: u32 = 100_000;
+const max_test_rom_text_bytes: usize = 0x1ffc;
 /// Full runtime logs contain several diagnostic lines per frame. Keep replay
 /// useful for extended recordings without accepting unbounded input.
 const max_replay_log_bytes = 64 * 1024 * 1024;
@@ -86,6 +87,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 3 and std.mem.eql(u8, args[1], "inspect")) return inspectNesRom(init, args[2]);
     if (args.len == 5 and std.mem.eql(u8, args[1], "framehash") and std.mem.eql(u8, args[3], "--frames")) {
         return hashNesFrames(init, args[2], try parseFrameCount(args[4]));
+    }
+    if (args.len == 5 and std.mem.eql(u8, args[1], "romtest") and std.mem.eql(u8, args[3], "--frames")) {
+        return runNesTestRom(init, args[2], try parseNesRunFrameCount(args[4]));
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "nes")) {
         return runNesWithOptions(init, args[2], try parseNesRunOptions(args[3..]));
@@ -306,6 +310,69 @@ fn hashNesFrames(init: std.process.Init, rom_path: []const u8, frame_count: u32)
         .{ image_sha256, frame.frame_number, std.hash.Wyhash.hash(0, frame.pixels) },
     );
     try output.flush();
+}
+
+/// Runs ROMs using blargg's conventional $6000 result protocol. The command
+/// only observes cartridge RAM at frame boundaries, so it cannot perturb CPU,
+/// PPU, APU, mapper, or controller timing.
+fn runNesTestRom(init: std.process.Init, rom_path: []const u8, frame_limit: u32) !void {
+    const image = try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        rom_path,
+        init.arena.allocator(),
+        .limited(8 * 1024 * 1024),
+    );
+    const cartridge = Cartridge.parse(image) catch |err| {
+        try appendCartridgeError(init.io, rom_path, err);
+        return err;
+    };
+    var nes: Nes = undefined;
+    nes.init(cartridge);
+
+    for (1..@as(usize, frame_limit) + 1) |frame_number| {
+        _ = try nes.runFrame();
+        if (!hasBlarggSignature(&nes)) continue;
+        const status = nes.bus.peekCartridge(0x6000) orelse continue;
+        if (status == 0x80) continue;
+        try printTestRomResult(init.io, &nes, @intCast(frame_number), status);
+        if (status == 0) return;
+        if (status == 0x81) return error.TestRomResetRequired;
+        return error.TestRomFailed;
+    }
+
+    if (hasBlarggSignature(&nes)) {
+        try printTestRomResult(init.io, &nes, frame_limit, nes.bus.peekCartridge(0x6000) orelse 0xff);
+        return error.TestRomTimeout;
+    }
+    return error.TestRomProtocolNotFound;
+}
+
+fn hasBlarggSignature(nes: *Nes) bool {
+    return nes.bus.peekCartridge(0x6001) == 0xde and
+        nes.bus.peekCartridge(0x6002) == 0xb0 and
+        nes.bus.peekCartridge(0x6003) == 0x61;
+}
+
+fn printTestRomResult(io: std.Io, nes: *Nes, frame_number: u32, status: u8) !void {
+    var output_storage: [1024]u8 = undefined;
+    var output_file_writer: std.Io.File.Writer = .init(.stdout(), io, &output_storage);
+    const output = &output_file_writer.interface;
+    try output.print("status: {d}\nframes: {d}\ntext:\n", .{ status, frame_number });
+    for (0..max_test_rom_text_bytes) |offset| {
+        const byte = nes.bus.peekCartridge(@intCast(0x6004 + offset)) orelse break;
+        if (byte == 0) break;
+        try appendSafeTestTextByte(output, byte);
+    }
+    try output.writeByte('\n');
+    try output.flush();
+}
+
+fn appendSafeTestTextByte(output: *std.Io.Writer, byte: u8) !void {
+    if (byte == '\n' or byte == '\t' or (byte >= 0x20 and byte <= 0x7e)) {
+        try output.writeByte(byte);
+    } else {
+        try output.writeByte('?');
+    }
 }
 
 fn appendCartridgeInfo(output: *std.Io.Writer, cartridge: Cartridge) !void {
@@ -844,6 +911,7 @@ fn printUsage(io: std.Io) !void {
             "  zigarcade --demo-neogeo <ansi|kitty|auto>\n" ++
             "  zigarcade inspect <path/to/rom.nes>\n" ++
             "  zigarcade framehash <path/to/rom.nes> --frames <1-10000>\n" ++
+            "  zigarcade romtest <path/to/rom.nes> --frames <1-100000>\n" ++
             "  zigarcade nes <path/to/rom.nes> [--renderer ansi|kitty|auto] [--audio [--audio-backend unit|queue]] [--log <path>] [--replay <log>] [--max-frames <1-100000>]\n",
     );
     try stderr_writer.interface.flush();
@@ -968,6 +1036,15 @@ test "framehash frame parser accepts only a bounded positive count" {
     try std.testing.expectError(error.InvalidArguments, parseFrameCount("0"));
     try std.testing.expectError(error.InvalidArguments, parseFrameCount("10001"));
     try std.testing.expectError(error.InvalidArguments, parseFrameCount("two"));
+}
+
+test "test ROM text filters terminal control bytes" {
+    var storage: [16]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&storage);
+    try appendSafeTestTextByte(&output, 'O');
+    try appendSafeTestTextByte(&output, 0x1b);
+    try appendSafeTestTextByte(&output, '\n');
+    try std.testing.expectEqualStrings("O?\n", output.buffered());
 }
 
 test "cartridge info names supported mapper and mirroring variants" {

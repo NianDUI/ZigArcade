@@ -27,6 +27,11 @@ pub const Cpu = struct {
     cycles: u64 = 0,
     irq_pending: bool = false,
     nmi_pending: bool = false,
+    /// CLI, SEI, and PLP expose their new I flag immediately to software but
+    /// IRQ polling at the following instruction boundary still uses the old
+    /// value. RTI is intentionally excluded because its restored I flag takes
+    /// effect immediately.
+    irq_i_override: ?bool = null,
 
     pub fn reset(self: *Cpu, bus: *TestBus) void {
         self.* = .{};
@@ -57,16 +62,19 @@ pub const Cpu = struct {
     /// initial P1 slice records all architecturally visible bus reads/writes;
     /// undocumented opcodes and interrupt micro-sequences are added later.
     pub fn step(self: *Cpu, bus: *TestBus) !u8 {
+        const irq_disabled = self.irq_i_override orelse self.status.interrupt_disable;
+        self.irq_i_override = null;
         if (self.nmi_pending) {
             self.nmi_pending = false;
             return self.serviceInterrupt(bus, 0xfffa);
         }
-        if (self.irq_pending and !self.status.interrupt_disable) {
+        if (self.irq_pending and !irq_disabled) {
             self.irq_pending = false;
             return self.serviceInterrupt(bus, 0xfffe);
         }
 
         const opcode = self.fetchByte(bus);
+        const previous_interrupt_disable = self.status.interrupt_disable;
         const elapsed: u8 = switch (opcode) {
             0x00 => self.brk(bus),
             0x08 => self.php(bus),
@@ -269,6 +277,9 @@ pub const Cpu = struct {
             0xfd => self.operateAbsoluteIndexed(bus, self.x, Cpu.sbc),
             else => return error.UnsupportedOpcode,
         };
+        if (opcode == 0x28 or opcode == 0x58 or opcode == 0x78) {
+            self.irq_i_override = previous_interrupt_disable;
+        }
         self.cycles += elapsed;
         return elapsed;
     }
@@ -1040,15 +1051,32 @@ test "NMI has priority over IRQ and pushes status without B" {
     try std.testing.expect(cpu.irq_pending);
 }
 
-test "masked IRQ waits until CLI completes at instruction boundary" {
+test "masked IRQ executes one instruction after CLI before vectoring" {
     var bus: TestBus = .{};
     bus.memory[0x8000] = 0x58; // CLI
+    bus.memory[0x8001] = 0xea; // NOP
     bus.memory[0xfffe] = 0x00;
     bus.memory[0xffff] = 0x90;
     var cpu: Cpu = .{ .pc = 0x8000, .status = .{ .interrupt_disable = true } };
     cpu.requestIrq();
     try std.testing.expectEqual(@as(u8, 2), try cpu.step(&bus));
     try std.testing.expect(!cpu.status.interrupt_disable);
+    try std.testing.expectEqual(@as(u8, 2), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u16, 0x8002), cpu.pc);
+    try std.testing.expectEqual(@as(u8, 7), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u16, 0x9000), cpu.pc);
+}
+
+test "CLI followed by SEI allows one IRQ after SEI" {
+    var bus: TestBus = .{};
+    bus.memory[0x8000..][0..2].* = .{ 0x58, 0x78 }; // CLI; SEI
+    bus.memory[0xfffe] = 0x00;
+    bus.memory[0xffff] = 0x90;
+    var cpu: Cpu = .{ .pc = 0x8000, .status = .{ .interrupt_disable = true } };
+    cpu.requestIrq();
+    try std.testing.expectEqual(@as(u8, 2), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u8, 2), try cpu.step(&bus));
+    try std.testing.expect(cpu.status.interrupt_disable);
     try std.testing.expectEqual(@as(u8, 7), try cpu.step(&bus));
     try std.testing.expectEqual(@as(u16, 0x9000), cpu.pc);
 }

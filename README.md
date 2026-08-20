@@ -10,6 +10,8 @@
 
 实现架构、分期计划、测试策略和参考项目索引见 [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)。项目采用 [MIT License](LICENSE)；外部资料的使用边界见 [REFERENCES.md](REFERENCES.md)。
 
+当前公开 NES 测试 ROM 的实测通过项与精度缺口见 [docs/NES_PUBLIC_ROM_TEST_REPORT.md](docs/NES_PUBLIC_ROM_TEST_REPORT.md)。
+
 GitHub CI 在 macOS 和 Linux 上固定 Zig 0.16.0，运行 `zig fmt --check build.zig src`、`zig build test` 与 `zig build`；不依赖 ROM、BIOS 或外部测试资产。
 
 当前可用接口：
@@ -18,6 +20,7 @@ GitHub CI 在 macOS 和 Linux 上固定 Zig 0.16.0，运行 `zig fmt --check bui
 zig build test
 zig build run -- inspect path/to/game.nes
 zig build run -- framehash path/to/game.nes --frames 120
+zig build run -- romtest path/to/blargg-test.nes --frames 5000
 zig build run -- nes path/to/game.nes
 zig build run -- nes path/to/game.nes --renderer ansi
 ```
@@ -29,6 +32,8 @@ zig build run -- nes path/to/game.nes --renderer ansi
 可先使用 `zig build run -- inspect path/to/game.nes` 验证 ROM；不受支持的 iNES 特性会在切换终端 raw mode 前给出中文原因。
 
 `framehash` 不需要 TTY：它固定推进 1–10000 帧并输出原始 ROM SHA-256 与最终 RGB framebuffer 的 Wyhash，适合为你合法持有的 ROM 或自制 ROM 记录回归基线；仓库不会收集或提交这些 ROM。
+
+`romtest` 不需要 TTY：它运行采用 blargg `$6000-$6003` 状态协议的公开测试 ROM，在帧边界只读检查完成码并输出经过控制字符过滤的 `$6004` 文本；状态码非零、请求复位、超时或未发现协议时以失败退出。ROM 仍须由用户合法提供，测试资产的版本、许可证与 SHA-256 应记录在 manifest 中。
 
 对合法持有的 SMB ROM，可将一次交互日志作为输入回放，执行 `scripts/smb-regression.zsh <rom.nes> <输入日志>`。脚本要求输入日志至少覆盖目标帧数，默认完整重放 10,500 帧，验证音频非静音、输出设备运行、无 render error，以及第一关结束（`state=0B`）后进入过场（`state=06`）；生成的运行日志保存在 `/tmp/zigarcade-smb-regression.*`。第三个可选参数可传入较小帧数作快速冒烟，例如 `... 1800`。
 

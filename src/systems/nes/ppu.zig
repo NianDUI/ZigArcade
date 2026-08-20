@@ -141,6 +141,11 @@ pub const Ppu = struct {
     dot: u16 = 0,
     frame_number: u64 = 0,
     nmi_pending: bool = false,
+    /// The final background prefetch can leave A12 high across the scanline
+    /// boundary. Keeping that state suppresses a second qualified MMC3 rise
+    /// at dot 5 while still allowing the first rise after rendering starts.
+    carry_a12_high_at_dot_zero: bool = false,
+    odd_frame_skip_armed: bool = false,
     /// A PPUSTATUS read on the VBlank start boundary prevents the status bit
     /// and its NMI edge from being produced for that frame. This has to be
     /// remembered until dot 1 because CPU register accesses occur between
@@ -207,10 +212,17 @@ pub const Ppu = struct {
         if (!background_fetch and !sprite_fetch) self.mapper.clockPpuAddress(self.idlePpuAddress());
         self.clockScrollAddress();
 
+        // The decision to omit the final pre-render clock is sampled one dot
+        // before the skip itself. PPUMASK changes on dot 339 are too late.
+        if (self.scanline == 261 and self.dot == 338) {
+            self.odd_frame_skip_armed = self.frame_number & 1 != 0 and self.renderingEnabled();
+        }
+
         // NTSC odd frames omit the final pre-render dot while either layer
         // is enabled. Keep this in the canonical dot clock: render sampling
         // never adjusts timing on its own.
-        if (self.scanline == 261 and self.dot == 339 and self.frame_number & 1 != 0 and self.renderingEnabled()) {
+        if (self.scanline == 261 and self.dot == 339 and self.odd_frame_skip_armed) {
+            self.odd_frame_skip_armed = false;
             self.dot = 0;
             self.scanline = 0;
             self.frame_number += 1;
@@ -270,6 +282,7 @@ pub const Ppu = struct {
             else => unreachable,
         };
         self.mapper.clockPpuAddress(address);
+        if (self.dot == 336) self.carry_a12_high_at_dot_zero = address & 0x1000 != 0;
 
         switch (phase) {
             1 => self.bg_next_tile = self.readMemory(address),
@@ -292,14 +305,11 @@ pub const Ppu = struct {
         return true;
     }
 
-    /// At dot zero the PPU retains the pattern-table address calculated by
-    /// the two unused name-table fetches at the end of the prior scanline.
-    /// Modelling it as low creates a false qualified A12 rise at dot five of
-    /// the next line; only its A12 state is needed before full fetch timing.
+    /// Dot zero carries the A12 state from the prior scanline's final
+    /// background prefetch. Before the first rendered line no such prefetch
+    /// exists, so the bus remains low until the pattern fetch at dot 5.
     fn idlePpuAddress(self: *const Ppu) u16 {
-        if (self.renderingEnabled() and (self.scanline < frame_height or self.scanline == 261) and self.dot == 0) {
-            return if (self.ctrl & 0x10 != 0) 0x1000 else 0;
-        }
+        if (self.dot == 0 and self.renderingEnabled() and self.carry_a12_high_at_dot_zero) return 0x1000;
         return 0;
     }
 
@@ -927,6 +937,7 @@ pub const Ppu = struct {
             },
             1 => {
                 self.mask = value;
+                if (!self.renderingEnabled()) self.carry_a12_high_at_dot_zero = false;
                 self.recordRasterState();
             },
             3 => self.oam_addr = value,
@@ -936,8 +947,11 @@ pub const Ppu = struct {
             5 => self.writeScroll(value),
             6 => self.writeAddress(value),
             7 => {
-                self.writeMemory(self.v & 0x3fff, value);
+                const address = self.v & 0x3fff;
+                self.mapper.clockPpuAddress(address);
+                self.writeMemory(address, value);
                 self.incrementVramAddress();
+                self.mapper.clockPpuAddress(self.v & 0x3fff);
             },
             else => {},
         }
@@ -945,7 +959,11 @@ pub const Ppu = struct {
 
     fn readData(self: *Ppu) u8 {
         const address = self.v & 0x3fff;
-        defer self.incrementVramAddress();
+        self.mapper.clockPpuAddress(address);
+        defer {
+            self.incrementVramAddress();
+            self.mapper.clockPpuAddress(self.v & 0x3fff);
+        }
         if (address >= 0x3f00) {
             const palette_value = self.readMemory(address);
             self.read_buffer = self.readMemory(address - 0x1000);
@@ -987,6 +1005,7 @@ pub const Ppu = struct {
         } else {
             self.t = (self.t & 0x7f00) | value;
             self.v = self.t;
+            self.mapper.clockPpuAddress(self.v & 0x3fff);
         }
         self.write_toggle = !self.write_toggle;
     }
@@ -1205,7 +1224,8 @@ test "rendering odd frame skips the final pre-render dot" {
     ppu.mask = 0x08;
     ppu.frame_number = 1;
     ppu.scanline = 261;
-    ppu.dot = 339;
+    ppu.dot = 338;
+    ppu.tickDot();
     ppu.tickDot();
     try std.testing.expectEqual(@as(u16, 0), ppu.dot);
     try std.testing.expectEqual(@as(u16, 0), ppu.scanline);
@@ -1214,7 +1234,8 @@ test "rendering odd frame skips the final pre-render dot" {
     ppu.mask = 0;
     ppu.frame_number = 1;
     ppu.scanline = 261;
-    ppu.dot = 339;
+    ppu.dot = 338;
+    ppu.tickDot();
     ppu.tickDot();
     try std.testing.expectEqual(@as(u16, 340), ppu.dot);
     try std.testing.expectEqual(@as(u16, 261), ppu.scanline);

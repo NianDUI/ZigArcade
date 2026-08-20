@@ -32,6 +32,13 @@ pub const Nes = struct {
     bus: TestBus = .{},
     framebuffer: [ppu_frame_rgb_bytes]u8 = undefined,
     background_opaque: [ppu_frame_width * ppu_frame_height]u8 = undefined,
+    tracking_cpu_instruction: bool = false,
+    instruction_cycle_progress: u8 = 0,
+    nmi_edge_cycle: ?u8 = null,
+    nmi_deferred: bool = false,
+    irq_edge_cycle: ?u8 = null,
+    irq_edge_subdot: u2 = 0,
+    irq_deferred: bool = false,
 
     pub fn init(self: *Nes, cartridge: Cartridge) void {
         self.null_audio_sink = .{};
@@ -54,6 +61,13 @@ pub const Nes = struct {
         self.apu = Apu.init(sink);
         self.controllers = .{};
         self.bus = .{};
+        self.tracking_cpu_instruction = false;
+        self.instruction_cycle_progress = 0;
+        self.nmi_edge_cycle = null;
+        self.nmi_deferred = false;
+        self.irq_edge_cycle = null;
+        self.irq_edge_subdot = 0;
+        self.irq_deferred = false;
         self.bus.setTraceEnabled(false);
         self.bus.attachMapper(mapper);
         self.bus.attachPpu(&self.ppu);
@@ -78,10 +92,19 @@ pub const Nes = struct {
     /// requested immediately before the following CPU instruction boundary.
     pub fn step(self: *Nes) !u16 {
         if (self.ppu.takeNmi()) self.cpu.requestNmi();
-        self.cpu.setIrqLine(self.apu.frameIrqPending() or self.mapperRef().irqPending());
+        const release_deferred_nmi = self.nmi_deferred;
+        self.nmi_deferred = false;
+        const suppress_late_irq = self.irq_deferred;
+        self.irq_deferred = false;
+        self.tracking_cpu_instruction = true;
+        self.instruction_cycle_progress = 0;
+        self.nmi_edge_cycle = null;
+        self.irq_edge_cycle = null;
+        self.cpu.setIrqLine(!suppress_late_irq and self.irqLinePending());
         self.bus.beginCpuCycleHook(@ptrCast(self), clockCpuBusCycle);
         const cycles = self.cpu.step(&self.bus) catch |err| {
             _ = self.bus.endCpuCycleHook();
+            self.tracking_cpu_instruction = false;
             return err;
         };
         const bus_cycles = self.bus.endCpuCycleHook();
@@ -90,6 +113,24 @@ pub const Nes = struct {
         // first. Complete the current bus cycle and any internal cycles that
         // did not touch the bus (for example an accumulator operation).
         self.advanceDevices(cycles - bus_cycles + 1);
+        self.tracking_cpu_instruction = false;
+        if (release_deferred_nmi) self.cpu.requestNmi();
+        if (self.nmi_edge_cycle) |edge_cycle| {
+            if (edge_cycle + 1 < cycles) {
+                self.cpu.requestNmi();
+            } else {
+                self.nmi_deferred = true;
+            }
+        }
+        if (self.irq_edge_cycle) |edge_cycle| {
+            // The 2A03 samples IRQ near the start of an instruction's
+            // penultimate cycle. An edge after the first PPU dot of that CPU
+            // cycle misses the poll and must wait through one more opcode.
+            const poll_cycle = cycles - 1;
+            if (edge_cycle > poll_cycle or (edge_cycle == poll_cycle and self.irq_edge_subdot > 0)) {
+                self.irq_deferred = true;
+            }
+        }
         var dmc_cycles = self.serviceDmcDma();
         if (self.bus.takeDmaRequest()) |page| {
             var dma = OamDma.init(page, self.cpu.pc, self.cpu.cycles);
@@ -110,13 +151,32 @@ pub const Nes = struct {
     }
 
     fn advanceDevices(self: *Nes, cpu_cycles: u8) void {
-        self.apu.tick(cpu_cycles);
-        for (0..@as(usize, cpu_cycles) * 3) |_| self.ppu.tickDot();
+        for (0..cpu_cycles) |_| {
+            self.apu.tick(1);
+            for (0..3) |subdot| {
+                const irq_before = self.irqLinePending();
+                self.ppu.tickDot();
+                if (self.tracking_cpu_instruction and !irq_before and self.irqLinePending() and self.irq_edge_cycle == null) {
+                    self.irq_edge_cycle = self.instruction_cycle_progress + 1;
+                    self.irq_edge_subdot = @intCast(subdot);
+                }
+            }
+            if (self.tracking_cpu_instruction) {
+                self.instruction_cycle_progress += 1;
+                if (self.ppu.takeNmi() and self.nmi_edge_cycle == null) {
+                    self.nmi_edge_cycle = self.instruction_cycle_progress;
+                }
+            }
+        }
     }
 
     fn clockCpuBusCycle(context: *anyopaque) void {
         const self: *Nes = @ptrCast(@alignCast(context));
         self.advanceDevices(1);
+    }
+
+    fn irqLinePending(self: *Nes) bool {
+        return self.apu.frameIrqPending() or self.mapperRef().irqPending();
     }
 
     /// A DMC sample fetch occupies the CPU bus for four cycles. Service it
@@ -184,10 +244,10 @@ test "Nes DMC fetch stalls the CPU four cycles and advances device clocks" {
     try std.testing.expect(nes.apu.dmc_sample_buffer != null);
 }
 
-test "Nes delivers PPU NMI at the next CPU instruction boundary" {
+test "Nes defers a PPU NMI edge raised after a two-cycle instruction poll" {
     var image: [16 + 16 * 1024]u8 = [_]u8{0} ** (16 + 16 * 1024);
     image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-    image[16] = 0xea;
+    image[16..][0..2].* = .{ 0xea, 0xea };
     image[16 + 0x3ffa] = 0x00;
     image[16 + 0x3ffb] = 0x90;
     image[16 + 0x3ffc] = 0x00;
@@ -199,8 +259,10 @@ test "Nes delivers PPU NMI at the next CPU instruction boundary" {
     nes.ppu.scanline = 241;
     nes.ppu.dot = 1;
 
-    _ = try nes.step(); // NOP advances dots and latches VBlank NMI.
+    _ = try nes.step(); // NOP advances dots and latches VBlank NMI after its poll.
     try std.testing.expectEqual(@as(u16, 0x8001), nes.cpu.pc);
+    try std.testing.expectEqual(@as(u16, 2), try nes.step());
+    try std.testing.expectEqual(@as(u16, 0x8002), nes.cpu.pc);
     try std.testing.expectEqual(@as(u16, 7), try nes.step());
     try std.testing.expectEqual(@as(u16, 0x9000), nes.cpu.pc);
 }
@@ -326,6 +388,62 @@ test "Nes delivers a pending MMC3 IRQ at the next CPU instruction boundary" {
     for (0..8) |_| mapper.clockPpuAddress(0);
     mapper.clockPpuAddress(0x1000);
 
+    try std.testing.expectEqual(@as(u16, 7), try nes.step());
+    try std.testing.expectEqual(@as(u16, 0x9000), nes.cpu.pc);
+}
+
+test "Nes accepts an MMC3 IRQ edge before the penultimate-cycle poll" {
+    var image: [16 + 2 * 16 * 1024]u8 = [_]u8{0} ** (16 + 2 * 16 * 1024);
+    image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 2, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    image[16..][0..2].* = .{ 0xea, 0xea };
+    image[16 + 0x7ffc] = 0x00;
+    image[16 + 0x7ffd] = 0x80;
+    image[16 + 0x7ffe] = 0x00;
+    image[16 + 0x7fff] = 0x90;
+    const cartridge = try Cartridge.parse(&image);
+    var nes: Nes = undefined;
+    nes.init(cartridge);
+    nes.cpu.status.interrupt_disable = false;
+    nes.ppu.mask = 0x18;
+    nes.ppu.ctrl = 0x08;
+    nes.ppu.scanline = 261;
+    nes.ppu.dot = 261;
+    nes.bus.write(0xc000, 0);
+    nes.bus.write(0xe001, 0);
+    var mapper = nes.mapperRef();
+    for (0..8) |_| mapper.clockPpuAddress(0);
+
+    try std.testing.expectEqual(@as(u16, 2), try nes.step());
+    try std.testing.expectEqual(@as(u16, 0x8001), nes.cpu.pc);
+    try std.testing.expectEqual(@as(u16, 7), try nes.step());
+    try std.testing.expectEqual(@as(u16, 0x9000), nes.cpu.pc);
+}
+
+test "Nes defers an MMC3 IRQ edge after the penultimate-cycle poll" {
+    var image: [16 + 2 * 16 * 1024]u8 = [_]u8{0} ** (16 + 2 * 16 * 1024);
+    image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 2, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    image[16..][0..3].* = .{ 0xea, 0xea, 0xea };
+    image[16 + 0x7ffc] = 0x00;
+    image[16 + 0x7ffd] = 0x80;
+    image[16 + 0x7ffe] = 0x00;
+    image[16 + 0x7fff] = 0x90;
+    const cartridge = try Cartridge.parse(&image);
+    var nes: Nes = undefined;
+    nes.init(cartridge);
+    nes.cpu.status.interrupt_disable = false;
+    nes.ppu.mask = 0x18;
+    nes.ppu.ctrl = 0x08;
+    nes.ppu.scanline = 261;
+    nes.ppu.dot = 260;
+    nes.bus.write(0xc000, 0);
+    nes.bus.write(0xe001, 0);
+    var mapper = nes.mapperRef();
+    for (0..8) |_| mapper.clockPpuAddress(0);
+
+    try std.testing.expectEqual(@as(u16, 2), try nes.step());
+    try std.testing.expectEqual(@as(u16, 0x8001), nes.cpu.pc);
+    try std.testing.expectEqual(@as(u16, 2), try nes.step());
+    try std.testing.expectEqual(@as(u16, 0x8002), nes.cpu.pc);
     try std.testing.expectEqual(@as(u16, 7), try nes.step());
     try std.testing.expectEqual(@as(u16, 0x9000), nes.cpu.pc);
 }

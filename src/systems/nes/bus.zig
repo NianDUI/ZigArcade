@@ -96,6 +96,14 @@ pub const TestBus = struct {
         return value;
     }
 
+    /// Side-effect-free cartridge observation for diagnostics at safe frame
+    /// boundaries. CPU execution must continue to use `read` so device timing
+    /// and register side effects remain visible.
+    pub fn peekCartridge(self: *const TestBus, address: u16) ?u8 {
+        const mapper = self.mapper orelse return null;
+        return mapper.cpuRead(address);
+    }
+
     pub fn write(self: *TestBus, address: u16, value: u8) void {
         self.clockBeforeCpuBusAccess();
         if (self.mapper) |*mapper| {
@@ -182,7 +190,10 @@ test "mapped bus mirrors internal RAM and fetches NROM reset vector" {
     bus.attachMapper0(&mapper);
 
     bus.write(0x0000, 0x5a);
+    bus.write(0x6000, 0x7c);
     try std.testing.expectEqual(@as(u8, 0x5a), bus.read(0x0800));
+    try std.testing.expectEqual(@as(?u8, 0x7c), bus.peekCartridge(0x6000));
+    try std.testing.expectEqual(@as(?u8, null), bus.peekCartridge(0x5000));
     try std.testing.expectEqual(@as(u8, 0xea), bus.read(0x8000));
     try std.testing.expectEqual(@as(u8, 0x00), bus.read(0xfffc));
     try std.testing.expectEqual(@as(u8, 0x80), bus.read(0xfffd));
