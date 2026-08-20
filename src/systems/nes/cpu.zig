@@ -27,6 +27,9 @@ pub const Cpu = struct {
     cycles: u64 = 0,
     irq_pending: bool = false,
     nmi_pending: bool = false,
+    nmi_vector_hijack: bool = false,
+    nmi_hijack_consumed: bool = false,
+    nmi_after_vector_select: bool = false,
     /// CLI, SEI, and PLP expose their new I flag immediately to software but
     /// IRQ polling at the following instruction boundary still uses the old
     /// value. RTI is intentionally excluded because its restored I flag takes
@@ -58,6 +61,22 @@ pub const Cpu = struct {
         self.nmi_pending = true;
     }
 
+    pub fn observeNmiEdge(self: *Cpu) void {
+        self.nmi_vector_hijack = true;
+    }
+
+    pub fn takeNmiHijackConsumed(self: *Cpu) bool {
+        const consumed = self.nmi_hijack_consumed;
+        self.nmi_hijack_consumed = false;
+        return consumed;
+    }
+
+    pub fn takeNmiAfterVectorSelect(self: *Cpu) bool {
+        const late = self.nmi_after_vector_select;
+        self.nmi_after_vector_select = false;
+        return late;
+    }
+
     /// Executes one supported instruction and returns its cycle count. This
     /// initial P1 slice records all architecturally visible bus reads/writes;
     /// undocumented opcodes and interrupt micro-sequences are added later.
@@ -66,6 +85,7 @@ pub const Cpu = struct {
         self.irq_i_override = null;
         if (self.nmi_pending) {
             self.nmi_pending = false;
+            self.nmi_vector_hijack = false;
             return self.serviceInterrupt(bus, 0xfffa);
         }
         if (self.irq_pending and !irq_disabled) {
@@ -886,25 +906,30 @@ pub const Cpu = struct {
         _ = self.fetchByte(bus);
         self.push(bus, @truncate(self.pc >> 8));
         self.push(bus, @truncate(self.pc));
+        const vector = self.selectInterruptVector(0xfffe);
         var pushed = self.status;
         pushed.break_flag = true;
         pushed.unused = true;
         self.push(bus, @bitCast(pushed));
         self.status.interrupt_disable = true;
-        self.pc = read16(bus, 0xfffe);
+        self.pc = read16(bus, vector);
+        self.finishInterruptVectoring();
         return 7;
     }
 
     fn serviceInterrupt(self: *Cpu, bus: *TestBus, vector: u16) u8 {
         _ = bus.read(self.pc);
+        _ = bus.read(self.pc);
         self.push(bus, @truncate(self.pc >> 8));
         self.push(bus, @truncate(self.pc));
+        const actual_vector = self.selectInterruptVector(vector);
         var pushed = self.status;
         pushed.break_flag = false;
         pushed.unused = true;
         self.push(bus, @bitCast(pushed));
         self.status.interrupt_disable = true;
-        self.pc = read16(bus, vector);
+        self.pc = read16(bus, actual_vector);
+        self.finishInterruptVectoring();
         self.cycles += 7;
         return 7;
     }
@@ -924,6 +949,19 @@ pub const Cpu = struct {
     fn push(self: *Cpu, bus: *TestBus, value: u8) void {
         bus.write(0x0100 | @as(u16, self.sp), value);
         self.sp -%= 1;
+    }
+
+    fn selectInterruptVector(self: *Cpu, vector: u16) u16 {
+        if (vector != 0xfffe or !self.nmi_vector_hijack) return vector;
+        self.nmi_vector_hijack = false;
+        self.nmi_hijack_consumed = true;
+        return 0xfffa;
+    }
+
+    fn finishInterruptVectoring(self: *Cpu) void {
+        if (!self.nmi_vector_hijack) return;
+        self.nmi_vector_hijack = false;
+        self.nmi_after_vector_select = true;
     }
 
     fn pull(self: *Cpu, bus: *TestBus) u8 {
@@ -948,6 +986,22 @@ fn readZeroPage16(bus: *TestBus, address: u8) u16 {
     const high = bus.read(address +% 1);
     return @as(u16, low) | (@as(u16, high) << 8);
 }
+
+const NmiEdgeInjector = struct {
+    cpu: *Cpu,
+    trigger_access: u8,
+    access_count: u8 = 0,
+
+    fn beforeAccess(context: *anyopaque) void {
+        _ = context;
+    }
+
+    fn afterAccess(context: *anyopaque) void {
+        const self: *NmiEdgeInjector = @ptrCast(@alignCast(context));
+        self.access_count += 1;
+        if (self.access_count == self.trigger_access) self.cpu.observeNmiEdge();
+    }
+};
 
 test "reset fetches reset vector and sets 2A03 defaults" {
     var bus: TestBus = .{};
@@ -1020,6 +1074,58 @@ test "BRK pushes PC plus two and vectors through IRQ" {
     try std.testing.expectEqual(@as(u8, 0x80), bus.memory[0x01fd]);
     try std.testing.expectEqual(@as(u8, 0x02), bus.memory[0x01fc]);
     try std.testing.expect(bus.memory[0x01fb] & 0x10 != 0);
+}
+
+test "NMI after BRK's PC pushes hijacks the vector but keeps B set" {
+    var bus: TestBus = .{};
+    bus.memory[0x8000..][0..2].* = .{ 0x00, 0xea };
+    bus.memory[0xfffa] = 0x34;
+    bus.memory[0xfffb] = 0x12;
+    bus.memory[0xfffe] = 0x78;
+    bus.memory[0xffff] = 0x56;
+    var cpu: Cpu = .{ .pc = 0x8000, .sp = 0xfd };
+    var injector = NmiEdgeInjector{ .cpu = &cpu, .trigger_access = 4 };
+    bus.beginCpuCycleHook(&injector, NmiEdgeInjector.beforeAccess, NmiEdgeInjector.afterAccess);
+    try std.testing.expectEqual(@as(u8, 7), try cpu.step(&bus));
+    _ = bus.endCpuCycleHook();
+    try std.testing.expectEqual(@as(u16, 0x1234), cpu.pc);
+    try std.testing.expect(bus.memory[0x01fb] & 0x10 != 0);
+    try std.testing.expect(cpu.takeNmiHijackConsumed());
+}
+
+test "NMI after the IRQ PC pushes hijacks the vector without B" {
+    var bus: TestBus = .{};
+    bus.memory[0xfffa] = 0x34;
+    bus.memory[0xfffb] = 0x12;
+    bus.memory[0xfffe] = 0x78;
+    bus.memory[0xffff] = 0x56;
+    var cpu: Cpu = .{ .pc = 0x8000, .sp = 0xfd, .status = .{ .interrupt_disable = false } };
+    cpu.requestIrq();
+    var injector = NmiEdgeInjector{ .cpu = &cpu, .trigger_access = 4 };
+    bus.beginCpuCycleHook(&injector, NmiEdgeInjector.beforeAccess, NmiEdgeInjector.afterAccess);
+    try std.testing.expectEqual(@as(u8, 7), try cpu.step(&bus));
+    _ = bus.endCpuCycleHook();
+    try std.testing.expectEqual(@as(u16, 0x1234), cpu.pc);
+    try std.testing.expect(bus.memory[0x01fb] & 0x10 == 0);
+    try std.testing.expect(cpu.takeNmiHijackConsumed());
+}
+
+test "hardware IRQ entry performs two dummy reads before stacking" {
+    var bus: TestBus = .{};
+    bus.memory[0xfffe] = 0x34;
+    bus.memory[0xffff] = 0x12;
+    var cpu: Cpu = .{ .pc = 0x8000, .sp = 0xfd, .status = .{ .interrupt_disable = false } };
+    cpu.requestIrq();
+    try std.testing.expectEqual(@as(u8, 7), try cpu.step(&bus));
+    try std.testing.expectEqualSlices(Access, &.{
+        .{ .kind = .read, .address = 0x8000, .value = 0 },
+        .{ .kind = .read, .address = 0x8000, .value = 0 },
+        .{ .kind = .write, .address = 0x01fd, .value = 0x80 },
+        .{ .kind = .write, .address = 0x01fc, .value = 0x00 },
+        .{ .kind = .write, .address = 0x01fb, .value = 0x20 },
+        .{ .kind = .read, .address = 0xfffe, .value = 0x34 },
+        .{ .kind = .read, .address = 0xffff, .value = 0x12 },
+    }, bus.accesses());
 }
 
 test "JSR and RTS preserve the return address and stack order" {

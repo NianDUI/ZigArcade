@@ -280,8 +280,10 @@ test "mapped bus separates APU $4017 writes from controller port two reads" {
     bus.attachApu(&apu);
     bus.attachControllers(&controllers);
     bus.write(0x4017, 0xc0);
-    try std.testing.expect(apu.frame_mode_5_step);
+    try std.testing.expect(!apu.frame_mode_5_step);
     try std.testing.expect(apu.frame_irq_inhibit);
+    apu.tick(4);
+    try std.testing.expect(apu.frame_mode_5_step);
     bus.write(0x4016, 1);
     try std.testing.expectEqual(@as(u8, 1), bus.read(0x4017));
 }

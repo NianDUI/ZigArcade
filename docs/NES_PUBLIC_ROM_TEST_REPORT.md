@@ -22,7 +22,7 @@
 | PPU open bus | 0 | 1 | 0 |
 | MMC3 IRQ 单项 | 5 | 0 | 0 |
 | APU reset 单项 | 0 | 3 | 3 |
-| CPU/APU 指令时序与中断 | 1 | 2 | 0 |
+| CPU/APU 指令时序与中断 | 3 | 2 | 0 |
 
 这里的“阻塞”表示 ROM 要求按 RESET 后继续，而当前自动入口没有模拟主机 RESET；不能据此判定测试通过或失败。没有 `$6000` 协议的旧测试 ROM 也不纳入统计。
 
@@ -43,6 +43,8 @@
 | `ppu_vbl_nmi/rom_singles/10-even_odd_timing.nes` | 144 | Passed，输出 `08 08 09 07` |
 | `ppu_read_buffer/test_ppu_read_buffer.nes` | 1310 | Passed |
 | `cpu_interrupts_v2/rom_singles/1-cli_latency.nes` | 18 | Passed |
+| `cpu_interrupts_v2/rom_singles/2-nmi_and_brk.nes` | 114 | Passed |
+| `cpu_interrupts_v2/rom_singles/3-nmi_and_irq.nes` | 134 | Passed |
 | `mmc3_test/1-clocking.nes` | 24 | Passed |
 | `mmc3_test/2-details.nes` | 26 | Passed |
 | `mmc3_test/3-A12_clocking.nes` | 24 | Passed |
@@ -71,7 +73,7 @@ CPU `$2006/$2007` 地址变化已经接入 MMC3 A12 观察路径。PPU 跨扫描
 | `apu_reset/4017_written.nes` | `Failed #2`：上电时应等效写入 `$4017=$00` |
 | `apu_reset/works_immediately.nes` | `Failed #2`：上电后寄存器写应立即生效 |
 | `instr_timing/instr_timing.nes` | `Failed #5`：APU length period 与指令组合时序不匹配 |
-| `cpu_interrupts_v2/cpu_interrupts.nes` | CLI latency 已通过；完整套件当前推进到 `2-nmi_and_brk` 后失败 |
+| `cpu_interrupts_v2/cpu_interrupts.nes` | CLI latency、NMI/BRK、NMI/IRQ 已通过；完整套件当前推进到 `4-irq_and_dma` 后失败 |
 
 `4015_cleared.nes`、`irq_flag_cleared.nes`、`len_ctrs_enabled.nes` 请求 RESET 后继续，当前标为阻塞。
 
@@ -85,6 +87,6 @@ CPU `$2006/$2007` 地址变化已经接入 MMC3 A12 观察路径。PPU 跨扫描
 
 当前 CPU 官方指令行为、PPU VBlank/NMI、PPU 基础内存/DMA 和 MMC3 IRQ 路径均已有公开 ROM 通过证据。建议后续修复顺序：
 
-1. 补全 NMI 打断 BRK/IRQ vectoring 的周期级仲裁。
-2. APU 上电状态、`$4017` 延迟和主机 RESET 生命周期。
+1. 补全 IRQ 与 OAM DMA 重叠时的周期级仲裁。
+2. APU 上电状态和主机 RESET 生命周期。
 3. PPU open-bus 衰减模型。

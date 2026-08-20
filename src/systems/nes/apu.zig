@@ -24,6 +24,9 @@ pub const Apu = struct {
     frame_mode_5_step: bool = false,
     frame_irq_inhibit: bool = false,
     frame_irq: bool = false,
+    frame_counter_write_value: ?u8 = null,
+    frame_counter_write_delay: u3 = 0,
+    frame_counter_write_extra_hold: bool = false,
     pulse1_divider: u16 = 0,
     pulse1_step: u3 = 0,
     pulse_clock_phase: bool = false,
@@ -120,15 +123,11 @@ pub const Apu = struct {
                 return true;
             },
             0x4017 => {
-                self.frame_mode_5_step = value & 0x80 != 0;
                 self.frame_irq_inhibit = value & 0x40 != 0;
                 if (self.frame_irq_inhibit) self.frame_irq = false;
-                self.frame_counter_cycles = 0;
-                if (self.frame_mode_5_step) {
-                    self.clockQuarterFrame();
-                    self.clockLengthCounters();
-                    self.clockPulseSweeps();
-                }
+                self.frame_counter_write_value = value;
+                self.frame_counter_write_delay = if (self.cpu_cycles & 1 == 0) 3 else 4;
+                self.frame_counter_write_extra_hold = self.frame_counter_write_delay == 3;
                 return true;
             },
             else => return false,
@@ -155,8 +154,11 @@ pub const Apu = struct {
     pub fn tick(self: *Apu, cycles: u16) void {
         for (0..cycles) |_| {
             self.cpu_cycles += 1;
-            self.frame_counter_cycles += 1;
-            self.clockFrameSequencer();
+            const skip_frame_counter_clock = self.clockPendingFrameCounterWrite();
+            if (skip_frame_counter_clock == null or !skip_frame_counter_clock.?) {
+                self.frame_counter_cycles += 1;
+                self.clockFrameSequencer();
+            }
             self.tickPulses();
             self.tickTriangle();
             self.tickNoise();
@@ -211,6 +213,24 @@ pub const Apu = struct {
             self.clockPulseSweeps();
             self.frame_counter_cycles = 0;
         }
+    }
+
+    fn clockPendingFrameCounterWrite(self: *Apu) ?bool {
+        if (self.frame_counter_write_value == null) return null;
+        self.frame_counter_write_delay -= 1;
+        if (self.frame_counter_write_delay != 0) return null;
+        const value = self.frame_counter_write_value.?;
+        self.frame_counter_write_value = null;
+        self.frame_mode_5_step = value & 0x80 != 0;
+        self.frame_counter_cycles = 0;
+        const skip_frame_counter_clock = self.frame_counter_write_extra_hold;
+        self.frame_counter_write_extra_hold = false;
+        if (self.frame_mode_5_step) {
+            self.clockQuarterFrame();
+            self.clockLengthCounters();
+            self.clockPulseSweeps();
+        }
+        return skip_frame_counter_clock;
     }
 
     fn clockQuarterFrame(self: *Apu) void {
@@ -477,10 +497,29 @@ test "APU five-step mode and IRQ inhibit suppress frame IRQ" {
     try std.testing.expect(!apu.frameIrqPending());
 
     _ = apu.cpuWrite(0x4017, 0x00);
-    apu.tick(14915);
+    apu.tick(4);
+    apu.tick(14914);
     try std.testing.expect(apu.frameIrqPending());
     _ = apu.cpuWrite(0x4017, 0x40);
     try std.testing.expect(!apu.frameIrqPending());
+}
+
+test "APU frame-counter write delay follows CPU parity" {
+    var null_sink = NullAudioSink{};
+    var even_apu = Apu.init(null_sink.asSink());
+    _ = even_apu.cpuWrite(0x4017, 0x80);
+    even_apu.tick(2);
+    try std.testing.expect(!even_apu.frame_mode_5_step);
+    even_apu.tick(1);
+    try std.testing.expect(even_apu.frame_mode_5_step);
+
+    var odd_apu = Apu.init(null_sink.asSink());
+    odd_apu.cpu_cycles = 1;
+    _ = odd_apu.cpuWrite(0x4017, 0x80);
+    odd_apu.tick(3);
+    try std.testing.expect(!odd_apu.frame_mode_5_step);
+    odd_apu.tick(1);
+    try std.testing.expect(odd_apu.frame_mode_5_step);
 }
 
 test "APU frame sequencer clocks terminal half-frames in four and five step modes" {
@@ -495,9 +534,11 @@ test "APU frame sequencer clocks terminal half-frames in four and five step mode
     try std.testing.expectEqual(@as(u8, 0), apu.pulse1_length);
 
     _ = apu.cpuWrite(0x4003, 0x18);
-    _ = apu.cpuWrite(0x4017, 0x80); // immediate half-frame clocks length once
+    _ = apu.cpuWrite(0x4017, 0x80);
+    try std.testing.expectEqual(@as(u8, 2), apu.pulse1_length);
+    apu.tick(4); // delayed five-step reset clocks a half-frame once
     try std.testing.expectEqual(@as(u8, 1), apu.pulse1_length);
-    apu.tick(18641);
+    apu.tick(18640);
     try std.testing.expectEqual(@as(u8, 0), apu.pulse1_length);
 }
 

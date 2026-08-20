@@ -114,12 +114,18 @@ pub const Nes = struct {
         // did not touch the bus (for example an accumulator operation).
         self.advanceDevices(cycles - bus_cycles + 1, true);
         self.tracking_cpu_instruction = false;
-        if (release_deferred_nmi) self.cpu.requestNmi();
-        if (self.nmi_edge_cycle) |edge_cycle| {
-            if (edge_cycle + 1 < cycles) {
-                self.cpu.requestNmi();
-            } else {
-                self.nmi_deferred = true;
+        const nmi_hijacked = self.cpu.takeNmiHijackConsumed();
+        const nmi_after_vector_select = self.cpu.takeNmiAfterVectorSelect();
+        if (nmi_after_vector_select) {
+            self.nmi_deferred = true;
+        } else if (!nmi_hijacked) {
+            if (release_deferred_nmi) self.cpu.requestNmi();
+            if (self.nmi_edge_cycle) |edge_cycle| {
+                if (edge_cycle + 1 < cycles) {
+                    self.cpu.requestNmi();
+                } else {
+                    self.nmi_deferred = true;
+                }
             }
         }
         if (self.irq_edge_cycle) |edge_cycle| {
@@ -181,6 +187,7 @@ pub const Nes = struct {
     fn sampleNmiLine(self: *Nes) void {
         if (self.ppu.takeNmi() and self.nmi_edge_cycle == null) {
             self.nmi_edge_cycle = self.instruction_cycle_progress + 1;
+            self.cpu.observeNmiEdge();
         }
     }
 
