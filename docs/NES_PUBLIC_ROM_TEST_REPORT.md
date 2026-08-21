@@ -21,6 +21,8 @@
 | PPU VBlank/NMI 单项 | 10 | 0 | 0 |
 | PPU read-buffer/DMA | 1 | 0 | 0 |
 | PPU open bus | 1 | 0 | 0 |
+| PPU sprite overflow | 5 | 0 | 0 |
+| PPU sprite-0 hit | 11 | 0 | 0 |
 | MMC3 IRQ 单项 | 5 | 0 | 0 |
 | APU 基础单项 | 8 | 0 | 0 |
 | APU reset 单项 | 6 | 0 | 0 |
@@ -50,6 +52,22 @@
 | `ppu_vbl_nmi/rom_singles/10-even_odd_timing.nes` | 144 | Passed，输出 `08 08 09 07` |
 | `ppu_read_buffer/test_ppu_read_buffer.nes` | 1267 | Passed |
 | `ppu_open_bus/ppu_open_bus.nes` | 250 | Passed |
+| `sprite_overflow_tests/1.Basics.nes` | 3000 | screen text `PASSED` |
+| `sprite_overflow_tests/2.Details.nes` | 3000 | screen text `PASSED` |
+| `sprite_overflow_tests/3.Timing.nes` | 3000 | screen text `PASSED` |
+| `sprite_overflow_tests/4.Obscure.nes` | 3000 | screen text `PASSED` |
+| `sprite_overflow_tests/5.Emulator.nes` | 3000 | screen text `PASSED` |
+| `sprite_hit_tests_2005.10.05/01.basics.nes` | 3000 | screen text `PASSED` |
+| `sprite_hit_tests_2005.10.05/02.alignment.nes` | 3000 | screen text `PASSED` |
+| `sprite_hit_tests_2005.10.05/03.corners.nes` | 3000 | screen text `PASSED` |
+| `sprite_hit_tests_2005.10.05/04.flip.nes` | 3000 | screen text `PASSED` |
+| `sprite_hit_tests_2005.10.05/05.left_clip.nes` | 3000 | screen text `PASSED` |
+| `sprite_hit_tests_2005.10.05/06.right_edge.nes` | 3000 | screen text `PASSED` |
+| `sprite_hit_tests_2005.10.05/07.screen_bottom.nes` | 3000 | screen text `PASSED` |
+| `sprite_hit_tests_2005.10.05/08.double_height.nes` | 3000 | screen text `PASSED` |
+| `sprite_hit_tests_2005.10.05/09.timing_basics.nes` | 3000 | screen text `PASSED` |
+| `sprite_hit_tests_2005.10.05/10.timing_order.nes` | 3000 | screen text `PASSED` |
+| `sprite_hit_tests_2005.10.05/11.edge_timing.nes` | 3000 | screen text `PASSED` |
 | `cpu_interrupts_v2/rom_singles/1-cli_latency.nes` | 18 | Passed |
 | `cpu_interrupts_v2/rom_singles/2-nmi_and_brk.nes` | 114 | Passed |
 | `cpu_interrupts_v2/rom_singles/3-nmi_and_irq.nes` | 134 | Passed |
@@ -101,6 +119,10 @@ VBlank 状态切换、NMI 输出窗口、`$2002`/`$2000` 撤销尚未采样边�
 
 CPU `$2006/$2007` 地址变化已经接入 MMC3 A12 观察路径。PPU 跨扫描线 A12 状态、首次背景 pattern fetch，以及 CPU 指令倒数第二周期的 IRQ 采样相位均已对齐；五个 MMC3 rev B 单项现全部通过。
 
+### PPU 精灵标志
+
+五个 sprite overflow ROM 已覆盖基础行为、错误对角字节搜索、逐 dot 置位时序、隐蔽边界与非预测式实现检查。十一项 sprite-0 hit ROM 已覆盖对齐、四角、翻转、左裁剪、右边界、屏幕底部、8×16 精灵及置位顺序/边沿时序。两组均输出 `PASSED`。
+
 ### APU 与 CPU/APU 时序
 
 APU frame counter、CPU 中断与分支轮询、official/unofficial 指令周期现均已有公开 ROM 通过证据。DMC cold load 在 `$4015` 重新启用后按 CPU/APU get-put parity 延迟 2/3 cycles，load 使用 3-cycle DMA、reload 使用 4-cycle DMA；启动 latency、buffer retained、status 与 status IRQ 已由四个音频报码 ROM 验证。OAM DMA 中间阶段及尾部 1/3-cycle 特例也已由两个公开 ROM 验证。DMC halt/dummy 对 `$2007` 的 2–3 次 phantom read、对 `$4016` 的单次额外移位，以及相邻 CPU 周期 `$2007` 连读返回锁存均已有公开 ROM 证据。`read_joy3/thorough_test` 进一步验证 DMC 覆盖所有相位时，四次手柄采样补偿仍能返回正确值；诊断 ROM 同次运行观察到补偿路径内部冲突 49/1000、无补偿快速读取错误 14/1000，两者不作为固定计数基线。
@@ -114,8 +136,8 @@ APU frame counter、CPU 中断与分支轮询、official/unofficial 指令周期
 
 ## 结论与建议顺序
 
-当前 CPU 官方指令行为、PPU VBlank/NMI、PPU 基础内存/DMA 和 MMC3 IRQ 路径均已有公开 ROM 通过证据。建议后续修复顺序：
+当前 CPU 官方指令行为、PPU VBlank/NMI、PPU 基础内存/DMA、精灵标志和 MMC3 IRQ 路径均已有公开 ROM 通过证据。建议后续修复顺序：
 
 1. 扩充 DMC DMA 与更复杂 OAM 阶段交错的公开回归。
-2. 扩充 PPU sprite overflow 与非渲染期总线细节测试。
+2. 扩充 PPU 非渲染期总线与 clear/copy micro-op 边界测试。
 3. 明确 12 个 CPU jam opcode 的停机模型和工具侧诊断。
