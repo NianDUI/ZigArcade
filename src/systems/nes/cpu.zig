@@ -17,6 +17,7 @@ pub const Status = packed struct(u8) {
 /// CPU carries the decimal flag but does not perform BCD adjustment.
 pub const Cpu = struct {
     const RmwOperation = enum { asl, lsr, rol, ror, inc, dec };
+    const UnofficialRmwOperation = enum { slo, rla, sre, rra, dcp, isc };
 
     a: u8 = 0,
     x: u8 = 0,
@@ -98,6 +99,70 @@ pub const Cpu = struct {
         const opcode = self.fetchByte(bus);
         const previous_interrupt_disable = self.status.interrupt_disable;
         const elapsed: u8 = switch (opcode) {
+            0x03 => self.unofficialRmwIndexedIndirect(bus, .slo),
+            0x07 => self.unofficialRmwZeroPage(bus, .slo),
+            0x0b, 0x2b => self.anc(self.fetchByte(bus)),
+            0x0f => self.unofficialRmwAbsolute(bus, .slo),
+            0x13 => self.unofficialRmwIndirectIndexed(bus, .slo),
+            0x17 => self.unofficialRmwZeroPageIndexed(bus, self.x, .slo),
+            0x1b => self.unofficialRmwAbsoluteIndexed(bus, self.y, .slo),
+            0x1f => self.unofficialRmwAbsoluteIndexed(bus, self.x, .slo),
+            0x23 => self.unofficialRmwIndexedIndirect(bus, .rla),
+            0x27 => self.unofficialRmwZeroPage(bus, .rla),
+            0x2f => self.unofficialRmwAbsolute(bus, .rla),
+            0x33 => self.unofficialRmwIndirectIndexed(bus, .rla),
+            0x37 => self.unofficialRmwZeroPageIndexed(bus, self.x, .rla),
+            0x3b => self.unofficialRmwAbsoluteIndexed(bus, self.y, .rla),
+            0x3f => self.unofficialRmwAbsoluteIndexed(bus, self.x, .rla),
+            0x43 => self.unofficialRmwIndexedIndirect(bus, .sre),
+            0x4b => self.alr(self.fetchByte(bus)),
+            0x47 => self.unofficialRmwZeroPage(bus, .sre),
+            0x4f => self.unofficialRmwAbsolute(bus, .sre),
+            0x53 => self.unofficialRmwIndirectIndexed(bus, .sre),
+            0x57 => self.unofficialRmwZeroPageIndexed(bus, self.x, .sre),
+            0x5b => self.unofficialRmwAbsoluteIndexed(bus, self.y, .sre),
+            0x5f => self.unofficialRmwAbsoluteIndexed(bus, self.x, .sre),
+            0x63 => self.unofficialRmwIndexedIndirect(bus, .rra),
+            0x6b => self.arr(self.fetchByte(bus)),
+            0x67 => self.unofficialRmwZeroPage(bus, .rra),
+            0x6f => self.unofficialRmwAbsolute(bus, .rra),
+            0x73 => self.unofficialRmwIndirectIndexed(bus, .rra),
+            0x77 => self.unofficialRmwZeroPageIndexed(bus, self.x, .rra),
+            0x7b => self.unofficialRmwAbsoluteIndexed(bus, self.y, .rra),
+            0x7f => self.unofficialRmwAbsoluteIndexed(bus, self.x, .rra),
+            0x83 => self.storeIndexedIndirectValue(bus, self.a & self.x),
+            0x8b => self.xaa(self.fetchByte(bus)),
+            0x87 => self.storeZeroPageValue(bus, self.a & self.x),
+            0x8f => self.storeAbsoluteValue(bus, self.a & self.x),
+            0x97 => self.storeZeroPageIndexed(bus, self.y, self.a & self.x),
+            0x93 => self.storeIndirectIndexedMasked(bus, self.a & self.x),
+            0x9b => self.tasAbsoluteY(bus),
+            0x9c => self.storeAbsoluteIndexedMasked(bus, self.x, self.y),
+            0x9e => self.storeAbsoluteIndexedMasked(bus, self.y, self.x),
+            0x9f => self.storeAbsoluteIndexedMasked(bus, self.y, self.a & self.x),
+            0xa3 => self.operateIndexedIndirect(bus, Cpu.lax),
+            0xab => self.lax(self.fetchByte(bus)),
+            0xa7 => self.operateZeroPage(bus, Cpu.lax),
+            0xaf => self.operateAbsolute(bus, Cpu.lax),
+            0xb3 => self.operateIndirectIndexed(bus, Cpu.lax),
+            0xb7 => self.operateZeroPageIndexed(bus, self.y, Cpu.lax),
+            0xbf => self.operateAbsoluteIndexed(bus, self.y, Cpu.lax),
+            0xbb => self.lasAbsoluteY(bus),
+            0xc3 => self.unofficialRmwIndexedIndirect(bus, .dcp),
+            0xc7 => self.unofficialRmwZeroPage(bus, .dcp),
+            0xcb => self.axs(self.fetchByte(bus)),
+            0xcf => self.unofficialRmwAbsolute(bus, .dcp),
+            0xd3 => self.unofficialRmwIndirectIndexed(bus, .dcp),
+            0xd7 => self.unofficialRmwZeroPageIndexed(bus, self.x, .dcp),
+            0xdb => self.unofficialRmwAbsoluteIndexed(bus, self.y, .dcp),
+            0xdf => self.unofficialRmwAbsoluteIndexed(bus, self.x, .dcp),
+            0xe3 => self.unofficialRmwIndexedIndirect(bus, .isc),
+            0xe7 => self.unofficialRmwZeroPage(bus, .isc),
+            0xef => self.unofficialRmwAbsolute(bus, .isc),
+            0xf3 => self.unofficialRmwIndirectIndexed(bus, .isc),
+            0xf7 => self.unofficialRmwZeroPageIndexed(bus, self.x, .isc),
+            0xfb => self.unofficialRmwAbsoluteIndexed(bus, self.y, .isc),
+            0xff => self.unofficialRmwAbsoluteIndexed(bus, self.x, .isc),
             0x00 => self.brk(bus),
             0x08 => self.php(bus),
             0x09 => self.ora(self.fetchByte(bus)),
@@ -108,6 +173,11 @@ pub const Cpu = struct {
             0x1e => self.rmwAbsoluteIndexedOperation(bus, self.x, .asl),
             0x10 => self.branch(bus, !self.status.negative), // BPL
             0x01 => self.operateIndexedIndirect(bus, Cpu.ora),
+            0x04, 0x44, 0x64 => self.nopZeroPage(bus),
+            0x0c => self.nopAbsolute(bus),
+            0x14, 0x34, 0x54, 0x74, 0xd4, 0xf4 => self.nopZeroPageX(bus),
+            0x1c, 0x3c, 0x5c, 0x7c, 0xdc, 0xfc => self.nopAbsoluteX(bus),
+            0x1a, 0x3a, 0x5a, 0x7a, 0xda, 0xfa => 2,
             0x05 => self.operateZeroPage(bus, Cpu.ora),
             0x0d => self.operateAbsolute(bus, Cpu.ora),
             0x11 => self.operateIndirectIndexed(bus, Cpu.ora),
@@ -183,6 +253,10 @@ pub const Cpu = struct {
                 break :blk 2;
             }, // SEI
             0x81 => self.staIndexedIndirect(bus),
+            0x80, 0x82, 0x89, 0xc2, 0xe2 => blk: {
+                _ = self.fetchByte(bus);
+                break :blk 2;
+            },
             0x84 => self.styZeroPage(bus),
             0x85 => self.staZeroPage(bus),
             0x88 => blk: {
@@ -288,6 +362,7 @@ pub const Cpu = struct {
             }, // INX
             0xea => 2, // NOP
             0xe9 => self.sbc(self.fetchByte(bus)),
+            0xeb => self.sbc(self.fetchByte(bus)),
             0xf0 => self.branch(bus, self.status.zero), // BEQ
             0xf1 => self.operateIndirectIndexed(bus, Cpu.sbc),
             0xf5 => self.operateZeroPageIndexed(bus, self.x, Cpu.sbc),
@@ -309,6 +384,50 @@ pub const Cpu = struct {
     fn lda(self: *Cpu, value: u8) u8 {
         self.a = value;
         self.setZn(value);
+        return 2;
+    }
+
+    fn lax(self: *Cpu, value: u8) u8 {
+        self.a = value;
+        self.x = value;
+        self.setZn(value);
+        return 2;
+    }
+
+    fn anc(self: *Cpu, value: u8) u8 {
+        _ = self.andValue(value);
+        self.status.carry = self.status.negative;
+        return 2;
+    }
+
+    fn alr(self: *Cpu, value: u8) u8 {
+        self.a &= value;
+        self.status.carry = self.a & 1 != 0;
+        self.a >>= 1;
+        self.setZn(self.a);
+        return 2;
+    }
+
+    fn arr(self: *Cpu, value: u8) u8 {
+        self.a &= value;
+        self.a = (self.a >> 1) | (if (self.status.carry) @as(u8, 0x80) else 0);
+        self.setZn(self.a);
+        self.status.carry = self.a & 0x40 != 0;
+        self.status.overflow = ((self.a >> 6) ^ (self.a >> 5)) & 1 != 0;
+        return 2;
+    }
+
+    fn xaa(self: *Cpu, value: u8) u8 {
+        self.a = self.x & value;
+        self.setZn(self.a);
+        return 2;
+    }
+
+    fn axs(self: *Cpu, value: u8) u8 {
+        const combined = self.a & self.x;
+        self.status.carry = combined >= value;
+        self.x = combined -% value;
+        self.setZn(self.x);
         return 2;
     }
 
@@ -427,6 +546,36 @@ pub const Cpu = struct {
         return 2;
     }
 
+    fn nopZeroPage(self: *Cpu, bus: *TestBus) u8 {
+        const address = self.fetchByte(bus);
+        _ = bus.read(address);
+        return 3;
+    }
+
+    fn nopZeroPageX(self: *Cpu, bus: *TestBus) u8 {
+        const base = self.fetchByte(bus);
+        _ = bus.read(base);
+        _ = bus.read(base +% self.x);
+        return 4;
+    }
+
+    fn nopAbsolute(self: *Cpu, bus: *TestBus) u8 {
+        _ = bus.read(self.fetchWord(bus));
+        return 4;
+    }
+
+    fn nopAbsoluteX(self: *Cpu, bus: *TestBus) u8 {
+        const base = self.fetchWord(bus);
+        const address = base +% self.x;
+        if ((base & 0xff00) != (address & 0xff00)) {
+            _ = bus.read((base & 0xff00) | (address & 0x00ff));
+            _ = bus.read(address);
+            return 5;
+        }
+        _ = bus.read(address);
+        return 4;
+    }
+
     fn aslAccumulator(self: *Cpu) u8 {
         self.status.carry = self.a & 0x80 != 0;
         self.a <<= 1;
@@ -524,6 +673,63 @@ pub const Cpu = struct {
         _ = bus.read(base);
         bus.write(base +% index, value);
         return 4;
+    }
+
+    fn storeZeroPageValue(self: *Cpu, bus: *TestBus, value: u8) u8 {
+        bus.write(self.fetchByte(bus), value);
+        return 3;
+    }
+
+    fn storeAbsoluteValue(self: *Cpu, bus: *TestBus, value: u8) u8 {
+        bus.write(self.fetchWord(bus), value);
+        return 4;
+    }
+
+    fn storeIndexedIndirectValue(self: *Cpu, bus: *TestBus, value: u8) u8 {
+        const base = self.fetchByte(bus);
+        _ = bus.read(base);
+        bus.write(readZeroPage16(bus, base +% self.x), value);
+        return 6;
+    }
+
+    fn storeIndirectIndexedMasked(self: *Cpu, bus: *TestBus, value: u8) u8 {
+        const pointer = self.fetchByte(bus);
+        const base = readZeroPage16(bus, pointer);
+        const address = base +% self.y;
+        _ = bus.read((base & 0xff00) | (address & 0x00ff));
+        const stored = value & @as(u8, @truncate((base >> 8) +% 1));
+        bus.write(maskedStoreAddress(base, address, stored), stored);
+        return 6;
+    }
+
+    fn storeAbsoluteIndexedMasked(self: *Cpu, bus: *TestBus, index: u8, value: u8) u8 {
+        const base = self.fetchWord(bus);
+        const address = base +% index;
+        _ = bus.read((base & 0xff00) | (address & 0x00ff));
+        const stored = value & @as(u8, @truncate((base >> 8) +% 1));
+        bus.write(maskedStoreAddress(base, address, stored), stored);
+        return 5;
+    }
+
+    fn tasAbsoluteY(self: *Cpu, bus: *TestBus) u8 {
+        self.sp = self.a & self.x;
+        return self.storeAbsoluteIndexedMasked(bus, self.y, self.sp);
+    }
+
+    fn lasAbsoluteY(self: *Cpu, bus: *TestBus) u8 {
+        const base = self.fetchWord(bus);
+        const address = base +% self.y;
+        var cycles: u8 = 4;
+        if ((base & 0xff00) != (address & 0xff00)) {
+            _ = bus.read((base & 0xff00) | (address & 0x00ff));
+            cycles = 5;
+        }
+        const value = bus.read(address) & self.sp;
+        self.a = value;
+        self.x = value;
+        self.sp = value;
+        self.setZn(value);
+        return cycles;
     }
 
     fn staIndexedIndirect(self: *Cpu, bus: *TestBus) u8 {
@@ -854,6 +1060,78 @@ pub const Cpu = struct {
         return cycles;
     }
 
+    fn unofficialRmwZeroPage(self: *Cpu, bus: *TestBus, operation: UnofficialRmwOperation) u8 {
+        return self.unofficialRmwAt(bus, self.fetchByte(bus), operation, 5);
+    }
+
+    fn unofficialRmwZeroPageIndexed(self: *Cpu, bus: *TestBus, index: u8, operation: UnofficialRmwOperation) u8 {
+        const base = self.fetchByte(bus);
+        _ = bus.read(base);
+        return self.unofficialRmwAt(bus, base +% index, operation, 6);
+    }
+
+    fn unofficialRmwAbsolute(self: *Cpu, bus: *TestBus, operation: UnofficialRmwOperation) u8 {
+        return self.unofficialRmwAt(bus, self.fetchWord(bus), operation, 6);
+    }
+
+    fn unofficialRmwAbsoluteIndexed(self: *Cpu, bus: *TestBus, index: u8, operation: UnofficialRmwOperation) u8 {
+        const base = self.fetchWord(bus);
+        const address = base +% index;
+        _ = bus.read((base & 0xff00) | (address & 0x00ff));
+        return self.unofficialRmwAt(bus, address, operation, 7);
+    }
+
+    fn unofficialRmwIndexedIndirect(self: *Cpu, bus: *TestBus, operation: UnofficialRmwOperation) u8 {
+        const base = self.fetchByte(bus);
+        _ = bus.read(base);
+        return self.unofficialRmwAt(bus, readZeroPage16(bus, base +% self.x), operation, 8);
+    }
+
+    fn unofficialRmwIndirectIndexed(self: *Cpu, bus: *TestBus, operation: UnofficialRmwOperation) u8 {
+        const pointer = self.fetchByte(bus);
+        const base = readZeroPage16(bus, pointer);
+        const address = base +% self.y;
+        _ = bus.read((base & 0xff00) | (address & 0x00ff));
+        return self.unofficialRmwAt(bus, address, operation, 8);
+    }
+
+    fn unofficialRmwAt(self: *Cpu, bus: *TestBus, address: u16, operation: UnofficialRmwOperation, cycles: u8) u8 {
+        const value = bus.read(address);
+        bus.write(address, value);
+        const result: u8 = switch (operation) {
+            .slo => blk: {
+                self.status.carry = value & 0x80 != 0;
+                break :blk value << 1;
+            },
+            .rla => blk: {
+                const carry_in: u8 = @intFromBool(self.status.carry);
+                self.status.carry = value & 0x80 != 0;
+                break :blk (value << 1) | carry_in;
+            },
+            .sre => blk: {
+                self.status.carry = value & 1 != 0;
+                break :blk value >> 1;
+            },
+            .rra => blk: {
+                const carry_in: u8 = if (self.status.carry) 0x80 else 0;
+                self.status.carry = value & 1 != 0;
+                break :blk (value >> 1) | carry_in;
+            },
+            .dcp => value -% 1,
+            .isc => value +% 1,
+        };
+        bus.write(address, result);
+        switch (operation) {
+            .slo => _ = self.ora(result),
+            .rla => _ = self.andValue(result),
+            .sre => _ = self.eor(result),
+            .rra => _ = self.adc(result),
+            .dcp => _ = self.compare(self.a, result),
+            .isc => _ = self.sbc(result),
+        }
+        return cycles;
+    }
+
     fn jsr(self: *Cpu, bus: *TestBus) u8 {
         const target_low = self.fetchByte(bus);
         _ = bus.read(0x0100 | @as(u16, self.sp));
@@ -992,6 +1270,11 @@ fn readZeroPage16(bus: *TestBus, address: u8) u16 {
     return @as(u16, low) | (@as(u16, high) << 8);
 }
 
+fn maskedStoreAddress(base: u16, address: u16, value: u8) u16 {
+    if ((base & 0xff00) == (address & 0xff00)) return address;
+    return (@as(u16, value) << 8) | (address & 0x00ff);
+}
+
 const NmiEdgeInjector = struct {
     cpu: *Cpu,
     trigger_access: u8,
@@ -1081,6 +1364,71 @@ test "taken on-page branch marks its early IRQ poll" {
     cpu.status.zero = true;
     try std.testing.expectEqual(@as(u8, 2), try cpu.step(&bus));
     try std.testing.expect(!cpu.irq_poll_one_cycle_early);
+}
+
+test "unofficial NOPs preserve state and retain addressing bus cycles" {
+    var bus: TestBus = .{};
+    bus.memory[0x8000..][0..6].* = .{ 0x04, 0x10, 0x1c, 0xff, 0x20, 0xea };
+    bus.memory[0x0010] = 0x55;
+    bus.memory[0x2100] = 0xaa;
+    var cpu: Cpu = .{ .pc = 0x8000, .x = 1, .a = 0x42, .status = .{ .carry = true } };
+
+    try std.testing.expectEqual(@as(u8, 3), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u8, 5), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u8, 0x42), cpu.a);
+    try std.testing.expect(cpu.status.carry);
+    try std.testing.expectEqualSlices(Access, &.{
+        .{ .kind = .read, .address = 0x8000, .value = 0x04 },
+        .{ .kind = .read, .address = 0x8001, .value = 0x10 },
+        .{ .kind = .read, .address = 0x0010, .value = 0x55 },
+        .{ .kind = .read, .address = 0x8002, .value = 0x1c },
+        .{ .kind = .read, .address = 0x8003, .value = 0xff },
+        .{ .kind = .read, .address = 0x8004, .value = 0x20 },
+        .{ .kind = .read, .address = 0x2000, .value = 0x00 },
+        .{ .kind = .read, .address = 0x2100, .value = 0xaa },
+    }, bus.accesses());
+}
+
+test "unofficial RMW instructions keep read-write-write ordering" {
+    var bus: TestBus = .{};
+    bus.memory[0x8000..][0..2].* = .{ 0x07, 0x10 }; // SLO $10
+    bus.memory[0x0010] = 0x81;
+    var cpu: Cpu = .{ .pc = 0x8000, .a = 0x10 };
+
+    try std.testing.expectEqual(@as(u8, 5), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u8, 0x02), bus.memory[0x0010]);
+    try std.testing.expectEqual(@as(u8, 0x12), cpu.a);
+    try std.testing.expect(cpu.status.carry);
+    try std.testing.expectEqualSlices(Access, &.{
+        .{ .kind = .read, .address = 0x8000, .value = 0x07 },
+        .{ .kind = .read, .address = 0x8001, .value = 0x10 },
+        .{ .kind = .read, .address = 0x0010, .value = 0x81 },
+        .{ .kind = .write, .address = 0x0010, .value = 0x81 },
+        .{ .kind = .write, .address = 0x0010, .value = 0x02 },
+    }, bus.accesses());
+}
+
+test "masked stores use base-page mask and corrupt the write page on crossing" {
+    var bus: TestBus = .{};
+    bus.memory[0x8000..][0..6].* = .{ 0x9c, 0xff, 0x20, 0x9e, 0x10, 0x20 };
+    var cpu: Cpu = .{ .pc = 0x8000, .x = 1, .y = 0x0f };
+
+    try std.testing.expectEqual(@as(u8, 5), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u8, 0x01), bus.memory[0x0100]);
+    try std.testing.expectEqual(@as(u8, 5), try cpu.step(&bus));
+    try std.testing.expectEqual(@as(u8, 0x01), bus.memory[0x201f]);
+    try std.testing.expectEqualSlices(Access, &.{
+        .{ .kind = .read, .address = 0x8000, .value = 0x9c },
+        .{ .kind = .read, .address = 0x8001, .value = 0xff },
+        .{ .kind = .read, .address = 0x8002, .value = 0x20 },
+        .{ .kind = .read, .address = 0x2000, .value = 0x00 },
+        .{ .kind = .write, .address = 0x0100, .value = 0x01 },
+        .{ .kind = .read, .address = 0x8003, .value = 0x9e },
+        .{ .kind = .read, .address = 0x8004, .value = 0x10 },
+        .{ .kind = .read, .address = 0x8005, .value = 0x20 },
+        .{ .kind = .read, .address = 0x201f, .value = 0x00 },
+        .{ .kind = .write, .address = 0x201f, .value = 0x01 },
+    }, bus.accesses());
 }
 
 test "BRK pushes PC plus two and vectors through IRQ" {

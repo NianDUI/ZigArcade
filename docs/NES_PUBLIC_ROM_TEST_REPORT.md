@@ -17,13 +17,14 @@
 | 范围 | 通过 | 失败 | 阻塞/不适用 |
 |---|---:|---:|---:|
 | 2A03 官方指令行为 | 1 | 0 | 0 |
+| 2A03 official/unofficial 非 jam 行为 | 1 | 0 | 0 |
 | PPU VBlank/NMI 单项 | 10 | 0 | 0 |
 | PPU read-buffer/DMA | 1 | 0 | 0 |
 | PPU open bus | 1 | 0 | 0 |
 | MMC3 IRQ 单项 | 5 | 0 | 0 |
 | APU 基础单项 | 6 | 0 | 0 |
 | APU reset 单项 | 6 | 0 | 0 |
-| CPU/APU 指令时序与中断 | 5 | 1 | 0 |
+| CPU/APU 指令时序与中断 | 8 | 0 | 0 |
 
 `romtest` 现会识别 `$6000=$81`，等待至少 100 ms 后模拟主机 RESET，并保留测试用于计数的 PRG RAM。没有 `$6000` 协议的旧测试 ROM 仍不纳入统计。
 
@@ -31,7 +32,8 @@
 
 | ROM | 完成帧 | 结果 |
 |---|---:|---|
-| `instr_test-v5/official_only.nes` | 1885 | `All 16 tests passed` |
+| `instr_test-v5/official_only.nes` | 1874 | `All 16 tests passed` |
+| `instr_test-v5/all_instrs.nes` | 2401 | `All 16 tests passed` |
 | `ppu_vbl_nmi/rom_singles/01-vbl_basics.nes` | 144 | Passed |
 | `ppu_vbl_nmi/rom_singles/02-vbl_set_time.nes` | 171 | Passed |
 | `ppu_vbl_nmi/rom_singles/03-vbl_clear_time.nes` | 171 | Passed |
@@ -50,6 +52,9 @@
 | `cpu_interrupts_v2/rom_singles/4-irq_and_dma.nes` | 71 | Passed |
 | `cpu_interrupts_v2/rom_singles/5-branch_delays_irq.nes` | 381 | Passed |
 | `cpu_interrupts_v2/cpu_interrupts.nes` | 726 | `All 5 tests passed` |
+| `instr_timing/rom_singles/1-instr_timing.nes` | 1013 | Passed，含 unofficial opcode timing |
+| `instr_timing/rom_singles/2-branch_timing.nes` | 140 | Passed |
+| `instr_timing/instr_timing.nes` | 1299 | `All 2 tests passed` |
 | `apu_test/rom_singles/1-len_ctr.nes` | 22 | Passed |
 | `apu_test/rom_singles/2-len_table.nes` | 17 | Passed |
 | `apu_test/rom_singles/3-irq_flag.nes` | 22 | Passed |
@@ -80,13 +85,11 @@ CPU `$2006/$2007` 地址变化已经接入 MMC3 A12 观察路径。PPU 跨扫描
 
 ### APU 与 CPU/APU 时序
 
-| ROM | 失败证据 |
-|---|---|
-| `instr_timing/instr_timing.nes` | `Failed #5`：APU length period 与指令组合时序不匹配 |
+APU frame counter、CPU 中断与分支轮询、official/unofficial 指令周期现均已有公开 ROM 通过证据。
 
 ## 未纳入结论
 
-- 需要非官方 opcode 的 ROM：当前按既定兼容边界返回 `UnsupportedOpcode`。
+- 12 个会锁死 2A03 的 jam opcode 尚未建模，当前仍返回 `UnsupportedOpcode`。
 - 没有 `$6000-$6003` 状态协议的旧 ROM：当前入口返回 `TestRomProtocolNotFound`，不能据此判模拟失败。
 - 需要真实按键、人工观察、PAL 或商业 ROM 的测试未执行。
 
@@ -94,6 +97,6 @@ CPU `$2006/$2007` 地址变化已经接入 MMC3 A12 观察路径。PPU 跨扫描
 
 当前 CPU 官方指令行为、PPU VBlank/NMI、PPU 基础内存/DMA 和 MMC3 IRQ 路径均已有公开 ROM 通过证据。建议后续修复顺序：
 
-1. 修复剩余 `instr_timing` APU length period 边界。
-2. 继续扩展 DMC DMA 与非官方 opcode 兼容边界。
-3. 扩充 PPU sprite overflow 与非渲染期总线细节测试。
+1. 扩充 DMC DMA 的冲突与 wraparound 公开回归。
+2. 扩充 PPU sprite overflow 与非渲染期总线细节测试。
+3. 明确 12 个 CPU jam opcode 的停机模型和工具侧诊断。

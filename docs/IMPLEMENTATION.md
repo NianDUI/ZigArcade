@@ -273,7 +273,7 @@ P5a 先锁定 68000 地址图：P-ROM 的 16-bit endian/interleave、work RAM、
 
 1. 建立仓库 LICENSE、`REFERENCES.md`、`THIRD_PARTY_NOTICES.md`、测试资产 manifest；用 Zig 0.16.0 初始化并锁定最小 `build.zig`、CI 的 `zig build test`/`zig fmt --check`。
 2. 完成 macOS/Linux TTY/termios/sigaction 可行性 spike、terminal lifecycle 状态机、ANSI 色条、fake duplex TTY；再实现 Kitty query、3072-byte 原始块传输、短写和清理测试。
-3. 实现 NES CPU/RAM 的 micro-op bus trace runner；先完成官方指令、interrupt/dummy/RMW 测试，再加载 ROM。当前已分派 151 个官方 2A03 opcode；非官方 opcode 仍明确 `UnsupportedOpcode`，兼容性范围限制为自制/测试 ROM，直到有公开 ROM 回归证据。
+3. 实现 NES CPU/RAM 的 micro-op bus trace runner；先完成官方指令、interrupt/dummy/RMW 测试，再加载 ROM。当前已分派 151 个官方 2A03 opcode，并覆盖公开 timing ROM 使用的 unofficial NOP、复合 RMW、load/store 与立即数变体；12 个 jam opcode 仍明确返回 `UnsupportedOpcode`。
 4. 接入 iNES/NROM、CPU bus、dot 级 PPU 寄存器/NMI，跑 manifest 锁定的公开测试 ROM。
 5. 完成逐周期 DMA、双控制器、背景、精灵和帧哈希，交付 NROM 可玩样例。
 6. 仅当 FC 回归稳定后，创建 Neo Geo 的 68000 单测切片。
