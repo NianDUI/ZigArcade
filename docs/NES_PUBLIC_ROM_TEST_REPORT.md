@@ -22,7 +22,7 @@
 | PPU read-buffer/DMA | 1 | 0 | 0 |
 | PPU open bus | 1 | 0 | 0 |
 | MMC3 IRQ 单项 | 5 | 0 | 0 |
-| APU 基础单项 | 6 | 0 | 0 |
+| APU 基础单项 | 8 | 0 | 0 |
 | APU reset 单项 | 6 | 0 | 0 |
 | CPU/APU 指令时序与中断 | 8 | 0 | 0 |
 
@@ -61,6 +61,8 @@
 | `apu_test/rom_singles/4-jitter.nes` | 21 | Passed |
 | `apu_test/rom_singles/5-len_timing.nes` | 115 | Passed |
 | `apu_test/rom_singles/6-irq_flag_timing.nes` | 24 | Passed |
+| `apu_test/rom_singles/7-dmc_basics.nes` | 27 | Passed |
+| `apu_test/rom_singles/8-dmc_rates.nes` | 30 | Passed |
 | `apu_reset/4015_cleared.nes` | 31 | Passed |
 | `apu_reset/4017_timing.nes` | 42 | Passed，输出有效写入延迟 12 clocks |
 | `apu_reset/4017_written.nes` | 59 | Passed |

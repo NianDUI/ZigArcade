@@ -10,7 +10,7 @@ const length_table = [_]u8{
     12, 16,  24, 18, 48, 20, 96, 22, 192, 24, 72, 26, 16, 28, 32, 30,
 };
 const noise_period_table = [_]u16{ 4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068 };
-const dmc_period_table = [_]u16{ 428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 85, 72, 54 };
+const dmc_period_table = [_]u16{ 428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54 };
 
 /// RP2A03 APU slice. It produces deterministic mono PCM at 44.1 kHz in
 /// emulated CPU-cycle time. The pulse channels share their half-rate timer
@@ -115,7 +115,6 @@ pub const Apu = struct {
             if (address == 0x4006 or address == 0x4007) self.reloadPulseTimer(.two);
             if (address == 0x400a or address == 0x400b) self.reloadTriangleTimer();
             if (address == 0x400e) self.reloadNoiseTimer();
-            if (address == 0x4010) self.reloadDmcTimer();
             if (address == 0x4010 and value & 0x80 == 0) self.dmc_irq = false;
             if (address == 0x4011) self.dmc_output = @truncate(value);
             if (address == 0x4012) self.dmc_sample_address = 0xc000 | (@as(u16, value) << 6);
@@ -560,6 +559,15 @@ test "APU stores CPU-visible registers and reports frame IRQ through $4015" {
     try std.testing.expect(apu.frameIrqPending());
     try std.testing.expectEqual(@as(?u8, 0x50), apu.cpuRead(0x4015));
     try std.testing.expect(!apu.frameIrqPending());
+}
+
+test "DMC rate writes preserve the active divider phase" {
+    var null_sink = NullAudioSink{};
+    var apu = Apu.init(null_sink.asSink());
+    apu.dmc_divider = 17;
+    _ = apu.cpuWrite(0x4010, 0x00);
+    try std.testing.expectEqual(@as(u16, 17), apu.dmc_divider);
+    try std.testing.expectEqual(@as(u16, 84), dmc_period_table[13]);
 }
 
 test "APU five-step mode and IRQ inhibit suppress frame IRQ" {
