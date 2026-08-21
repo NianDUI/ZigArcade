@@ -42,6 +42,8 @@ pub const Nes = struct {
     // A 513-cycle OAM DMA releases the CPU one APU phase earlier than the
     // aligned 514-cycle form, affecting the first resumed IRQ poll only.
     post_dma_apu_irq_early: bool = false,
+    dmc_instruction_stall_cycles: u16 = 0,
+    dmc_delayed_by_write: bool = false,
 
     pub fn init(self: *Nes, cartridge: Cartridge) void {
         self.null_audio_sink = .{};
@@ -73,6 +75,8 @@ pub const Nes = struct {
         self.irq_edge_subdot = 0;
         self.irq_deferred = false;
         self.post_dma_apu_irq_early = false;
+        self.dmc_instruction_stall_cycles = 0;
+        self.dmc_delayed_by_write = false;
         self.bus.setTraceEnabled(false);
         self.bus.attachMapper(mapper);
         self.bus.attachPpu(&self.ppu);
@@ -105,6 +109,8 @@ pub const Nes = struct {
         self.irq_edge_subdot = 0;
         self.irq_deferred = false;
         self.post_dma_apu_irq_early = false;
+        self.dmc_instruction_stall_cycles = 0;
+        self.dmc_delayed_by_write = false;
         self.cpu.reset(&self.bus);
     }
 
@@ -121,6 +127,8 @@ pub const Nes = struct {
         self.instruction_cycle_progress = 0;
         self.nmi_edge_cycle = null;
         self.irq_edge_cycle = null;
+        self.dmc_instruction_stall_cycles = 0;
+        self.dmc_delayed_by_write = false;
         self.cpu.setIrqLine(!suppress_late_irq and self.irqLinePending());
         self.bus.beginCpuCycleHook(@ptrCast(self), clockCpuBusCycle, sampleCpuBusCycle);
         const cycles = self.cpu.step(&self.bus) catch |err| {
@@ -135,6 +143,7 @@ pub const Nes = struct {
         // did not touch the bus (for example an accumulator operation).
         self.advanceDevices(cycles - bus_cycles + 1, true);
         self.tracking_cpu_instruction = false;
+        if (self.bus.currentCpuAccessKind() == .write and self.apu.dmcReadPending()) self.dmc_delayed_by_write = true;
         const nmi_hijacked = self.cpu.takeNmiHijackConsumed();
         const nmi_after_vector_select = self.cpu.takeNmiAfterVectorSelect();
         if (nmi_after_vector_select) {
@@ -158,17 +167,19 @@ pub const Nes = struct {
                 self.irq_deferred = true;
             }
         }
-        var dmc_cycles = self.serviceDmcDma();
         if (self.bus.takeDmaRequest()) |page| {
-            var dma = OamDma.init(page, self.cpu.pc, self.cpu.cycles);
+            var dma = OamDma.init(page, self.cpu.pc, self.cpu.cycles + self.dmc_instruction_stall_cycles);
             var dma_cycles: u16 = 0;
+            var dmc_cycles = self.dmc_instruction_stall_cycles;
             var irq_during_dma = false;
             while (true) {
                 dma_cycles += 1;
                 const irq_before_dma_cycle = self.irqLinePending();
                 const active = dma.tick(&self.bus, &self.ppu);
                 self.apu.tick(1);
-                dmc_cycles += self.serviceDmcDma();
+                const dmc_stall_cycles = dma.dmcStallCycles();
+                const serviced_dmc = self.serviceDmcDmaWithStall(dmc_stall_cycles);
+                dmc_cycles += serviced_dmc;
                 for (0..3) |_| self.ppu.tickDot();
                 if (!irq_before_dma_cycle and self.irqLinePending()) irq_during_dma = true;
                 if (!active) break;
@@ -180,6 +191,7 @@ pub const Nes = struct {
             self.cpu.cycles += dma_cycles + dmc_cycles;
             return @as(u16, cycles) + dma_cycles + dmc_cycles;
         }
+        const dmc_cycles = self.dmc_instruction_stall_cycles + self.serviceDmcDma();
         self.cpu.cycles += dmc_cycles;
         return @as(u16, cycles) + dmc_cycles;
     }
@@ -210,7 +222,21 @@ pub const Nes = struct {
 
     fn clockCpuBusCycle(context: *anyopaque) void {
         const self: *Nes = @ptrCast(@alignCast(context));
+        const access_kind = self.bus.currentCpuAccessKind();
+        if (access_kind == .read and self.apu.dmcReadPending()) self.serviceInstructionDmc();
         self.advanceDevices(1, false);
+        if (access_kind == .write) {
+            if (self.apu.dmcReadPending()) self.dmc_delayed_by_write = true;
+            return;
+        }
+        self.serviceInstructionDmc();
+    }
+
+    fn serviceInstructionDmc(self: *Nes) void {
+        const stall_cycles: u16 = if (self.dmc_delayed_by_write) 3 else 4;
+        const serviced = self.serviceDmcDmaWithStall(stall_cycles);
+        self.dmc_instruction_stall_cycles += serviced;
+        if (serviced != 0) self.dmc_delayed_by_write = false;
     }
 
     fn sampleCpuBusCycle(context: *anyopaque) void {
@@ -233,11 +259,18 @@ pub const Nes = struct {
     /// outside the CPU instruction boundary and inside OAM DMA alike, keeping
     /// device clocks and the CPU cycle counter in the same timeline.
     fn serviceDmcDma(self: *Nes) u16 {
+        const stall_cycles: u16 = if (self.dmc_delayed_by_write) 3 else 4;
+        const serviced = self.serviceDmcDmaWithStall(stall_cycles);
+        if (serviced != 0) self.dmc_delayed_by_write = false;
+        return serviced;
+    }
+
+    fn serviceDmcDmaWithStall(self: *Nes, stall_cycles: u16) u16 {
         const address = self.apu.takeDmcReadRequest() orelse return 0;
-        self.apu.provideDmcSample(self.bus.read(address));
-        self.apu.tick(4);
-        for (0..12) |_| self.ppu.tickDot();
-        return 4;
+        self.apu.tick(stall_cycles);
+        for (0..stall_cycles * 3) |_| self.ppu.tickDot();
+        self.apu.provideDmcSample(self.bus.dmaRead(address));
+        return stall_cycles;
     }
 
     /// Runs until the next PPU frame boundary. Both background and fetched
@@ -374,13 +407,13 @@ test "Nes stalls CPU for OAM DMA and advances PPU through every DMA cycle" {
     var nes: Nes = undefined;
     nes.init(cartridge);
     nes.cpu.a = 0x00;
-    nes.cpu.cycles = 0; // even completed write cycle -> 513 DMA cycles
+    nes.cpu.cycles = 0; // STA completes on cycle four -> 514 DMA cycles
 
-    try std.testing.expectEqual(@as(u16, 517), try nes.step());
-    try std.testing.expectEqual(@as(u64, 517), nes.cpu.cycles);
-    try std.testing.expectEqual(@as(u16, 187), nes.ppu.dot);
+    try std.testing.expectEqual(@as(u16, 518), try nes.step());
+    try std.testing.expectEqual(@as(u64, 518), nes.cpu.cycles);
+    try std.testing.expectEqual(@as(u16, 190), nes.ppu.dot);
     try std.testing.expectEqual(@as(u16, 4), nes.ppu.scanline);
-    try std.testing.expectEqual(@as(u64, 517), nes.apu.cpu_cycles);
+    try std.testing.expectEqual(@as(u64, 518), nes.apu.cpu_cycles);
 }
 
 test "Nes runFrame advances to a PPU frame boundary and exposes RGB frame" {
@@ -677,5 +710,5 @@ test "BSD-2-Clause nes15 fixture reaches a deterministic rendered title frame" {
     var frame: Frame = undefined;
     for (0..3) |_| frame = try nes.runFrame();
 
-    try std.testing.expectEqual(@as(u64, 8933172950573502855), std.hash.Wyhash.hash(0, frame.pixels));
+    try std.testing.expectEqual(@as(u64, 8264638174104152342), std.hash.Wyhash.hash(0, frame.pixels));
 }

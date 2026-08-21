@@ -35,6 +35,7 @@ pub const TestBus = struct {
     cpu_cycle_after_access_hook: ?CpuCycleHook = null,
     cpu_cycle_context: ?*anyopaque = null,
     cpu_cycle_accesses: u8 = 0,
+    current_cpu_access_kind: AccessKind = .read,
 
     pub fn attachMapper0(self: *TestBus, mapper: *Mapper0) void {
         self.mapper = Mapper.fromMapper0(mapper);
@@ -90,6 +91,7 @@ pub const TestBus = struct {
     }
 
     pub fn read(self: *TestBus, address: u16) u8 {
+        self.current_cpu_access_kind = .read;
         self.clockBeforeCpuBusAccess();
         const value = if (self.mapper) |*mapper|
             self.readMapped(mapper, address)
@@ -109,6 +111,7 @@ pub const TestBus = struct {
     }
 
     pub fn write(self: *TestBus, address: u16, value: u8) void {
+        self.current_cpu_access_kind = .write;
         self.clockBeforeCpuBusAccess();
         if (self.mapper) |*mapper| {
             if (address < 0x2000) {
@@ -138,6 +141,22 @@ pub const TestBus = struct {
 
     pub fn accesses(self: *const TestBus) []const Access {
         return self.trace[0..self.trace_len];
+    }
+
+    pub fn currentCpuAccessKind(self: *const TestBus) AccessKind {
+        return self.current_cpu_access_kind;
+    }
+
+    /// DMA reads occur while the CPU cycle hook is suspended by bus
+    /// arbitration. They retain mapper/register side effects and tracing but
+    /// must not recursively begin another CPU bus cycle.
+    pub fn dmaRead(self: *TestBus, address: u16) u8 {
+        const value = if (self.mapper) |*mapper|
+            self.readMapped(mapper, address)
+        else
+            self.memory[address];
+        self.record(.{ .kind = .read, .address = address, .value = value });
+        return value;
     }
 
     fn record(self: *TestBus, access: Access) void {

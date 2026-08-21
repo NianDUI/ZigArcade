@@ -1,4 +1,4 @@
-# NES 公开测试 ROM 回归报告（2026-08-20）
+# NES 公开测试 ROM 回归报告（2026-08-21）
 
 ## 测试基线
 
@@ -25,6 +25,7 @@
 | APU 基础单项 | 8 | 0 | 0 |
 | APU reset 单项 | 6 | 0 | 0 |
 | CPU/APU 指令时序与中断 | 8 | 0 | 0 |
+| OAM/DMC DMA 冲突 | 2 | 0 | 0 |
 
 `romtest` 现会识别 `$6000=$81`，等待至少 100 ms 后模拟主机 RESET，并保留测试用于计数的 PRG RAM。没有 `$6000` 协议的旧测试 ROM 仍不纳入统计。
 
@@ -69,6 +70,8 @@
 | `apu_reset/irq_flag_cleared.nes` | 33 | Passed |
 | `apu_reset/len_ctrs_enabled.nes` | 36 | Passed |
 | `apu_reset/works_immediately.nes` | 37 | Passed |
+| `sprdma_and_dmc_dma/sprdma_and_dmc_dma.nes` | 143 | Passed，覆盖普通 OAM 阶段的 2-cycle DMC stall |
+| `sprdma_and_dmc_dma/sprdma_and_dmc_dma_512.nes` | 140 | Passed，覆盖倒数第 3/最后 OAM 周期的 1/3-cycle stall |
 | `mmc3_test/1-clocking.nes` | 24 | Passed |
 | `mmc3_test/2-details.nes` | 26 | Passed |
 | `mmc3_test/3-A12_clocking.nes` | 24 | Passed |
@@ -87,7 +90,7 @@ CPU `$2006/$2007` 地址变化已经接入 MMC3 A12 观察路径。PPU 跨扫描
 
 ### APU 与 CPU/APU 时序
 
-APU frame counter、CPU 中断与分支轮询、official/unofficial 指令周期现均已有公开 ROM 通过证据。
+APU frame counter、CPU 中断与分支轮询、official/unofficial 指令周期现均已有公开 ROM 通过证据。DMC load/reload 请求按 CPU 读写与 APU phase 仲裁，OAM DMA 中间阶段及尾部 1/3-cycle 特例也已由两个公开 ROM 验证。
 
 ## 未纳入结论
 
@@ -99,6 +102,6 @@ APU frame counter、CPU 中断与分支轮询、official/unofficial 指令周期
 
 当前 CPU 官方指令行为、PPU VBlank/NMI、PPU 基础内存/DMA 和 MMC3 IRQ 路径均已有公开 ROM 通过证据。建议后续修复顺序：
 
-1. 扩充 DMC DMA 的冲突与 wraparound 公开回归。
+1. 扩充 DMC DMA 对 `$2007/$4016` 副作用读取的公开回归。
 2. 扩充 PPU sprite overflow 与非渲染期总线细节测试。
 3. 明确 12 个 CPU jam opcode 的停机模型和工具侧诊断。

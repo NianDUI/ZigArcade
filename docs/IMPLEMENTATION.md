@@ -118,7 +118,7 @@ ROM 标题和错误文本输出前过滤 ESC/C0，防止 ROM 元数据注入控�
 | `$4016-$4017` | 控制器 |
 | `$4020-$FFFF` | Mapper/卡带 |
 
-CPU `read/write` 和无副作用 `peek` 必须分开；CPU 绝不使用 `peek`。OAM DMA 是 bus-cycle 状态机：起始写 `$4014` 后先执行 1/2 个 alignment/dummy 周期，再交替 256 次有副作用 CPU bus read 与 OAM write，总计 513/514 周期；来源可以是 mapper/I/O。必须测试奇偶、mapper 来源和中断优先级。
+CPU `read/write` 和无副作用 `peek` 必须分开；CPU 绝不使用 `peek`。OAM DMA 是 bus-cycle 状态机：起始写 `$4014` 后先执行 1/2 个 alignment/dummy 周期，再交替 256 次有副作用 CPU bus read 与 OAM write，总计 513/514 周期；来源可以是 mapper/I/O。DMC DMA 在 CPU 读周期停机、CPU 写后按 3-cycle 延迟处理，并与 OAM DMA 仲裁：中间阶段通常额外 2 cycles，倒数第 3/最后周期分别为 1/3 cycles；样本只在最终 get cycle 写入 buffer，避免 in-flight 请求重复排队。必须测试奇偶、mapper 来源、中断优先级与 DMA 冲突。
 
 ### 6.2 PPU、卡带与控制器
 
