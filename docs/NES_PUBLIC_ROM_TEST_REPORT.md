@@ -18,9 +18,12 @@
 |---|---:|---:|---:|
 | 2A03 官方指令行为 | 1 | 0 | 0 |
 | 2A03 official/unofficial 非 jam 行为 | 1 | 0 | 0 |
-| PPU VBlank/NMI 单项 | 10 | 0 | 0 |
+| PPU VBlank/NMI 单项 | 11 | 0 | 0 |
 | PPU read-buffer/DMA | 1 | 0 | 0 |
 | PPU open bus | 1 | 0 | 0 |
+| PPU palette/VRAM 旧式单项 | 2 | 0 | 0 |
+| PPU OAM 访问 | 2 | 0 | 0 |
+| CPU RMW 对 PPU/OAM 双写 | 2 | 0 | 0 |
 | PPU sprite overflow | 5 | 0 | 0 |
 | PPU sprite-0 hit | 11 | 0 | 0 |
 | MMC3 IRQ 单项 | 5 | 0 | 0 |
@@ -50,8 +53,15 @@
 | `ppu_vbl_nmi/rom_singles/08-nmi_off_timing.nes` | 223 | Passed |
 | `ppu_vbl_nmi/rom_singles/09-even_odd_frames.nes` | 80 | Passed，输出 `00 01 01 02` |
 | `ppu_vbl_nmi/rom_singles/10-even_odd_timing.nes` | 144 | Passed，输出 `08 08 09 07` |
+| `blargg_ppu_tests_2005.09.15b/vbl_clear_time.nes` | 3000 | screen result `$01`，按随附 README 表示 VBlank clear timing Passed |
 | `ppu_read_buffer/test_ppu_read_buffer.nes` | 1267 | Passed |
 | `ppu_open_bus/ppu_open_bus.nes` | 250 | Passed |
+| `blargg_ppu_tests_2005.09.15b/palette_ram.nes` | 3000 | screen result `$01`，按随附 README 表示 Passed |
+| `blargg_ppu_tests_2005.09.15b/vram_access.nes` | 3000 | screen result `$01`，按随附 README 表示 Passed |
+| `blargg_ppu_tests_2005.09.15b/sprite_ram.nes` | 3000 | screen result `$01`，按随附 README 表示 Passed |
+| `oam_read/oam_read.nes` | 27 | Passed |
+| `cpu_dummy_writes/cpu_dummy_writes_oam.nes` | 314 | Passed，覆盖 official/unofficial RMW 的原值写与次周期结果写 |
+| `cpu_dummy_writes/cpu_dummy_writes_ppumem.nes` | 233 | Passed，覆盖 PPU 寄存器 open bus 与 official/unofficial RMW 双写 |
 | `sprite_overflow_tests/1.Basics.nes` | 3000 | screen text `PASSED` |
 | `sprite_overflow_tests/2.Details.nes` | 3000 | screen text `PASSED` |
 | `sprite_overflow_tests/3.Timing.nes` | 3000 | screen text `PASSED` |
@@ -109,7 +119,7 @@
 | `mmc3_test/4-scanline_timing.nes` | 317 | Passed |
 | `mmc3_test/5-MMC3.nes` | 24 | Passed |
 
-## 确认失败项
+## 已闭环领域
 
 ### PPU VBlank/NMI
 
@@ -123,6 +133,10 @@ CPU `$2006/$2007` 地址变化已经接入 MMC3 A12 观察路径。PPU 跨扫描
 
 五个 sprite overflow ROM 已覆盖基础行为、错误对角字节搜索、逐 dot 置位时序、隐蔽边界与非预测式实现检查。十一项 sprite-0 hit ROM 已覆盖对齐、四角、翻转、左裁剪、右边界、屏幕底部、8×16 精灵及置位顺序/边沿时序。两组均输出 `PASSED`。
 
+### PPU 内存与 OAM 访问
+
+旧式 `palette_ram`、`vram_access` 与 `sprite_ram` 均返回该套 ROM 定义的通过码 `$01`，覆盖 palette 镜像、立即读、VRAM read buffer、palette shadow read、`$2003/$2004` 地址行为及 `$4014` 从当前 OAM 地址环绕复制。新式 `oam_read` 进一步通过；两项 CPU dummy-write ROM 验证 official/unofficial RMW 对 OAM 和 PPU 寄存器连续写入原值与结果值的总线副作用。
+
 ### APU 与 CPU/APU 时序
 
 APU frame counter、CPU 中断与分支轮询、official/unofficial 指令周期现均已有公开 ROM 通过证据。DMC cold load 在 `$4015` 重新启用后按 CPU/APU get-put parity 延迟 2/3 cycles，load 使用 3-cycle DMA、reload 使用 4-cycle DMA；启动 latency、buffer retained、status 与 status IRQ 已由四个音频报码 ROM 验证。OAM DMA 中间阶段及尾部 1/3-cycle 特例也已由两个公开 ROM 验证。DMC halt/dummy 对 `$2007` 的 2–3 次 phantom read、对 `$4016` 的单次额外移位，以及相邻 CPU 周期 `$2007` 连读返回锁存均已有公开 ROM 证据。`read_joy3/thorough_test` 进一步验证 DMC 覆盖所有相位时，四次手柄采样补偿仍能返回正确值；诊断 ROM 同次运行观察到补偿路径内部冲突 49/1000、无补偿快速读取错误 14/1000，两者不作为固定计数基线。
@@ -131,6 +145,7 @@ APU frame counter、CPU 中断与分支轮询、official/unofficial 指令周期
 
 - 12 个会锁死 2A03 的 jam opcode 尚未建模，当前仍返回 `UnsupportedOpcode`。
 - 没有 `$6000-$6003` 状态协议的旧 ROM：`romtest` 返回 `TestRomProtocolNotFound` 并输出 `screen-text`；蜂鸣报码 ROM 可通过 `audiotest` 自动判定，其余只有文本中的 `Passed` 或 CRC 与锁定源码允许值一致时才手工纳入结论。
+- `blargg_ppu_tests_2005.09.15b/power_up_palette.nes` 返回 `$02`；随附 README 明确说明期望表可能仅对应作者的单台 NES，因此不作为通用上电状态门禁。
 - `read_joy3/count_errors.nes` 与 `count_errors_fast.nes` 是统计冲突/错误数量的诊断 ROM，没有固定通过码；当前分别观察到 49/1000 与 14/1000，证明干扰路径可达，但未计入通过项。
 - 需要真实按键、人工观察、PAL 或商业 ROM 的测试未执行。
 
