@@ -152,6 +152,20 @@ test "MMC1 reset restores fixed-last-bank mode and CHR-RAM is writable" {
     try std.testing.expectEqual(@as(?u8, 0x7a), mapper.ppuRead(0x1fff));
 }
 
+test "MMC1 mirrors a single 16 KiB PRG bank in every banking mode" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    prg[0] = 0x11;
+    prg[0x3fff] = 0x22;
+    var mapper = Mapper1{ .prg_rom = &prg, .chr_rom = &.{}, .chr_is_ram = true };
+
+    try std.testing.expectEqual(@as(?u8, 0x11), mapper.cpuRead(0x8000));
+    try std.testing.expectEqual(@as(?u8, 0x11), mapper.cpuRead(0xc000));
+    serialWrite(&mapper, 0x8000, 0);
+    serialWrite(&mapper, 0xe000, 0x0f);
+    try std.testing.expectEqual(@as(?u8, 0x22), mapper.cpuRead(0xbfff));
+    try std.testing.expectEqual(@as(?u8, 0x22), mapper.cpuRead(0xffff));
+}
+
 test "MMC1 serial latch ignores CPU write bits above D0" {
     var prg: [3 * 16 * 1024]u8 = undefined;
     @memset(prg[0 .. 16 * 1024], 0x10);

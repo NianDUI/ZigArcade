@@ -147,6 +147,7 @@ APU frame counter、CPU 中断与分支轮询、official/unofficial 指令周期
 - 没有 `$6000-$6003` 状态协议的旧 ROM：`romtest` 返回 `TestRomProtocolNotFound` 并输出 `screen-text`；蜂鸣报码 ROM 可通过 `audiotest` 自动判定，其余只有文本中的 `Passed` 或 CRC 与锁定源码允许值一致时才手工纳入结论。
 - `blargg_ppu_tests_2005.09.15b/power_up_palette.nes` 返回 `$02`；随附 README 明确说明期望表可能仅对应作者的单台 NES，因此不作为通用上电状态门禁。
 - `read_joy3/count_errors.nes` 与 `count_errors_fast.nes` 是统计冲突/错误数量的诊断 ROM，没有固定通过码；当前分别观察到 49/1000 与 14/1000，证明干扰路径可达，但未计入通过项。
+- `scrolltest/scroll.nes` 是 16 KiB PRG + CHR-RAM 的单 bank MMC1 交互式滚动演示；当前已可运行 600 帧且无模拟错误，但没有通过码，未据此宣称滚动光栅精度通过。
 - 需要真实按键、人工观察、PAL 或商业 ROM 的测试未执行。
 
 ## 结论与建议顺序

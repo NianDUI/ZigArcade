@@ -57,7 +57,7 @@ pub const Cartridge = struct {
                 // This is the standard iNES MMC1 layout. Board variants with
                 // outer PRG banking exceed these ranges and need separate
                 // board identification rather than silently wrapping banks.
-                if (prg_size < 2 * 16 * 1024 or prg_size > 16 * 16 * 1024 or chr_size > 32 * 4 * 1024) {
+                if (prg_size < 16 * 1024 or prg_size > 16 * 16 * 1024 or chr_size > 32 * 4 * 1024) {
                     return error.UnsupportedMapperLayout;
                 }
             },
@@ -119,6 +119,16 @@ test "iNES parser accepts MMC1 PRG-ROM with either CHR-ROM or CHR-RAM" {
 
     image[4] = 17;
     try std.testing.expectError(error.UnsupportedMapperLayout, Cartridge.parse(&image));
+}
+
+test "iNES parser accepts a mirrored 16 KiB MMC1 PRG bank" {
+    var image: [16 + 16 * 1024]u8 = [_]u8{0} ** (16 + 16 * 1024);
+    image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    const cartridge = try Cartridge.parse(&image);
+    try std.testing.expectEqual(MapperId.mmc1, cartridge.mapper);
+    try std.testing.expectEqual(@as(usize, 16 * 1024), cartridge.prg_rom.len);
+    try std.testing.expect(cartridge.chr_is_ram);
 }
 
 test "iNES NROM parser recognizes CHR RAM and rejects unsupported header features" {
