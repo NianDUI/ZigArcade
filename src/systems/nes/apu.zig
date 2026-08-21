@@ -64,7 +64,9 @@ pub const Apu = struct {
     dmc_bits_remaining: u4 = 8,
     dmc_silence: bool = true,
     dmc_request_pending: bool = false,
+    dmc_request_is_load: bool = false,
     dmc_dma_active: bool = false,
+    dmc_transfer_start_delay: u3 = 0,
     dmc_irq: bool = false,
     sample_phase: u32 = 0,
 
@@ -97,7 +99,9 @@ pub const Apu = struct {
         self.dmc_bytes_remaining = 0;
         self.dmc_sample_buffer = null;
         self.dmc_request_pending = false;
+        self.dmc_request_is_load = false;
         self.dmc_dma_active = false;
+        self.dmc_transfer_start_delay = 0;
         self.dmc_irq = false;
         self.clearFrameIrq();
         self.frame_mode_5_step = self.frame_counter_value & 0x80 != 0;
@@ -156,7 +160,13 @@ pub const Apu = struct {
                     self.triangle_linear_counter = 0;
                 }
                 if (self.channel_enable & 8 == 0) self.noise_length = 0;
-                if (self.channel_enable & 0x10 == 0) self.dmc_bytes_remaining = 0 else if (self.dmc_bytes_remaining == 0) self.restartDmc();
+                if (self.channel_enable & 0x10 == 0) {
+                    self.dmc_bytes_remaining = 0;
+                    self.dmc_transfer_start_delay = 0;
+                } else if (self.dmc_bytes_remaining == 0) {
+                    self.restartDmc();
+                    if (self.dmc_sample_buffer == null) self.dmc_transfer_start_delay = if (self.cpu_cycles & 1 == 0) 2 else 3;
+                }
                 return true;
             },
             0x4017 => {
@@ -220,6 +230,10 @@ pub const Apu = struct {
 
     pub fn dmcReadPending(self: *const Apu) bool {
         return self.dmc_request_pending;
+    }
+
+    pub fn dmcReadIsLoad(self: *const Apu) bool {
+        return self.dmc_request_pending and self.dmc_request_is_load;
     }
 
     pub fn provideDmcSample(self: *Apu, value: u8) void {
@@ -483,11 +497,17 @@ pub const Apu = struct {
     fn restartDmc(self: *Apu) void {
         self.dmc_current_address = self.dmc_sample_address;
         self.dmc_bytes_remaining = self.dmc_sample_length;
-        if (self.dmc_sample_buffer == null) self.dmc_request_pending = true;
     }
 
     fn tickDmc(self: *Apu) void {
-        if (!self.dmc_dma_active and self.cpu_cycles & 1 == 0 and self.dmc_sample_buffer == null and self.dmc_bytes_remaining != 0) self.dmc_request_pending = true;
+        const cold_start_ready = if (self.dmc_transfer_start_delay != 0) blk: {
+            self.dmc_transfer_start_delay -= 1;
+            break :blk self.dmc_transfer_start_delay == 0;
+        } else false;
+        if (self.dmc_transfer_start_delay == 0 and !self.dmc_dma_active and self.cpu_cycles & 1 == 0 and self.dmc_sample_buffer == null and self.dmc_bytes_remaining != 0) {
+            if (!self.dmc_request_pending) self.dmc_request_is_load = cold_start_ready;
+            self.dmc_request_pending = true;
+        }
         if (self.dmc_divider != 0) {
             self.dmc_divider -= 1;
             return;
@@ -640,7 +660,7 @@ test "APU pulse-1 length reloads on $4003 and appears in $4015 status" {
     try std.testing.expectEqual(@as(?u8, 0x01), apu.cpuRead(0x4015));
 
     apu.frame_counter_cycles = 14913;
-    apu.tick(1);
+    apu.tick(2);
     try std.testing.expectEqual(@as(u8, 29), apu.pulse1_length);
     _ = apu.cpuWrite(0x4015, 0);
     try std.testing.expectEqual(@as(?u8, 0), apu.cpuRead(0x4015));
@@ -717,7 +737,7 @@ test "APU DMC requests CPU memory and raises IRQ at sample end" {
     _ = apu.cpuWrite(0x4012, 2);
     _ = apu.cpuWrite(0x4013, 0);
     _ = apu.cpuWrite(0x4015, 0x10);
-    apu.tick(1);
+    apu.tick(2);
     try std.testing.expectEqual(@as(?u16, 0xc080), apu.takeDmcReadRequest());
     apu.provideDmcSample(0x01);
     try std.testing.expectEqual(@as(u16, 0), apu.dmc_bytes_remaining);
@@ -748,6 +768,26 @@ test "APU DMC keeps an in-flight request singular and wraps sample address" {
     apu.dmc_sample_buffer = null;
     apu.tick(2);
     try std.testing.expectEqual(@as(?u16, 0x8000), apu.takeDmcReadRequest());
+}
+
+test "APU delays a cold DMC load by CPU get-put parity" {
+    var null_sink = NullAudioSink{};
+    var even = Apu.init(null_sink.asSink());
+    even.cpu_cycles = 10;
+    _ = even.cpuWrite(0x4015, 0x10);
+    try std.testing.expect(!even.dmcReadPending());
+    even.tick(1);
+    try std.testing.expect(!even.dmcReadPending());
+    even.tick(1);
+    try std.testing.expect(even.dmcReadPending());
+
+    var odd = Apu.init(null_sink.asSink());
+    odd.cpu_cycles = 11;
+    _ = odd.cpuWrite(0x4015, 0x10);
+    odd.tick(2);
+    try std.testing.expect(!odd.dmcReadPending());
+    odd.tick(1);
+    try std.testing.expect(odd.dmcReadPending());
 }
 
 test "APU triangle clocks its linear counter and timer independently" {

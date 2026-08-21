@@ -91,6 +91,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 5 and std.mem.eql(u8, args[1], "romtest") and std.mem.eql(u8, args[3], "--frames")) {
         return runNesTestRom(init, args[2], try parseNesRunFrameCount(args[4]));
     }
+    if (args.len == 5 and std.mem.eql(u8, args[1], "audiotest") and std.mem.eql(u8, args[3], "--frames")) {
+        return runNesAudioTestRom(init, args[2], try parseNesRunFrameCount(args[4]));
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "nes")) {
         return runNesWithOptions(init, args[2], try parseNesRunOptions(args[3..]));
     }
@@ -368,6 +371,114 @@ fn runNesTestRom(init: std.process.Init, rom_path: []const u8, frame_limit: u32)
     }
     try printNametableText(init.io, &nes);
     return error.TestRomProtocolNotFound;
+}
+
+const AudioToneDetector = struct {
+    const window_samples = 220; // approximately 5 ms at 44.1 kHz
+
+    windows: []f64,
+    window_count: usize = 0,
+    sum_squares: f64 = 0,
+    sample_count: u16 = 0,
+
+    fn asSink(self: *AudioToneDetector) CoreAudioSink {
+        return .{ .context = self, .write_fn = write };
+    }
+
+    fn write(context: *anyopaque, _: u64, samples: []const i16) void {
+        const self: *AudioToneDetector = @ptrCast(@alignCast(context));
+        for (samples) |sample| {
+            const value: f64 = @floatFromInt(sample);
+            self.sum_squares += value * value;
+            self.sample_count += 1;
+            if (self.sample_count != window_samples) continue;
+            if (self.window_count < self.windows.len) {
+                self.windows[self.window_count] = @sqrt(self.sum_squares / window_samples);
+                self.window_count += 1;
+            }
+            self.sum_squares = 0;
+            self.sample_count = 0;
+        }
+    }
+
+    fn countTones(self: *const AudioToneDetector) usize {
+        const envelope = self.windows[0..self.window_count];
+        var peak: f64 = 0;
+        for (envelope) |value| peak = @max(peak, value);
+        if (peak == 0) return 0;
+        const on = peak * 0.35;
+        const off = peak * 0.15;
+        const max_gap_windows = 8; // 40 ms; result tones are separated by >=100 ms
+        const min_tone_windows = 8; // ignore clicks shorter than 40 ms
+
+        var raw_start: ?usize = null;
+        var merged_start: ?usize = null;
+        var merged_end: usize = 0;
+        var tone_count: usize = 0;
+        for (envelope, 0..) |value, index| {
+            if (raw_start == null and value > on) {
+                raw_start = index;
+            } else if (raw_start != null and value < off) {
+                const start = raw_start.?;
+                if (merged_start) |previous_start| {
+                    if (start - merged_end < max_gap_windows) {
+                        merged_end = index;
+                    } else {
+                        if (merged_end - previous_start >= min_tone_windows) tone_count += 1;
+                        merged_start = start;
+                        merged_end = index;
+                    }
+                } else {
+                    merged_start = start;
+                    merged_end = index;
+                }
+                raw_start = null;
+            }
+        }
+        if (raw_start) |start| {
+            if (merged_start) |previous_start| {
+                if (start - merged_end < max_gap_windows) {
+                    merged_end = envelope.len;
+                } else {
+                    if (merged_end - previous_start >= min_tone_windows) tone_count += 1;
+                    merged_start = start;
+                    merged_end = envelope.len;
+                }
+            } else {
+                merged_start = start;
+                merged_end = envelope.len;
+            }
+        }
+        if (merged_start) |start| {
+            if (merged_end - start >= min_tone_windows) tone_count += 1;
+        }
+        return tone_count;
+    }
+};
+
+/// Runs legacy blargg ROMs whose result code is emitted as tone bursts. One
+/// tone encodes status zero; every non-zero status requires at least two.
+fn runNesAudioTestRom(init: std.process.Init, rom_path: []const u8, frame_limit: u32) !void {
+    const image = try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        rom_path,
+        init.arena.allocator(),
+        .limited(8 * 1024 * 1024),
+    );
+    const cartridge = try Cartridge.parse(image);
+    const windows = try init.arena.allocator().alloc(f64, @as(usize, frame_limit) * 4 + 16);
+    var detector = AudioToneDetector{ .windows = windows };
+    var nes: Nes = undefined;
+    nes.initWithAudioSink(cartridge, detector.asSink());
+    for (0..frame_limit) |_| _ = try nes.runFrame();
+
+    const tone_count = detector.countTones();
+    var output_storage: [128]u8 = undefined;
+    var output_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &output_storage);
+    const output = &output_file_writer.interface;
+    try output.print("frames: {d}\naudio-tones: {d}\n", .{ frame_limit, tone_count });
+    try output.flush();
+    if (tone_count != 1) return error.TestRomFailed;
 }
 
 fn printNametableText(io: std.Io, nes: *const Nes) !void {
@@ -952,6 +1063,7 @@ fn printUsage(io: std.Io) !void {
             "  zigarcade inspect <path/to/rom.nes>\n" ++
             "  zigarcade framehash <path/to/rom.nes> --frames <1-10000>\n" ++
             "  zigarcade romtest <path/to/rom.nes> --frames <1-100000>\n" ++
+            "  zigarcade audiotest <path/to/rom.nes> --frames <1-100000>\n" ++
             "  zigarcade nes <path/to/rom.nes> [--renderer ansi|kitty|auto] [--audio [--audio-backend unit|queue]] [--log <path>] [--replay <log>] [--max-frames <1-100000>]\n",
     );
     try stderr_writer.interface.flush();

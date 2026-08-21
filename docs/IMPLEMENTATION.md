@@ -75,7 +75,7 @@ pub const InputState = struct { ports: [4]ActionBits = .{ .{}, .{}, .{}, .{} } }
 
 `core/input.zig` 定义稳定的 packed `Actions(u16)`；`stride` 必须被呈现器尊重。NES 映射 `primary_1/2` 为 A/B、`select` 为 Select；Neo Geo 映射 `primary_1..4` 为 A..D、`coin` 为 Coin。公共位的语义在此锁定，不在主机接入时破坏 ABI。
 
-音频是独立时钟域：`AudioSink` 接收带模拟 cycle timestamp 的交错 PCM；默认仍注入 `NullAudioSink`，而 NES APU 已按 CPU 时钟生成 44.1 kHz 单声道 PCM。macOS 的显式 `--audio` 使用 AudioUnit SPSC 环形缓冲输出，`--audio-backend queue` 保留为可比较稳定性的 AudioQueue 试验路径；宿主缓冲满时只丢弃新样本，绝不以 wall clock 修正模拟周期。仍需以公开基线验证精确混音、帧计数器边界和 underrun/overrun 行为。
+音频是独立时钟域：`AudioSink` 接收带模拟 cycle timestamp 的交错 PCM；默认仍注入 `NullAudioSink`，而 NES APU 已按 CPU 时钟生成 44.1 kHz 单声道 PCM。macOS 的显式 `--audio` 使用 AudioUnit SPSC 环形缓冲输出，`--audio-backend queue` 保留为可比较稳定性的 AudioQueue 试验路径；宿主缓冲满时只丢弃新样本，绝不以 wall clock 修正模拟周期。`audiotest` 可捕获该确定性 PCM，以 5 ms RMS 包络、40 ms 最短音调/合并间隔统计旧式 blargg 蜂鸣报码；一个有效音调代表状态码 0。仍需以公开基线验证精确混音和宿主 underrun/overrun 行为。
 
 ## 5. Ghostty 与终端呈现
 
@@ -118,7 +118,7 @@ ROM 标题和错误文本输出前过滤 ESC/C0，防止 ROM 元数据注入控�
 | `$4016-$4017` | 控制器 |
 | `$4020-$FFFF` | Mapper/卡带 |
 
-CPU `read/write` 和无副作用 `peek` 必须分开；CPU 绝不使用 `peek`。OAM DMA 是 bus-cycle 状态机：起始写 `$4014` 后先执行 1/2 个 alignment/dummy 周期，再交替 256 次有副作用 CPU bus read 与 OAM write，总计 513/514 周期；来源可以是 mapper/I/O。DMC DMA 在 CPU 读周期停机、CPU 写后按 3-cycle 延迟处理，并与 OAM DMA 仲裁：中间阶段通常额外 2 cycles，倒数第 3/最后周期分别为 1/3 cycles；样本只在最终 get cycle 写入 buffer，避免 in-flight 请求重复排队。halt/dummy 会重放当前 CPU 读地址，`$2007` 因而产生 2–3 次额外读，`$4016/$4017` 则只额外移位一次；相邻 CPU 周期连续读 `$2007` 时第二次重复前次返回值，但内部 read buffer 继续推进。必须测试奇偶、mapper 来源、中断优先级与 DMA 冲突。
+CPU `read/write` 和无副作用 `peek` 必须分开；CPU 绝不使用 `peek`。OAM DMA 是 bus-cycle 状态机：起始写 `$4014` 后先执行 1/2 个 alignment/dummy 周期，再交替 256 次有副作用 CPU bus read 与 OAM write，总计 513/514 周期；来源可以是 mapper/I/O。DMC DMA 在 CPU 读周期停机、CPU 写后按 3-cycle 延迟处理；`$4015` 重新启用 idle DMC 时，cold load 还会按 CPU/APU get-put parity 等待 2/3 cycles，并采用 3-cycle load DMA，后续 reload 采用 4-cycle DMA。DMC 与 OAM DMA 仲裁时，中间阶段通常额外 2 cycles，倒数第 3/最后周期分别为 1/3 cycles；样本只在最终 get cycle 写入 buffer，避免 in-flight 请求重复排队。halt/dummy 会重放当前 CPU 读地址，`$2007` 因而产生 2–3 次额外读，`$4016/$4017` 则只额外移位一次；相邻 CPU 周期连续读 `$2007` 时第二次重复前次返回值，但内部 read buffer 继续推进。必须测试奇偶、mapper 来源、中断优先级与 DMA 冲突。
 
 ### 6.2 PPU、卡带与控制器
 

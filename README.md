@@ -35,6 +35,8 @@ zig build run -- nes path/to/game.nes --renderer ansi
 
 `romtest` 不需要 TTY：它运行采用 blargg `$6000-$6003` 状态协议的公开测试 ROM，在帧边界检查完成码并输出经过控制字符过滤的 `$6004` 文本；`$81` 会在等待至少 100 ms 后自动模拟 RESET 并保留 PRG RAM，其余非零状态、超时或未发现协议时以失败退出。对没有该协议的旧 ROM，退出前会附带输出名称表中的可读 `screen-text`，便于人工核对 CRC，但不会据此自动判定通过。ROM 仍须由用户合法提供，测试资产的版本、许可证与 SHA-256 应记录在 manifest 中。
 
+`audiotest` 用于只通过蜂鸣报码的旧 blargg ROM：固定运行指定帧数，按 5 ms RMS 包络过滤短点击并统计有效音调段。单音代表状态码 0，两个及以上音调代表非零失败码。
+
 对合法持有的 SMB ROM，可将一次交互日志作为输入回放，执行 `scripts/smb-regression.zsh <rom.nes> <输入日志>`。脚本要求输入日志至少覆盖目标帧数，默认完整重放 10,500 帧，验证音频非静音、输出设备运行、无 render error，以及第一关结束（`state=0B`）后进入过场（`state=06`）；生成的运行日志保存在 `/tmp/zigarcade-smb-regression.*`。第三个可选参数可传入较小帧数作快速冒烟，例如 `... 1800`。
 
 当前核心包含全部 151 个官方 2A03 opcode 的分派、Mapper 0/1/2/3/4/7、PPU 寄存器/VRAM 镜像/VBlank NMI/奇帧 dot skip，以及渲染期间的 `v/t` 滚动地址推进和可见区 `$2000/$2001/$2005` 写入回放；背景数据通路在 `tickDot()` 中按名称表/属性/pattern 的 1/3/5/7 dot 取数、每 8 dot 装入 16 位 pattern/attribute shift-register，并直接输出到 framebuffer。精灵在 dot 1–64 清 secondary OAM、65–256 选入下一行的前八项、257–320 取 pattern 并直接合成像素；背景和精灵取数地址的 A12 合格上升沿均会送至 MMC3 IRQ。overflow 状态位仍覆盖八个精灵之后把后续 2/3/4/1 字节循环误读为 Y 坐标的错误搜索路径。双手柄串行读取与逐总线周期 OAM DMA 已实现。APU 已有帧计数器 IRQ、Pulse 1/2 的长度/包络/扫频、Triangle 线性计数器、Noise LFSR 与 DMC 取样 DMA/IRQ，并按模拟 CPU 时钟生成确定性的 44.1 kHz 单声道 PCM。模拟循环按约 60 Hz 推进，Kitty 每帧展示、ANSI 回退路径约 30 FPS；默认使用 `NullAudioSink` 静音，macOS 可通过 `--audio` 显式启用 CoreAudio AudioUnit PCM 输出。可用 `--audio-backend queue` 试验 AudioQueue（默认仍为 `unit`）以便比较稳定性。仍缺经公开测试 ROM 验证的精确 PPU/Mapper 光栅行为与 APU 时序/混音，以及锁定的公开 ROM 回归；因此此阶段只适合自制/测试 ROM，不承诺商业 ROM 兼容性。

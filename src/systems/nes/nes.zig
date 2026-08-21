@@ -233,7 +233,7 @@ pub const Nes = struct {
     }
 
     fn serviceInstructionDmc(self: *Nes) void {
-        const stall_cycles: u16 = if (self.dmc_delayed_by_write) 3 else 4;
+        const stall_cycles: u16 = if (self.apu.dmcReadIsLoad() or self.dmc_delayed_by_write) 3 else 4;
         const serviced = self.serviceDmcDmaDuringCpuRead(stall_cycles, self.bus.currentCpuAccessAddress());
         self.dmc_instruction_stall_cycles += serviced;
         if (serviced != 0) self.dmc_delayed_by_write = false;
@@ -259,7 +259,7 @@ pub const Nes = struct {
     /// outside the CPU instruction boundary and inside OAM DMA alike, keeping
     /// device clocks and the CPU cycle counter in the same timeline.
     fn serviceDmcDma(self: *Nes) u16 {
-        const stall_cycles: u16 = if (self.dmc_delayed_by_write) 3 else 4;
+        const stall_cycles: u16 = if (self.apu.dmcReadIsLoad() or self.dmc_delayed_by_write) 3 else 4;
         const serviced = self.serviceDmcDmaWithStall(stall_cycles);
         if (serviced != 0) self.dmc_delayed_by_write = false;
         return serviced;
@@ -323,7 +323,7 @@ test "Nes steps CPU from NROM and advances PPU three dots per CPU cycle" {
     try std.testing.expectEqual(@as(u16, 0), nes.ppu.scanline);
 }
 
-test "Nes DMC fetch stalls the CPU four cycles and advances device clocks" {
+test "Nes cold DMC load stalls the CPU three cycles and advances device clocks" {
     var image: [16 + 16 * 1024]u8 = [_]u8{0} ** (16 + 16 * 1024);
     image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     image[16] = 0xea; // NOP
@@ -335,10 +335,10 @@ test "Nes DMC fetch stalls the CPU four cycles and advances device clocks" {
     _ = nes.apu.cpuWrite(0x4010, 0x0f);
     _ = nes.apu.cpuWrite(0x4015, 0x10);
 
-    try std.testing.expectEqual(@as(u16, 6), try nes.step());
-    try std.testing.expectEqual(@as(u64, 13), nes.cpu.cycles); // reset's seven cycles plus NOP and DMC fetch
-    try std.testing.expectEqual(@as(u64, 6), nes.apu.cpu_cycles);
-    try std.testing.expectEqual(@as(u16, 18), nes.ppu.dot);
+    try std.testing.expectEqual(@as(u16, 5), try nes.step());
+    try std.testing.expectEqual(@as(u64, 12), nes.cpu.cycles); // reset's seven cycles plus NOP and cold DMC load
+    try std.testing.expectEqual(@as(u64, 5), nes.apu.cpu_cycles);
+    try std.testing.expectEqual(@as(u16, 15), nes.ppu.dot);
     try std.testing.expect(nes.apu.dmc_sample_buffer != null);
 }
 
@@ -353,6 +353,7 @@ test "Nes DMC halt repeats PPU data reads before the sample get cycle" {
     nes.bus.setTraceEnabled(true);
     nes.bus.clearTrace();
     _ = nes.apu.cpuWrite(0x4015, 0x10);
+    nes.apu.tick(2);
 
     try std.testing.expectEqual(@as(u16, 4), nes.serviceDmcDmaDuringCpuRead(4, 0x2007));
     try std.testing.expectEqual(@as(u16, 3), nes.ppu.v);
@@ -375,6 +376,7 @@ test "Nes DMC halt clocks a controller port only once" {
     nes.bus.setTraceEnabled(true);
     nes.bus.clearTrace();
     _ = nes.apu.cpuWrite(0x4015, 0x10);
+    nes.apu.tick(2);
 
     try std.testing.expectEqual(@as(u16, 4), nes.serviceDmcDmaDuringCpuRead(4, 0x4016));
     try std.testing.expectEqual(@as(usize, 2), nes.bus.accesses().len);
