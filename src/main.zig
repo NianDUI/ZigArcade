@@ -366,7 +366,25 @@ fn runNesTestRom(init: std.process.Init, rom_path: []const u8, frame_limit: u32)
         try printTestRomResult(init.io, &nes, frame_limit, nes.bus.peekCartridge(0x6000) orelse 0xff);
         return error.TestRomTimeout;
     }
+    try printNametableText(init.io, &nes);
     return error.TestRomProtocolNotFound;
+}
+
+fn printNametableText(io: std.Io, nes: *const Nes) !void {
+    var output_storage: [4096]u8 = undefined;
+    var output_file_writer: std.Io.File.Writer = .init(.stdout(), io, &output_storage);
+    const output = &output_file_writer.interface;
+    try output.writeAll("screen-text:\n");
+    var line: [32]u8 = undefined;
+    for (0..30) |row| {
+        for (0..32) |column| {
+            const tile = nes.ppu.peekVram(@intCast(0x2000 + row * 32 + column));
+            line[column] = if (tile >= 0x20 and tile <= 0x7e) tile else ' ';
+        }
+        const visible = std.mem.trimEnd(u8, &line, " ");
+        if (visible.len != 0) try output.print("{s}\n", .{visible});
+    }
+    try output.flush();
 }
 
 fn hasBlarggSignature(nes: *Nes) bool {

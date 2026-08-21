@@ -137,6 +137,8 @@ pub const Ppu = struct {
     sprite_zero_ctrl_captured: bool = false,
     write_toggle: bool = false,
     read_buffer: u8 = 0,
+    last_cpu_data_read_dot: ?u64 = null,
+    last_cpu_data_read_value: u8 = 0,
     open_bus: u8 = 0,
     open_bus_expiry: [8]u64 = [_]u64{0} ** 8,
     total_dots: u64 = 0,
@@ -955,16 +957,33 @@ pub const Ppu = struct {
                 const palette_read = self.v & 0x3fff >= 0x3f00;
                 const data = self.readData();
                 if (palette_read) {
+                    self.last_cpu_data_read_dot = null;
                     const palette_value = (data & 0x3f) | (self.open_bus & 0xc0);
                     self.refreshOpenBus(palette_value, 0x3f);
                     break :blk palette_value;
                 }
-                self.refreshOpenBus(data, 0xff);
-                break :blk data;
+                const value = if (self.last_cpu_data_read_dot) |last_dot|
+                    if (self.total_dots - last_dot == 3) self.last_cpu_data_read_value else data
+                else
+                    data;
+                self.last_cpu_data_read_dot = self.total_dots;
+                self.last_cpu_data_read_value = value;
+                self.refreshOpenBus(value, 0xff);
+                break :blk value;
             },
             else => self.open_bus,
         };
         return value;
+    }
+
+    /// Side-effect-free VRAM observation for headless diagnostics. CPU/PPU
+    /// emulation must continue to use the timed register and fetch paths.
+    pub fn peekVram(self: *const Ppu, address: u16) u8 {
+        return self.readMemory(address);
+    }
+
+    pub fn finishDmaDataRead(self: *Ppu) void {
+        self.last_cpu_data_read_dot = null;
     }
 
     pub fn cpuWrite(self: *Ppu, register_address: u3, value: u8) void {
@@ -1246,6 +1265,27 @@ test "PPUDATA is buffered outside palette and honors 32-byte increment" {
     ppu.cpuWrite(7, 0x33);
     try std.testing.expectEqual(@as(u16, 0x2020), ppu.v);
     try std.testing.expectEqual(@as(u8, 0x33), ppu.readMemory(0x2000));
+}
+
+test "back-to-back CPU PPUDATA reads repeat the first value but advance the buffer" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.read_buffer = 0x11;
+    ppu.writeMemory(0x2000, 0x22);
+    ppu.writeMemory(0x2001, 0x33);
+    ppu.v = 0x2000;
+
+    try std.testing.expectEqual(@as(u8, 0x11), ppu.cpuRead(7));
+    ppu.total_dots += 3;
+    try std.testing.expectEqual(@as(u8, 0x11), ppu.cpuRead(7));
+    try std.testing.expectEqual(@as(u8, 0x33), ppu.read_buffer);
+    try std.testing.expectEqual(@as(u16, 0x2002), ppu.v);
 }
 
 test "VBlank and enabling NMI during VBlank produce one pending NMI" {

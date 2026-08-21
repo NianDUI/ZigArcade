@@ -234,7 +234,7 @@ pub const Nes = struct {
 
     fn serviceInstructionDmc(self: *Nes) void {
         const stall_cycles: u16 = if (self.dmc_delayed_by_write) 3 else 4;
-        const serviced = self.serviceDmcDmaWithStall(stall_cycles);
+        const serviced = self.serviceDmcDmaDuringCpuRead(stall_cycles, self.bus.currentCpuAccessAddress());
         self.dmc_instruction_stall_cycles += serviced;
         if (serviced != 0) self.dmc_delayed_by_write = false;
     }
@@ -266,9 +266,24 @@ pub const Nes = struct {
     }
 
     fn serviceDmcDmaWithStall(self: *Nes, stall_cycles: u16) u16 {
+        return self.serviceDmcDmaTransfer(stall_cycles, null);
+    }
+
+    fn serviceDmcDmaDuringCpuRead(self: *Nes, stall_cycles: u16, cpu_address: u16) u16 {
+        return self.serviceDmcDmaTransfer(stall_cycles, cpu_address);
+    }
+
+    fn serviceDmcDmaTransfer(self: *Nes, stall_cycles: u16, phantom_address: ?u16) u16 {
         const address = self.apu.takeDmcReadRequest() orelse return 0;
-        self.apu.tick(stall_cycles);
-        for (0..stall_cycles * 3) |_| self.ppu.tickDot();
+        const phantom_reads: u16 = if (phantom_address) |cpu_address|
+            if (cpu_address == 0x4016 or cpu_address == 0x4017) 1 else stall_cycles - 1
+        else
+            0;
+        for (0..stall_cycles) |cycle| {
+            self.apu.tick(1);
+            for (0..3) |_| self.ppu.tickDot();
+            if (cycle < phantom_reads) _ = self.bus.dmaRead(phantom_address.?);
+        }
         self.apu.provideDmcSample(self.bus.dmaRead(address));
         return stall_cycles;
     }
@@ -325,6 +340,48 @@ test "Nes DMC fetch stalls the CPU four cycles and advances device clocks" {
     try std.testing.expectEqual(@as(u64, 6), nes.apu.cpu_cycles);
     try std.testing.expectEqual(@as(u16, 18), nes.ppu.dot);
     try std.testing.expect(nes.apu.dmc_sample_buffer != null);
+}
+
+test "Nes DMC halt repeats PPU data reads before the sample get cycle" {
+    var image: [16 + 16 * 1024]u8 = [_]u8{0} ** (16 + 16 * 1024);
+    image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    image[16 + 0x3ffc] = 0x00;
+    image[16 + 0x3ffd] = 0x80;
+    const cartridge = try Cartridge.parse(&image);
+    var nes: Nes = undefined;
+    nes.init(cartridge);
+    nes.bus.setTraceEnabled(true);
+    nes.bus.clearTrace();
+    _ = nes.apu.cpuWrite(0x4015, 0x10);
+
+    try std.testing.expectEqual(@as(u16, 4), nes.serviceDmcDmaDuringCpuRead(4, 0x2007));
+    try std.testing.expectEqual(@as(u16, 3), nes.ppu.v);
+    try std.testing.expectEqual(@as(usize, 4), nes.bus.accesses().len);
+    for (nes.bus.accesses()[0..3]) |access| try std.testing.expectEqual(@as(u16, 0x2007), access.address);
+    try std.testing.expectEqual(@as(u16, 0xc000), nes.bus.accesses()[3].address);
+}
+
+test "Nes DMC halt clocks a controller port only once" {
+    var image: [16 + 16 * 1024]u8 = [_]u8{0} ** (16 + 16 * 1024);
+    image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    image[16 + 0x3ffc] = 0x00;
+    image[16 + 0x3ffd] = 0x80;
+    const cartridge = try Cartridge.parse(&image);
+    var nes: Nes = undefined;
+    nes.init(cartridge);
+    nes.controllers.ports[0].setHostButtons(.{ .a = true, .select = true });
+    nes.bus.write(0x4016, 1);
+    nes.bus.write(0x4016, 0);
+    nes.bus.setTraceEnabled(true);
+    nes.bus.clearTrace();
+    _ = nes.apu.cpuWrite(0x4015, 0x10);
+
+    try std.testing.expectEqual(@as(u16, 4), nes.serviceDmcDmaDuringCpuRead(4, 0x4016));
+    try std.testing.expectEqual(@as(usize, 2), nes.bus.accesses().len);
+    try std.testing.expectEqual(@as(u16, 0x4016), nes.bus.accesses()[0].address);
+    try std.testing.expectEqual(@as(u16, 0xc000), nes.bus.accesses()[1].address);
+    try std.testing.expectEqual(@as(u8, 0), nes.bus.read(0x4016)); // B
+    try std.testing.expectEqual(@as(u8, 1), nes.bus.read(0x4016)); // Select
 }
 
 test "Nes defers a PPU NMI edge raised after a two-cycle instruction poll" {
