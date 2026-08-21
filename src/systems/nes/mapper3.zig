@@ -63,3 +63,12 @@ test "CNROM switches its 8 KiB CHR bank while preserving fixed PRG" {
     try std.testing.expectEqual(@as(?u8, 0x22), mapper.ppuRead(0));
     try std.testing.expect(!mapper.ppuWrite(0, 0xff));
 }
+
+test "CNROM with one CHR bank safely ignores bank selection" {
+    var prg: [32 * 1024]u8 = [_]u8{0} ** (32 * 1024);
+    var chr: [8 * 1024]u8 = [_]u8{0x5a} ** (8 * 1024);
+    var mapper = Mapper3{ .prg_rom = &prg, .chr_rom = &chr, .mirroring = .vertical };
+
+    try std.testing.expect(mapper.cpuWrite(0x8000, 0xff));
+    try std.testing.expectEqual(@as(?u8, 0x5a), mapper.ppuRead(0x1fff));
+}

@@ -65,7 +65,7 @@ pub const Cartridge = struct {
                 if (prg_size < 2 * 16 * 1024 or chr_size != 0) return error.UnsupportedMapperLayout;
             },
             .cnrom => {
-                if ((prg_size != 16 * 1024 and prg_size != 32 * 1024) or chr_size < 2 * 8 * 1024) {
+                if ((prg_size != 16 * 1024 and prg_size != 32 * 1024) or chr_size < 8 * 1024) {
                     return error.UnsupportedMapperLayout;
                 }
             },
@@ -148,7 +148,7 @@ test "iNES parser accepts CHR-RAM Mapper 2 and rejects CHR-ROM UNROM layouts" {
     try std.testing.expectError(error.UnsupportedMapperLayout, Cartridge.parse(&image));
 }
 
-test "iNES parser accepts CNROM CHR-ROM banks and rejects unsupported layouts" {
+test "iNES parser accepts one or more CNROM CHR-ROM banks and rejects unsupported layouts" {
     var image: [16 + 16 * 1024 + 2 * 8 * 1024]u8 = [_]u8{0} ** (16 + 16 * 1024 + 2 * 8 * 1024);
     image[0..16].* = .{ 'N', 'E', 'S', 0x1a, 1, 2, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     const cartridge = try Cartridge.parse(&image);
@@ -158,6 +158,8 @@ test "iNES parser accepts CNROM CHR-ROM banks and rejects unsupported layouts" {
     image[5] = 0;
     try std.testing.expectError(error.UnsupportedMapperLayout, Cartridge.parse(&image));
     image[5] = 1;
+    try std.testing.expectEqual(MapperId.cnrom, (try Cartridge.parse(&image)).mapper);
+    image[4] = 3;
     try std.testing.expectError(error.UnsupportedMapperLayout, Cartridge.parse(&image));
 }
 

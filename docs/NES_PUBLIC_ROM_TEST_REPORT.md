@@ -28,6 +28,7 @@
 | OAM/DMC DMA 冲突 | 2 | 0 | 0 |
 | DMC DMA 读副作用 | 5 | 0 | 0 |
 | DMC 启动/状态音频报码 | 4 | 0 | 0 |
+| DMC/手柄读取干扰 | 1 | 0 | 2 个诊断项 |
 
 `romtest` 现会识别 `$6000=$81`，等待至少 100 ms 后模拟主机 RESET，并保留测试用于计数的 PRG RAM。没有 `$6000` 协议的旧测试 ROM 不会自动判定；本文仅在稳定 `screen-text` 的 Passed/CRC 与锁定源码一致时手工纳入。
 
@@ -83,6 +84,7 @@
 | `dmc_tests/latency.nes` | 900 | audio status 0（1 tone），Passed |
 | `dmc_tests/status.nes` | 900 | audio status 0（1 tone），Passed |
 | `dmc_tests/status_irq.nes` | 900 | audio status 0（1 tone），Passed |
+| `read_joy3/thorough_test.nes` | 300 | screen text `Passed`，覆盖 DMC DMA 所有相位且四次采样补偿最多只损坏一次读取 |
 | `mmc3_test/1-clocking.nes` | 24 | Passed |
 | `mmc3_test/2-details.nes` | 26 | Passed |
 | `mmc3_test/3-A12_clocking.nes` | 24 | Passed |
@@ -101,18 +103,19 @@ CPU `$2006/$2007` 地址变化已经接入 MMC3 A12 观察路径。PPU 跨扫描
 
 ### APU 与 CPU/APU 时序
 
-APU frame counter、CPU 中断与分支轮询、official/unofficial 指令周期现均已有公开 ROM 通过证据。DMC cold load 在 `$4015` 重新启用后按 CPU/APU get-put parity 延迟 2/3 cycles，load 使用 3-cycle DMA、reload 使用 4-cycle DMA；启动 latency、buffer retained、status 与 status IRQ 已由四个音频报码 ROM 验证。OAM DMA 中间阶段及尾部 1/3-cycle 特例也已由两个公开 ROM 验证。DMC halt/dummy 对 `$2007` 的 2–3 次 phantom read、对 `$4016` 的单次额外移位，以及相邻 CPU 周期 `$2007` 连读返回锁存均已有公开 ROM 证据。
+APU frame counter、CPU 中断与分支轮询、official/unofficial 指令周期现均已有公开 ROM 通过证据。DMC cold load 在 `$4015` 重新启用后按 CPU/APU get-put parity 延迟 2/3 cycles，load 使用 3-cycle DMA、reload 使用 4-cycle DMA；启动 latency、buffer retained、status 与 status IRQ 已由四个音频报码 ROM 验证。OAM DMA 中间阶段及尾部 1/3-cycle 特例也已由两个公开 ROM 验证。DMC halt/dummy 对 `$2007` 的 2–3 次 phantom read、对 `$4016` 的单次额外移位，以及相邻 CPU 周期 `$2007` 连读返回锁存均已有公开 ROM 证据。`read_joy3/thorough_test` 进一步验证 DMC 覆盖所有相位时，四次手柄采样补偿仍能返回正确值；诊断 ROM 同次运行观察到补偿路径内部冲突 49/1000、无补偿快速读取错误 14/1000，两者不作为固定计数基线。
 
 ## 未纳入结论
 
 - 12 个会锁死 2A03 的 jam opcode 尚未建模，当前仍返回 `UnsupportedOpcode`。
 - 没有 `$6000-$6003` 状态协议的旧 ROM：`romtest` 返回 `TestRomProtocolNotFound` 并输出 `screen-text`；蜂鸣报码 ROM 可通过 `audiotest` 自动判定，其余只有文本中的 `Passed` 或 CRC 与锁定源码允许值一致时才手工纳入结论。
+- `read_joy3/count_errors.nes` 与 `count_errors_fast.nes` 是统计冲突/错误数量的诊断 ROM，没有固定通过码；当前分别观察到 49/1000 与 14/1000，证明干扰路径可达，但未计入通过项。
 - 需要真实按键、人工观察、PAL 或商业 ROM 的测试未执行。
 
 ## 结论与建议顺序
 
 当前 CPU 官方指令行为、PPU VBlank/NMI、PPU 基础内存/DMA 和 MMC3 IRQ 路径均已有公开 ROM 通过证据。建议后续修复顺序：
 
-1. 扩充 DMC DMA controller interference 与更复杂 OAM 交错的公开回归。
+1. 扩充 DMC DMA 与更复杂 OAM 阶段交错的公开回归。
 2. 扩充 PPU sprite overflow 与非渲染期总线细节测试。
 3. 明确 12 个 CPU jam opcode 的停机模型和工具侧诊断。
