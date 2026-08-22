@@ -7,6 +7,9 @@ const audio_queue_host = @import("frontend/audio_queue_host.zig");
 const kitty = @import("frontend/kitty.zig");
 const terminal = @import("frontend/terminal.zig");
 const Actions = @import("core/input.zig").Actions;
+const observation = @import("ai/observation.zig");
+const visual_scene = @import("ai/nes/scene.zig");
+const text_codec = @import("ai/text_codec.zig");
 const CoreAudioSink = @import("core/audio.zig").AudioSink;
 const Cartridge = @import("systems/nes/cartridge.zig").Cartridge;
 const actionsForByte = @import("systems/nes/input.zig").actionsForByte;
@@ -40,6 +43,7 @@ const raw_input_hold_frames: u8 = 8;
 const ansi_presentation_divisor: u64 = 2;
 const max_framehash_frames: u32 = 10_000;
 const max_nes_run_frames: u32 = 100_000;
+const max_observation_text_bytes: usize = 96 * 1024;
 const max_test_rom_text_bytes: usize = 0x1ffc;
 /// Full runtime logs contain several diagnostic lines per frame. Keep replay
 /// useful for extended recordings without accepting unbounded input.
@@ -93,6 +97,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 5 and std.mem.eql(u8, args[1], "audiotest") and std.mem.eql(u8, args[3], "--frames")) {
         return runNesAudioTestRom(init, args[2], try parseNesRunFrameCount(args[4]));
+    }
+    if (args.len == 5 and std.mem.eql(u8, args[1], "observe") and std.mem.eql(u8, args[3], "--frames")) {
+        return observeNes(init, args[2], try parseNesRunFrameCount(args[4]));
     }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "nes")) {
         return runNesWithOptions(init, args[2], try parseNesRunOptions(args[3..]));
@@ -313,6 +320,46 @@ fn hashNesFrames(init: std.process.Init, rom_path: []const u8, frame_count: u32)
         .{ image_sha256, frame.frame_number, std.hash.Wyhash.hash(0, frame.pixels) },
     );
     try output.flush();
+}
+
+/// Emits one self-contained text observation without opening a terminal or
+/// contacting a model. This is the reproducible input fixture for tokenizer
+/// measurements and later synchronous AI decisions.
+fn observeNes(init: std.process.Init, rom_path: []const u8, frame_count: u32) !void {
+    const image = try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        rom_path,
+        init.arena.allocator(),
+        .limited(8 * 1024 * 1024),
+    );
+    const cartridge = Cartridge.parse(image) catch |err| {
+        try appendCartridgeError(init.io, rom_path, err);
+        return err;
+    };
+    var nes: Nes = undefined;
+    nes.init(cartridge);
+    for (0..frame_count) |_| _ = try nes.runFrame();
+
+    var rom_sha256: observation.RomHash = undefined;
+    std.crypto.hash.sha2.Sha256.hash(image, &rom_sha256, .{});
+    const snapshot = nes.ppu.presentationSnapshot();
+    const scene = try visual_scene.build(snapshot);
+    const header = observation.Header{
+        .system = .nes,
+        .rom_sha256 = rom_sha256,
+        .sequence = 1,
+        .base_sequence = 0,
+        .frame = snapshot.frame_number,
+        .kind = .keyframe,
+    };
+    var catalog = text_codec.ShapeCatalog{};
+    var encoded_storage: [max_observation_text_bytes]u8 = undefined;
+    const encoded = try text_codec.encodeKeyframe(header, &scene, &catalog, &encoded_storage);
+
+    var output_storage: [1024]u8 = undefined;
+    var output_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &output_storage);
+    try output_file_writer.interface.writeAll(encoded);
+    try output_file_writer.interface.flush();
 }
 
 /// Runs ROMs using blargg's conventional $6000 result protocol. Ordinary
@@ -684,6 +731,7 @@ fn runNesWithOptions(init: std.process.Init, rom_path: []const u8, options: NesR
         // FPS; neither renderer slows or skips emulation itself.
         if (shouldPresentFrame(renderer, frame.frame_number)) {
             if (logged_frame) try logger.write(init.io, "frame={d} present=begin\n", .{frame.frame_number});
+            if (logged_frame and renderer == .kitty) try logKittyPresentationOptions(init.io, &logger, frame);
             const present_started = std.Io.Clock.Timestamp.now(init.io, .awake);
             try appendExitPrompt(init.io, output);
             try appendPresentedFrame(init.io, output, renderer, frame);
@@ -862,13 +910,13 @@ fn waitForNextNesFrame(
     logger: *RunLogger,
 ) !terminal.Event {
     while (true) {
-        const now = std.Io.Clock.Timestamp.now(io, .awake);
-        if (now.compare(.gte, deadline.*)) {
-            while (deadline.*.compare(.lte, now)) deadline.* = deadline.*.addDuration(nesFrameDuration());
-            return .none;
-        }
+        // Poll before checking the frame deadline. Debug builds and slow
+        // renderers can already be late here; skipping this poll would starve
+        // keyboard input for every subsequent over-budget frame.
+        var handled_input = false;
         switch (try session.nextEventTimeout(0)) {
             .key => |event| {
+                handled_input = true;
                 if (logger.enabled()) {
                     try logger.write(
                         io,
@@ -895,9 +943,20 @@ fn waitForNextNesFrame(
             },
             .exit => |reason| return .{ .exit = reason },
             .suspended => return .suspended,
-            .none => sleepNanoseconds(@min(@as(u64, std.time.ns_per_ms), @as(u64, @intCast(now.durationTo(deadline.*).raw.nanoseconds)))),
+            .none => {},
+        }
+        const now = std.Io.Clock.Timestamp.now(io, .awake);
+        if (advanceExpiredNesFrameDeadline(now, deadline)) return .none;
+        if (!handled_input) {
+            sleepNanoseconds(@min(@as(u64, std.time.ns_per_ms), @as(u64, @intCast(now.durationTo(deadline.*).raw.nanoseconds))));
         }
     }
+}
+
+fn advanceExpiredNesFrameDeadline(now: std.Io.Clock.Timestamp, deadline: *std.Io.Clock.Timestamp) bool {
+    if (now.compare(.lt, deadline.*)) return false;
+    while (deadline.*.compare(.lte, now)) deadline.* = deadline.*.addDuration(nesFrameDuration());
+    return true;
 }
 
 fn sleepNanoseconds(nanoseconds: u64) void {
@@ -995,12 +1054,48 @@ fn appendPresentedFrame(io: std.Io, output: *std.Io.Writer, renderer: Renderer, 
         },
         .kitty => {
             const options = if (try terminal.viewport(io)) |view|
-                kitty.fitOptions(frame, view.columns, if (view.rows > 1) view.rows - 1 else 1)
+                kitty.fitOptionsForPixelViewport(
+                    frame,
+                    view.columns,
+                    if (view.rows > 1) view.rows - 1 else 1,
+                    view.width_pixels,
+                    view.height_pixels,
+                )
             else
                 kitty.Options{};
             try kitty.appendFrame(output, frame, options);
         },
         .auto => unreachable,
+    }
+}
+
+/// Records the exact sizing input and Kitty placement parameters for visual
+/// regressions. Zero in either option field means that it was deliberately
+/// omitted so Kitty derives that dimension from the source aspect ratio.
+fn logKittyPresentationOptions(io: std.Io, logger: *RunLogger, frame: Frame) !void {
+    if (try terminal.viewport(io)) |view| {
+        const options = kitty.fitOptionsForPixelViewport(
+            frame,
+            view.columns,
+            if (view.rows > 1) view.rows - 1 else 1,
+            view.width_pixels,
+            view.height_pixels,
+        );
+        try logger.write(
+            io,
+            "frame={d} kitty viewport={d}x{d} cells pixels={d}x{d} placement_columns={d} placement_rows={d}\n",
+            .{
+                frame.frame_number,
+                view.columns,
+                view.rows,
+                view.width_pixels,
+                view.height_pixels,
+                options.columns orelse 0,
+                options.rows orelse 0,
+            },
+        );
+    } else {
+        try logger.write(io, "frame={d} kitty viewport=unavailable placement=defaults\n", .{frame.frame_number});
     }
 }
 
@@ -1064,6 +1159,7 @@ fn printUsage(io: std.Io) !void {
             "  zigarcade framehash <path/to/rom.nes> --frames <1-10000>\n" ++
             "  zigarcade romtest <path/to/rom.nes> --frames <1-100000>\n" ++
             "  zigarcade audiotest <path/to/rom.nes> --frames <1-100000>\n" ++
+            "  zigarcade observe <path/to/rom.nes> --frames <1-100000>\n" ++
             "  zigarcade nes <path/to/rom.nes> [--renderer ansi|kitty|auto] [--audio [--audio-backend unit|queue]] [--log <path>] [--replay <log>] [--max-frames <1-100000>]\n",
     );
     try stderr_writer.interface.flush();
@@ -1297,6 +1393,18 @@ test "legacy expiry cannot release Kitty-held actions" {
     const second = mergeActions(held, consumeLegacyActions(&legacy, &remaining));
     try std.testing.expect(second.primary_1);
     try std.testing.expect(!second.right);
+}
+
+test "over-budget NES frame deadlines catch up to a future frame" {
+    const frame = nesFrameDuration();
+    const start = std.Io.Clock.Timestamp{ .raw = .fromNanoseconds(0), .clock = .awake };
+    const now = start.addDuration(.{ .raw = .fromNanoseconds(3 * nes_frame_interval_ns + 1), .clock = .awake });
+    var deadline = start.addDuration(frame);
+
+    try std.testing.expect(advanceExpiredNesFrameDeadline(now, &deadline));
+    try std.testing.expect(deadline.compare(.gt, now));
+    try std.testing.expectEqual(@as(i96, 4 * nes_frame_interval_ns), deadline.raw.nanoseconds);
+    try std.testing.expect(!advanceExpiredNesFrameDeadline(start, &deadline));
 }
 
 fn fillColorBarsForSize(rgb: []u8, width: usize, height: usize) void {

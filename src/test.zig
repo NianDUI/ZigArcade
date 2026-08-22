@@ -2,6 +2,10 @@ test {
     _ = @import("core/audio.zig");
     _ = @import("core/frame.zig");
     _ = @import("core/input.zig");
+    _ = @import("ai/action_plan.zig");
+    _ = @import("ai/nes/scene.zig");
+    _ = @import("ai/observation.zig");
+    _ = @import("ai/text_codec.zig");
     _ = @import("frontend/kitty.zig");
     _ = @import("frontend/ansi.zig");
     _ = @import("frontend/audio_host.zig");

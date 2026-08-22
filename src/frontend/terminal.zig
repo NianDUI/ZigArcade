@@ -37,20 +37,34 @@ pub const ExitReason = enum { escape, input_closed, interrupt, terminate, hangup
 
 pub const Event = union(enum) { none, key: KeyEvent, exit: ExitReason, suspended };
 
-pub const Viewport = struct { columns: u16, rows: u16 };
+pub const Viewport = struct {
+    columns: u16,
+    rows: u16,
+    width_pixels: u16,
+    height_pixels: u16,
+};
 
 /// Returns the current terminal-cell geometry, or null when the operating
 /// system cannot provide it. The presentation path then uses its conservative
 /// fixed fallback.
 pub fn viewport(io: std.Io) !?Viewport {
+    _ = io;
     var size: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const result = (try io.operate(.{ .device_io_control = .{
-        .file = std.Io.File.stdout(),
-        .code = std.posix.T.IOCGWINSZ,
-        .arg = &size,
-    } })).device_io_control;
-    if (result < 0 or size.col == 0 or size.row == 0) return null;
-    return .{ .columns = size.col, .rows = size.row };
+    // `std.Io.operate(.device_io_control)` has returned a zeroed winsize in
+    // ReleaseFast under Ghostty. Go straight to the POSIX ioctl so Debug and
+    // optimized builds observe the same terminal geometry.
+    const result = std.posix.system.ioctl(
+        std.posix.STDOUT_FILENO,
+        @intCast(std.posix.T.IOCGWINSZ),
+        @intFromPtr(&size),
+    );
+    if (std.posix.errno(result) != .SUCCESS or size.col == 0 or size.row == 0) return null;
+    return .{
+        .columns = size.col,
+        .rows = size.row,
+        .width_pixels = size.xpixel,
+        .height_pixels = size.ypixel,
+    };
 }
 
 pub const Session = struct {

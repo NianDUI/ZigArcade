@@ -13,10 +13,11 @@ pub const RenderError = error{InvalidFrameBuffer};
 /// CPU register writes can alter the visible picture during a scanline. Keep
 /// a bounded log for one frame so the presentation renderer can replay the
 /// same state transitions after VBlank without participating in PPU timing.
-const raster_event_capacity = 128;
+pub const presentation_raster_event_capacity = 128;
+const raster_event_capacity = presentation_raster_event_capacity;
 const open_bus_decay_dots: u64 = 3_221_591; // approximately 600 ms at NTSC PPU speed
 
-const RasterState = struct {
+pub const PresentationRasterState = struct {
     scroll_x: u8,
     scroll_y: u8,
     nametable: u2,
@@ -24,11 +25,33 @@ const RasterState = struct {
     mask: u8,
 };
 
-const RasterEvent = struct {
+pub const PresentationRasterEvent = struct {
     scanline: u16,
     dot: u16,
-    state: RasterState,
+    state: PresentationRasterState,
 };
+
+/// Immutable video inputs used to produce the most recently completed
+/// picture. The snapshot is intentionally value-owned: observers must never
+/// retain a pointer to mutable PPU state or read timing-sensitive registers.
+pub const PresentationSnapshot = struct {
+    frame_number: u64,
+    scroll_x: u8,
+    scroll_y: u8,
+    nametable: u2,
+    ctrl: u8,
+    mask: u8,
+    mirroring: Mirroring,
+    oam: [256]u8,
+    nametables: [2 * 1024]u8,
+    pattern: [0x2000]u8,
+    palette: [32]u8,
+    raster_events: [presentation_raster_event_capacity]PresentationRasterEvent,
+    raster_event_count: usize,
+};
+
+const RasterState = PresentationRasterState;
+const RasterEvent = PresentationRasterEvent;
 
 const empty_raster_event = RasterEvent{
     .scanline = 0,
@@ -105,7 +128,9 @@ pub const Ppu = struct {
     presentation_nametable: u2 = 0,
     presentation_ctrl: u8 = 0,
     presentation_mask: u8 = 0,
+    presentation_mirroring: Mirroring = .horizontal,
     presentation_oam: [256]u8 = [_]u8{0} ** 256,
+    presentation_nametables: [2 * 1024]u8 = [_]u8{0} ** (2 * 1024),
     /// The staged sprite overlay runs after VBlank, so it must retain the
     /// pattern and palette bytes seen by the completed visible frame rather
     /// than reading data a game's NMI handler is already preparing for the
@@ -572,6 +597,27 @@ pub const Ppu = struct {
         };
     }
 
+    /// Copies the VBlank-latched inputs that produced the completed visible
+    /// picture. This is a read-only inspection API: it neither observes CPU
+    /// register side effects nor exposes mutable PPU or mapper pointers.
+    pub fn presentationSnapshot(self: *const Ppu) PresentationSnapshot {
+        return .{
+            .frame_number = self.frame_number,
+            .scroll_x = self.presentation_scroll_x,
+            .scroll_y = self.presentation_scroll_y,
+            .nametable = self.presentation_nametable,
+            .ctrl = self.presentation_ctrl,
+            .mask = self.presentation_mask,
+            .mirroring = self.presentation_mirroring,
+            .oam = self.presentation_oam,
+            .nametables = self.presentation_nametables,
+            .pattern = self.presentation_pattern,
+            .palette = self.presentation_palette,
+            .raster_events = self.presentation_raster_events,
+            .raster_event_count = self.presentation_raster_event_count,
+        };
+    }
+
     /// Sprite evaluation begins at dot 65. A candidate Y check takes two
     /// dots; copying one of the first eight in-range sprites occupies the
     /// next eight dots. Once secondary OAM is full, the overflow path follows
@@ -675,7 +721,9 @@ pub const Ppu = struct {
         self.presentation_nametable = self.active_raster_state.nametable;
         self.presentation_ctrl = self.active_raster_state.ctrl;
         self.presentation_mask = self.active_raster_state.mask;
+        self.presentation_mirroring = self.mapper.mirroring();
         self.presentation_oam = self.active_oam;
+        self.presentation_nametables = self.nametables;
         for (0..self.presentation_pattern.len) |address| {
             self.presentation_pattern[address] = self.readMemory(@intCast(address));
         }
@@ -1974,6 +2022,53 @@ test "sprite presentation uses the OAM captured with its frame state" {
     const next_frame_pixel = (10 * frame_width + 40) * 3;
     try std.testing.expectEqualSlices(u8, &.{ 76, 154, 236 }, rgb[captured_pixel..][0..3]);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, rgb[next_frame_pixel..][0..3]);
+}
+
+test "presentation snapshot retains VBlank-latched video inputs" {
+    var prg: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var mapper = Mapper0{
+        .prg_rom = &prg,
+        .chr_rom = &.{},
+        .chr_is_ram = true,
+        .mirroring = .horizontal,
+    };
+    var ppu = Ppu.init(&mapper);
+    ppu.ctrl = 0x10;
+    ppu.mask = 0x1e;
+    ppu.pending_scroll_x = 37;
+    ppu.pending_scroll_y = 91;
+    ppu.pending_nametable = 2;
+    ppu.oam[0..4].* = .{ 9, 1, 2, 20 };
+    ppu.nametables[0] = 0x44;
+    mapper.chr_ram[0] = 0x88;
+    ppu.palette[0] = 0x21;
+    ppu.latchActiveRasterState();
+    ppu.active_raster_events[0] = .{
+        .scanline = 12,
+        .dot = 40,
+        .state = .{ .scroll_x = 5, .scroll_y = 6, .nametable = 1, .ctrl = 0, .mask = 0x08 },
+    };
+    ppu.active_raster_event_count = 1;
+    ppu.latchPresentationState();
+
+    const snapshot = ppu.presentationSnapshot();
+    ppu.oam[0] = 0xf8;
+    ppu.nametables[0] = 0;
+    mapper.chr_ram[0] = 0;
+    ppu.palette[0] = 0;
+    ppu.active_raster_events[0].scanline = 0;
+    mapper.mirroring = .vertical;
+
+    try std.testing.expectEqual(@as(u8, 37), snapshot.scroll_x);
+    try std.testing.expectEqual(@as(u8, 91), snapshot.scroll_y);
+    try std.testing.expectEqual(@as(u2, 2), snapshot.nametable);
+    try std.testing.expectEqual(Mirroring.horizontal, snapshot.mirroring);
+    try std.testing.expectEqual(@as(u8, 9), snapshot.oam[0]);
+    try std.testing.expectEqual(@as(u8, 0x44), snapshot.nametables[0]);
+    try std.testing.expectEqual(@as(u8, 0x88), snapshot.pattern[0]);
+    try std.testing.expectEqual(@as(u8, 0x21), snapshot.palette[0]);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.raster_event_count);
+    try std.testing.expectEqual(@as(u16, 12), snapshot.raster_events[0].scanline);
 }
 
 test "lower OAM index wins where opaque sprites overlap" {

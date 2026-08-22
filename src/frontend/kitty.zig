@@ -117,8 +117,11 @@ fn responseForImage(payload: []const u8, image_id: u32) ?ProbeResult {
 pub const Options = struct {
     image_id: u32 = 1,
     placement_id: u32 = 1,
-    columns: u16 = 128,
-    rows: u16 = 60,
+    // Supplying exactly one cell dimension lets Kitty compute the other one
+    // from the source pixels, avoiding distortion when terminal cells are not
+    // the traditional 1:2 width:height ratio.
+    columns: ?u16 = 128,
+    rows: ?u16 = 60,
     quiet: bool = true,
 };
 
@@ -136,6 +139,30 @@ pub fn fitOptions(frame: Frame, max_columns: u16, max_rows: u16) Options {
         @max(@as(u32, 1), @as(u32, rows) * columns_per_row / frame.height),
     ));
     return .{ .columns = columns, .rows = rows };
+}
+
+/// Fits against the terminal's actual pixel rectangle when it is available.
+/// Sending only the limiting cell dimension delegates the other dimension to
+/// Kitty, which preserves the source image aspect ratio exactly.
+pub fn fitOptionsForPixelViewport(
+    frame: Frame,
+    max_columns: u16,
+    max_rows: u16,
+    width_pixels: u16,
+    height_pixels: u16,
+) Options {
+    if (max_columns == 0 or max_rows == 0 or width_pixels == 0 or height_pixels == 0) {
+        return fitOptions(frame, max_columns, max_rows);
+    }
+
+    const frame_width = @as(u64, frame.width);
+    const frame_height = @as(u64, frame.height);
+    const available_width = @as(u64, width_pixels);
+    const available_height = @as(u64, height_pixels);
+    return if (frame_width * available_height <= frame_height * available_width)
+        .{ .columns = null, .rows = max_rows }
+    else
+        .{ .columns = max_columns, .rows = null };
 }
 
 /// Encodes one RGB frame as Kitty APC transmit-and-display commands. Large
@@ -162,19 +189,21 @@ pub fn appendFrame(writer: *std.Io.Writer, frame: Frame, options: Options) !void
         try writer.writeAll("\x1b_G");
         if (first) {
             try writer.print(
-                "a=T,q={d},t=d,f=24,s={d},v={d},i={d},p={d},c={d},r={d},C=1{s},m={d};",
+                "a=T,q={d},t=d,f=24,s={d},v={d},i={d},p={d}",
                 .{
                     @intFromBool(options.quiet),
                     frame.width,
                     frame.height,
                     options.image_id,
                     options.placement_id,
-                    options.columns,
-                    options.rows,
-                    if (transmission.compressed) ",o=z" else "",
-                    @intFromBool(more),
                 },
             );
+            if (options.columns) |columns| try writer.print(",c={d}", .{columns});
+            if (options.rows) |rows| try writer.print(",r={d}", .{rows});
+            try writer.print(",C=1{s},m={d};", .{
+                if (transmission.compressed) ",o=z" else "",
+                @intFromBool(more),
+            });
         } else {
             try writer.print("q={d},m={d};", .{ @intFromBool(options.quiet), @intFromBool(more) });
         }
@@ -260,6 +289,17 @@ test "Kitty fit options preserve NES aspect ratio within terminal cells" {
     const narrow = fitOptions(frame, 80, 59);
     try std.testing.expectEqual(@as(u16, 78), narrow.columns);
     try std.testing.expectEqual(@as(u16, 37), narrow.rows);
+}
+
+test "Kitty fit options use the limiting viewport dimension without distortion" {
+    const frame = Frame{ .pixels = &.{}, .width = 256, .height = 240, .stride = 768, .format = .rgb888, .frame_number = 0 };
+    const wide = fitOptionsForPixelViewport(frame, 160, 59, 1600, 600);
+    try std.testing.expectEqual(@as(?u16, null), wide.columns);
+    try std.testing.expectEqual(@as(?u16, 59), wide.rows);
+
+    const tall = fitOptionsForPixelViewport(frame, 80, 59, 800, 1600);
+    try std.testing.expectEqual(@as(?u16, 80), tall.columns);
+    try std.testing.expectEqual(@as(?u16, null), tall.rows);
 }
 
 test "Kitty rejects non-tight RGB frame" {
